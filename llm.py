@@ -19,6 +19,7 @@ APP_TITLE = os.environ.get("OPENROUTER_TITLE", "Dailylife Telegram Bot")
 USER_TZ = os.environ.get("USER_TZ", "Asia/Seoul")
 
 TOOLS: List[Dict] = [
+    # ---- schedule ----
     {
         "type": "function",
         "function": {
@@ -63,14 +64,8 @@ TOOLS: List[Dict] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "from_iso": {
-                        "type": "string",
-                        "description": f"Inclusive start datetime in {USER_TZ}. Omit for 'now'.",
-                    },
-                    "to_iso": {
-                        "type": "string",
-                        "description": f"Inclusive end datetime in {USER_TZ}. Omit for 'no upper bound'.",
-                    },
+                    "from_iso": {"type": "string", "description": f"Inclusive start datetime in {USER_TZ}. Omit for 'now'."},
+                    "to_iso": {"type": "string", "description": f"Inclusive end datetime in {USER_TZ}. Omit for no upper bound."},
                 },
             },
         },
@@ -102,6 +97,172 @@ TOOLS: List[Dict] = [
                 "type": "object",
                 "properties": {"event_id": {"type": "integer"}},
                 "required": ["event_id"],
+            },
+        },
+    },
+    # ---- long-term facts about the user ----
+    {
+        "type": "function",
+        "function": {
+            "name": "remember_fact",
+            "description": (
+                "Persist a piece of personal information the user wants you to remember "
+                "long-term (home address, workplace, military unit, family names, "
+                "preferences, etc.). Call this whenever the user shares a stable fact "
+                "about themselves, OR when they explicitly say '기억해줘'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "description": "Short snake_case identifier, e.g. 'home_address', 'unit_location'."},
+                    "value": {"type": "string", "description": "The actual value to store, in natural language."},
+                },
+                "required": ["key", "value"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "forget_fact",
+            "description": "Delete a previously remembered fact by its key.",
+            "parameters": {
+                "type": "object",
+                "properties": {"key": {"type": "string"}},
+                "required": ["key"],
+            },
+        },
+    },
+    # ---- recurring tasks (e.g. daily 7am udo ferry briefing) ----
+    {
+        "type": "function",
+        "function": {
+            "name": "add_recurring_task",
+            "description": (
+                "Schedule a daily task that runs at a fixed local time and runs the given "
+                "prompt through this same agent (with full tool access), then sends the "
+                "answer to the user. Use whenever the user wants a recurring briefing — "
+                "'매일 7시에 우도 배 운항 알려줘' / 'every morning summarize ...'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "cron_kst": {
+                        "type": "string",
+                        "description": "Daily fire time in HH:MM (24h, KST). Example: '07:00'.",
+                    },
+                    "prompt": {
+                        "type": "string",
+                        "description": (
+                            "The instruction to run, written as if the user is sending it. "
+                            "Example: '우도 운항 정보 사이트 확인해서 오늘 운항여부와 시간표 알려줘.'"
+                        ),
+                    },
+                },
+                "required": ["cron_kst", "prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_recurring_tasks",
+            "description": "List all recurring tasks the user has set up.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delete_recurring_task",
+            "description": "Cancel a recurring task by its id.",
+            "parameters": {
+                "type": "object",
+                "properties": {"task_id": {"type": "integer"}},
+                "required": ["task_id"],
+            },
+        },
+    },
+    # ---- external lookups ----
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": (
+                "Search Korean web (Naver). Use for general questions, schedules, news, "
+                "operating-hours lookups. Returns title/snippet/link list."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["blog", "news", "webkr", "encyc"],
+                        "description": "blog (default) | news | webkr | encyc",
+                    },
+                    "display": {"type": "integer", "description": "Number of results (1-10). Default 5."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "kakao_local_search",
+            "description": (
+                "Search Korean places (restaurants, addresses, landmarks) via Kakao Local. "
+                "Returns place name, address, phone, lat/long. Optional radius search around (x,y)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "x": {"type": "number", "description": "Optional center longitude."},
+                    "y": {"type": "number", "description": "Optional center latitude."},
+                    "radius_m": {"type": "integer", "description": "Optional search radius in meters (max 20000)."},
+                    "size": {"type": "integer", "description": "Number of results (1-15). Default 5."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "kakao_directions_drive",
+            "description": (
+                "Get DRIVING (car) directions between two coords via Kakao Mobility. "
+                "Returns distance and duration. Note: no public-transit option on this tier."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "origin_x": {"type": "number"},
+                    "origin_y": {"type": "number"},
+                    "dest_x": {"type": "number"},
+                    "dest_y": {"type": "number"},
+                },
+                "required": ["origin_x", "origin_y", "dest_x", "dest_y"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "fetch_url",
+            "description": (
+                "GET a URL and return its text (HTML stripped). Use for direct page lookups "
+                "like ferry operation status, train timetables, business pages."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "max_chars": {"type": "integer", "description": "Truncation limit (default 8000)."},
+                },
+                "required": ["url"],
             },
         },
     },

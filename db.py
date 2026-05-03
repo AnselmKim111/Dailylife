@@ -22,6 +22,25 @@ CREATE TABLE IF NOT EXISTS events (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_events_chat_when ON events(chat_id, when_utc);
+
+CREATE TABLE IF NOT EXISTS facts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    key TEXT NOT NULL,
+    value TEXT NOT NULL,
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(chat_id, key)
+);
+
+CREATE TABLE IF NOT EXISTS recurring_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    cron_kst TEXT NOT NULL,          -- "HH:MM" (daily) for now
+    prompt TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_run_utc TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
 """
 
 _lock = threading.Lock()
@@ -138,3 +157,74 @@ def pending_reminders() -> List[sqlite3.Row]:
                 (now,),
             )
         )
+
+
+# ---------------- facts ----------------
+
+
+def remember_fact(chat_id: int, key: str, value: str) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO facts (chat_id, key, value, updated_at) VALUES (?,?,?,?) "
+            "ON CONFLICT(chat_id, key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+            (chat_id, key.strip(), value.strip(), now),
+        )
+
+
+def forget_fact(chat_id: int, key: str) -> bool:
+    with _conn() as c:
+        cur = c.execute("DELETE FROM facts WHERE chat_id=? AND key=?", (chat_id, key.strip()))
+        return cur.rowcount > 0
+
+
+def list_facts(chat_id: int) -> List[sqlite3.Row]:
+    with _conn() as c:
+        return list(
+            c.execute(
+                "SELECT key, value, updated_at FROM facts WHERE chat_id=? ORDER BY key",
+                (chat_id,),
+            )
+        )
+
+
+# ---------------- recurring tasks ----------------
+
+
+def add_recurring_task(chat_id: int, cron_kst: str, prompt: str) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO recurring_tasks (chat_id, cron_kst, prompt) VALUES (?,?,?)",
+            (chat_id, cron_kst.strip(), prompt.strip()),
+        )
+        return cur.lastrowid
+
+
+def list_recurring_tasks(chat_id: Optional[int] = None) -> List[sqlite3.Row]:
+    with _conn() as c:
+        if chat_id is None:
+            return list(c.execute("SELECT * FROM recurring_tasks WHERE enabled=1 ORDER BY id"))
+        return list(
+            c.execute(
+                "SELECT * FROM recurring_tasks WHERE chat_id=? ORDER BY id", (chat_id,)
+            )
+        )
+
+
+def get_recurring_task(task_id: int) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute("SELECT * FROM recurring_tasks WHERE id=?", (task_id,)).fetchone()
+
+
+def delete_recurring_task(task_id: int, chat_id: int) -> bool:
+    with _conn() as c:
+        cur = c.execute(
+            "DELETE FROM recurring_tasks WHERE id=? AND chat_id=?", (task_id, chat_id)
+        )
+        return cur.rowcount > 0
+
+
+def mark_recurring_run(task_id: int) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as c:
+        c.execute("UPDATE recurring_tasks SET last_run_utc=? WHERE id=?", (now, task_id))
