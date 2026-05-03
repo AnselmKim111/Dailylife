@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.env
+.venv/
+venv/
+.railway/
+.idea/
+.vscode/
+.claude/secrets.local.md
+.claude/*.local.md
