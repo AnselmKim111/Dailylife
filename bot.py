@@ -113,9 +113,23 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(reply[i : i + 4000])
 
 
+async def self_test(app: Application) -> None:
+    """One-off OpenRouter ping at startup so we can confirm end-to-end wiring in logs."""
+    try:
+        reply = await call_openrouter(
+            [
+                {"role": "system", "content": "Respond with one word."},
+                {"role": "user", "content": "Say 'ready'."},
+            ]
+        )
+        logger.info("self_test ok — OpenRouter replied: %r", reply[:80])
+    except Exception:
+        logger.exception("self_test FAILED")
+
+
 def main() -> None:
     logger.info("Starting Dailylife bot — model=%s", OPENROUTER_MODEL)
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(self_test).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("reset", cmd_reset))
