@@ -26,6 +26,12 @@ A Telegram bot powered by OpenRouter LLMs, deployed on Railway as a worker.
 - Endpoint: `https://openrouter.ai/api/v1/chat/completions`
 - Default model: `anthropic/claude-haiku-4.5` (override with `OPENROUTER_MODEL`).
 
+## Kakao Developers
+
+- REST API key: stored in Railway as `KAKAO_REST_API_KEY` (and in `.claude/secrets.local.md`).
+- Used for Kakao Local API (place search, address ↔ coords).
+- Auth header: `Authorization: KakaoAK <key>`.
+
 ## Required Railway env vars
 
 | Name                 | Purpose                          |
