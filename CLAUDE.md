@@ -32,6 +32,12 @@ A Telegram bot powered by OpenRouter LLMs, deployed on Railway as a worker.
 - Used for Kakao Local API (place search, address ↔ coords).
 - Auth header: `Authorization: KakaoAK <key>`.
 
+## Naver Developers
+
+- Client ID + secret: stored in Railway as `NAVER_CLIENT_ID` / `NAVER_CLIENT_SECRET` (and in `.claude/secrets.local.md`).
+- Used for Naver Search API (local/blog/web — business hours, phone numbers).
+- Auth headers: `X-Naver-Client-Id`, `X-Naver-Client-Secret`.
+
 ## Required Railway env vars
 
 | Name                 | Purpose                          |
