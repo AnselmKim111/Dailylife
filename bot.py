@@ -22,6 +22,7 @@ from telegram.ext import (
 import db
 import external
 import scheduler
+import transcribe
 from llm import TOOLS, USER_TZ, chat_completion, parse_tool_calls
 
 logging.basicConfig(
@@ -703,15 +704,16 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("대화 메모리 초기화 완료. 일정/기억은 그대로 보존.")
 
 
-async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not update.message or not update.message.text:
-        return
+async def _process_user_text(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    user_text: str,
+    *,
+    log_prefix: str = "",
+) -> None:
+    """Shared agent dispatch used by text, voice, and photo handlers."""
     chat_id = update.effective_chat.id
-    user_text = update.message.text
-    logger.info("msg from %s: %r", chat_id, user_text[:200])
-
-    db.log_chat(chat_id, "user", user_text)
-
+    db.log_chat(chat_id, "user", f"{log_prefix}{user_text}")
     history = _history(chat_id)
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
@@ -720,7 +722,6 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     except Exception as exc:
         logger.exception("agent loop failed")
         await update.message.reply_text(f"⚠️ 처리 실패: {exc}")
-        # Drop the user turn we just appended in run_agent.
         if history and history[-1].get("role") == "user":
             history.pop()
         return
@@ -729,6 +730,71 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     _trim_history(chat_id)
     for i in range(0, len(reply), 4000):
         await update.message.reply_text(reply[i : i + 4000])
+
+
+async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not (update.message.voice or update.message.audio):
+        return
+    chat_id = update.effective_chat.id
+    voice = update.message.voice or update.message.audio
+    mime = getattr(voice, "mime_type", "audio/ogg") or "audio/ogg"
+    logger.info("voice from %s: duration=%s mime=%s", chat_id, voice.duration, mime)
+
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    try:
+        tg_file = await voice.get_file()
+        bio = await tg_file.download_as_bytearray()
+        text = await transcribe.transcribe_voice(bytes(bio), mime)
+    except transcribe.TranscribeUnavailable:
+        await update.message.reply_text(
+            "음성 인식이 아직 켜져 있지 않아요. OPENAI_API_KEY를 Railway에 추가하면 켜집니다."
+        )
+        return
+    except Exception as exc:
+        logger.exception("transcribe failed")
+        await update.message.reply_text(f"⚠️ 음성 처리 실패: {exc}")
+        return
+
+    if not text:
+        await update.message.reply_text("음성에서 텍스트를 찾지 못했어요.")
+        return
+
+    logger.info("transcribed (%d chars): %r", len(text), text[:160])
+    await update.message.reply_text(f"🎙️ 들었어요: {text[:300]}\n\n처리 중…")
+    await _process_user_text(update, context, text, log_prefix="[voice] ")
+
+
+async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.photo:
+        return
+    chat_id = update.effective_chat.id
+    caption = (update.message.caption or "").strip()
+    photo = update.message.photo[-1]   # highest resolution
+    logger.info("photo from %s: %sx%s caption=%r", chat_id, photo.width, photo.height, caption[:80])
+
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    try:
+        tg_file = await photo.get_file()
+        bio = await tg_file.download_as_bytearray()
+        description = await transcribe.describe_image(bytes(bio), mime="image/jpeg", caption=caption or None)
+    except Exception as exc:
+        logger.exception("vision failed")
+        await update.message.reply_text(f"⚠️ 사진 처리 실패: {exc}")
+        return
+
+    logger.info("vision (%d chars): %r", len(description), description[:160])
+    await update.message.reply_text(f"📷 사진에서 추출:\n\n{description[:1500]}\n\n처리 중…")
+
+    user_text = f"[사진 첨부] caption={caption!r}\n추출된 정보:\n{description}"
+    await _process_user_text(update, context, user_text, log_prefix="[photo] ")
+
+
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not update.message or not update.message.text:
+        return
+    user_text = update.message.text
+    logger.info("msg from %s: %r", update.effective_chat.id, user_text[:200])
+    await _process_user_text(update, context, user_text)
 
 
 async def post_init(app: Application) -> None:
@@ -763,6 +829,8 @@ def main() -> None:
     app.add_handler(CommandHandler("notes", cmd_notes))
     app.add_handler(CommandHandler("tasks", cmd_tasks))
     app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
+    app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
