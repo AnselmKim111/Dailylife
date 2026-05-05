@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 DB_PATH = os.environ.get("DAILYLIFE_DB_PATH", "/data/dailylife.db")
 SCHEMA = """
@@ -41,6 +42,48 @@ CREATE TABLE IF NOT EXISTS recurring_tasks (
     last_run_utc TEXT,
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
+
+CREATE TABLE IF NOT EXISTS notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    content TEXT NOT NULL,
+    tags TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_notes_chat ON notes(chat_id, created_at DESC);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts
+    USING fts5(content, tags, content='notes', content_rowid='id', tokenize='trigram');
+
+CREATE TRIGGER IF NOT EXISTS notes_ai AFTER INSERT ON notes BEGIN
+    INSERT INTO notes_fts(rowid, content, tags) VALUES (new.id, new.content, COALESCE(new.tags, ''));
+END;
+CREATE TRIGGER IF NOT EXISTS notes_au AFTER UPDATE ON notes BEGIN
+    INSERT INTO notes_fts(notes_fts, rowid, content, tags) VALUES('delete', old.id, old.content, COALESCE(old.tags, ''));
+    INSERT INTO notes_fts(rowid, content, tags) VALUES (new.id, new.content, COALESCE(new.tags, ''));
+END;
+CREATE TRIGGER IF NOT EXISTS notes_ad AFTER DELETE ON notes BEGIN
+    INSERT INTO notes_fts(notes_fts, rowid, content, tags) VALUES('delete', old.id, old.content, COALESCE(old.tags, ''));
+END;
+
+CREATE TABLE IF NOT EXISTS chat_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    role TEXT NOT NULL,         -- 'user' | 'assistant'
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_chat_log_chat ON chat_log(chat_id, created_at DESC);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS chat_log_fts
+    USING fts5(content, content='chat_log', content_rowid='id', tokenize='trigram');
+
+CREATE TRIGGER IF NOT EXISTS chat_log_ai AFTER INSERT ON chat_log BEGIN
+    INSERT INTO chat_log_fts(rowid, content) VALUES (new.id, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS chat_log_ad AFTER DELETE ON chat_log BEGIN
+    INSERT INTO chat_log_fts(chat_log_fts, rowid, content) VALUES('delete', old.id, old.content);
+END;
 """
 
 _lock = threading.Lock()
@@ -228,3 +271,97 @@ def mark_recurring_run(task_id: int) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with _conn() as c:
         c.execute("UPDATE recurring_tasks SET last_run_utc=? WHERE id=?", (now, task_id))
+
+
+# ---------------- notes ----------------
+
+
+def add_note(chat_id: int, content: str, tags: Optional[str] = None) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO notes (chat_id, content, tags) VALUES (?,?,?)",
+            (chat_id, content.strip(), (tags or "").strip() or None),
+        )
+        return cur.lastrowid
+
+
+def list_notes(chat_id: int, limit: int = 20) -> List[sqlite3.Row]:
+    with _conn() as c:
+        return list(
+            c.execute(
+                "SELECT * FROM notes WHERE chat_id=? ORDER BY created_at DESC LIMIT ?",
+                (chat_id, limit),
+            )
+        )
+
+
+def delete_note(note_id: int, chat_id: int) -> bool:
+    with _conn() as c:
+        cur = c.execute("DELETE FROM notes WHERE id=? AND chat_id=?", (note_id, chat_id))
+        return cur.rowcount > 0
+
+
+def search_notes(chat_id: int, query: str, limit: int = 5) -> List[Dict]:
+    """Full-text search via FTS5 with LIKE fallback for short queries (trigram needs >=3 chars)."""
+    q = _fts_safe(query)
+    with _conn() as c:
+        if q:
+            rows = c.execute(
+                "SELECT n.id, n.content, n.tags, n.created_at, "
+                "  snippet(notes_fts, 0, '«', '»', '…', 12) AS snippet "
+                "FROM notes_fts JOIN notes n ON n.id = notes_fts.rowid "
+                "WHERE notes_fts MATCH ? AND n.chat_id=? "
+                "ORDER BY rank LIMIT ?",
+                (q, chat_id, limit),
+            ).fetchall()
+            if rows:
+                return [dict(r) for r in rows]
+        # LIKE fallback for short / non-trigrammable queries
+        rows = c.execute(
+            "SELECT id, content, tags, created_at, content AS snippet FROM notes "
+            "WHERE chat_id=? AND content LIKE ? ORDER BY created_at DESC LIMIT ?",
+            (chat_id, f"%{query.strip()}%", limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+# ---------------- chat log (episodic memory) ----------------
+
+
+def log_chat(chat_id: int, role: str, content: str) -> None:
+    if not content.strip():
+        return
+    with _conn() as c:
+        c.execute("INSERT INTO chat_log (chat_id, role, content) VALUES (?,?,?)",
+                  (chat_id, role, content.strip()))
+
+
+def search_chat_log(chat_id: int, query: str, limit: int = 5) -> List[Dict]:
+    q = _fts_safe(query)
+    with _conn() as c:
+        if q:
+            rows = c.execute(
+                "SELECT cl.id, cl.role, cl.content, cl.created_at, "
+                "  snippet(chat_log_fts, 0, '«', '»', '…', 14) AS snippet "
+                "FROM chat_log_fts JOIN chat_log cl ON cl.id = chat_log_fts.rowid "
+                "WHERE chat_log_fts MATCH ? AND cl.chat_id=? "
+                "ORDER BY rank LIMIT ?",
+                (q, chat_id, limit),
+            ).fetchall()
+            if rows:
+                return [dict(r) for r in rows]
+        rows = c.execute(
+            "SELECT id, role, content, created_at, content AS snippet FROM chat_log "
+            "WHERE chat_id=? AND content LIKE ? ORDER BY created_at DESC LIMIT ?",
+            (chat_id, f"%{query.strip()}%", limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def _fts_safe(query: str) -> str:
+    """Build an FTS5 MATCH clause. Drops tokens <3 chars (trigram tokenizer requires >=3).
+    Returns '' if nothing usable — caller should fall back to LIKE."""
+    tokens = [t for t in re.split(r"\s+", query.strip()) if len(t) >= 3]
+    if not tokens:
+        return ""
+    return " ".join(f'"{t.replace(chr(34), "")}"' for t in tokens)

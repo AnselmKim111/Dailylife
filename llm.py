@@ -248,6 +248,52 @@ TOOLS: List[Dict] = [
             },
         },
     },
+    # ---- notes + episodic memory ----
+    {
+        "type": "function",
+        "function": {
+            "name": "save_note",
+            "description": (
+                "Save a free-form short note for later recall. Use for quick captures the "
+                "user wants to remember but isn't a stable identity fact (use remember_fact "
+                "for that), an event with a time (use add_event), or a long-horizon goal "
+                "(use add_goal). Examples: '오늘 점심에 김철수 만남 — 인하대 후배', "
+                "'스벅에서 본 책 추천: ...', '아빠 생신 선물 후보들'."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "content": {"type": "string"},
+                    "tags": {"type": "string", "description": "Optional comma-separated tags."},
+                },
+                "required": ["content"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_memory",
+            "description": (
+                "Full-text search the user's saved notes AND past chat history (episodic). "
+                "Use for any 'what did I say about X', '내가 언제 X 얘기했지', "
+                "'지난주에 X 어땠어' style recall. Each query token ≥3 chars works best."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "kind": {
+                        "type": "string",
+                        "enum": ["notes", "chat", "all"],
+                        "description": "notes (saved notes only) | chat (past chat only) | all (default)",
+                    },
+                    "limit": {"type": "integer", "description": "Max hits per source (default 5)."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
     {
         "type": "function",
         "function": {

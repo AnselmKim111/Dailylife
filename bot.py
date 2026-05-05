@@ -35,17 +35,19 @@ HISTORY_LIMIT = int(os.environ.get("HISTORY_LIMIT", "16"))
 TZ = ZoneInfo(USER_TZ)
 
 SYSTEM_PROMPT_TEMPLATE = (
-    "You are Dailylife, the user's personal Telegram assistant for schedule, errands, and "
+    "You are Dailylife, the user's personal Telegram assistant for schedule, errands, memory, and "
     "general questions. Default to Korean unless the user writes another language. Be warm and concise.\n\n"
     "All datetimes the user mentions are in {tz} timezone. Convert relative times "
     "('내일 3시', 'in 2 hours', '다음 주 월요일') against current_time below.\n"
     "current_time: {now} ({tz})\n\n"
-    "When the user mentions a personal/stable fact about themselves (집 주소, 자대 위치, 가족 이름, "
-    "선호도 등), call remember_fact to persist it — don't just acknowledge in chat.\n"
-    "When asked something you can answer better with live data (영업시간, 길찾기, 운항정보, 시간표), "
-    "use the available tools (web_search, kakao_local_search, fetch_url, kakao_directions_drive) "
-    "instead of guessing.\n"
-    "When the user wants a recurring briefing ('매일 X시에 ~ 알려줘'), use add_recurring_task.\n\n"
+    "Tool routing:\n"
+    "- Stable identity facts (집 주소, 자대 위치, 가족 이름, 선호도) → remember_fact.\n"
+    "- Free-form short notes the user wants saved (점심 약속 메모, 책 추천, 선물 후보) → save_note.\n"
+    "- 'What did I say about X' / '지난주에 X 얘기 어땠지' style recall → search_memory.\n"
+    "- Time-bound appointment with a clock time → add_event.\n"
+    "- Daily recurring briefing ('매일 X시에 …') → add_recurring_task.\n"
+    "- Live data (영업시간, 길찾기, 운항정보, 시간표) → use web_search / kakao_local_search / "
+    "  fetch_url / kakao_directions_drive — don't guess.\n\n"
     "Known facts about this user:\n{facts_block}"
 )
 
@@ -245,6 +247,31 @@ def tool_delete_recurring_task(chat_id: int, args: Dict) -> Dict:
     return {"ok": ok, "task_id": int(tid)}
 
 
+# ---------------- notes + episodic memory ----------------
+
+
+def tool_save_note(chat_id: int, args: Dict) -> Dict:
+    content = (args.get("content") or "").strip()
+    if not content:
+        return {"ok": False, "error": "content required"}
+    nid = db.add_note(chat_id, content, args.get("tags"))
+    return {"ok": True, "note_id": nid}
+
+
+def tool_search_memory(chat_id: int, args: Dict) -> Dict:
+    query = (args.get("query") or "").strip()
+    if not query:
+        return {"ok": False, "error": "query required"}
+    kind = args.get("kind", "all")
+    limit = int(args.get("limit", 5))
+    out: Dict = {"ok": True, "query": query}
+    if kind in ("notes", "all"):
+        out["notes"] = db.search_notes(chat_id, query, limit)
+    if kind in ("chat", "all"):
+        out["chat_history"] = db.search_chat_log(chat_id, query, limit)
+    return out
+
+
 # ---------------- async external tool handlers ----------------
 
 
@@ -291,6 +318,8 @@ SYNC_HANDLERS = {
     "add_recurring_task": tool_add_recurring_task,
     "list_recurring_tasks": tool_list_recurring_tasks,
     "delete_recurring_task": tool_delete_recurring_task,
+    "save_note": tool_save_note,
+    "search_memory": tool_search_memory,
 }
 
 ASYNC_HANDLERS = {
@@ -436,6 +465,20 @@ async def cmd_facts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("기억하고 있는 정보:\n" + body)
 
 
+async def cmd_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    rows = db.list_notes(chat_id, limit=15)
+    if not rows:
+        await update.message.reply_text("저장된 메모가 없어요. 자유롭게 흘려도 알아서 저장할게요.")
+        return
+    lines = []
+    for r in rows:
+        when_local = datetime.fromisoformat(r["created_at"].rstrip("Z") + "+00:00").astimezone(TZ)
+        tag = f" · #{r['tags']}" if r["tags"] else ""
+        lines.append(f"#{r['id']} · {when_local.strftime('%m-%d %H:%M')}{tag}\n   {r['content']}")
+    await update.message.reply_text("최근 메모:\n" + "\n\n".join(lines))
+
+
 async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     rows = db.list_recurring_tasks(chat_id)
@@ -461,6 +504,8 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     user_text = update.message.text
     logger.info("msg from %s: %r", chat_id, user_text[:200])
 
+    db.log_chat(chat_id, "user", user_text)
+
     history = _history(chat_id)
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
@@ -474,6 +519,7 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             history.pop()
         return
 
+    db.log_chat(chat_id, "assistant", reply)
     _trim_history(chat_id)
     for i in range(0, len(reply), 4000):
         await update.message.reply_text(reply[i : i + 4000])
@@ -501,6 +547,7 @@ def main() -> None:
     app.add_handler(CommandHandler("week", cmd_week))
     app.add_handler(CommandHandler("agenda", cmd_agenda))
     app.add_handler(CommandHandler("facts", cmd_facts))
+    app.add_handler(CommandHandler("notes", cmd_notes))
     app.add_handler(CommandHandler("tasks", cmd_tasks))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
