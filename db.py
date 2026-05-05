@@ -9,8 +9,11 @@ import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Dict, Iterator, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 DB_PATH = os.environ.get("DAILYLIFE_DB_PATH", "/data/dailylife.db")
+USER_TZ_NAME = os.environ.get("USER_TZ", "Asia/Seoul")
+_USER_TZ = ZoneInfo(USER_TZ_NAME)
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -332,11 +335,15 @@ def log_usage(
 
 
 def usage_summary(chat_id: int) -> Dict:
-    """Return today/this-month totals + last 7-day daily series."""
-    today_local = datetime.now(timezone.utc).astimezone().date()
-    month_start = today_local.replace(day=1)
-    today_iso = today_local.isoformat()
-    month_start_iso = month_start.isoformat()
+    """Return today/this-month totals + last 7-day daily series.
+
+    Boundaries are computed in the user's local TZ but compared against UTC
+    timestamps in the DB — convert the local boundary to UTC ISO."""
+    now_local = datetime.now(_USER_TZ)
+    today_local_start = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+    month_local_start = today_local_start.replace(day=1)
+    today_iso = today_local_start.astimezone(timezone.utc).isoformat()
+    month_start_iso = month_local_start.astimezone(timezone.utc).isoformat()
     with _conn() as c:
         today_row = c.execute(
             "SELECT COUNT(*) AS n, COALESCE(SUM(cost_usd),0) AS cost, "
@@ -517,8 +524,11 @@ def mark_goal_reviewed(goal_id: int) -> None:
 
 
 def goals_due_within(chat_id: int, days: int) -> List[sqlite3.Row]:
-    """Open goals with target_date_local within today..today+days (inclusive)."""
-    today = datetime.now(timezone.utc).astimezone().date()
+    """Open goals with target_date_local within today..today+days (inclusive).
+
+    'today' is computed in the user's TZ since target_date_local is also stored
+    in the user's TZ as YYYY-MM-DD."""
+    today = datetime.now(_USER_TZ).date()
     upper = today.fromordinal(today.toordinal() + max(0, days))
     with _conn() as c:
         return list(
@@ -566,27 +576,31 @@ def delete_note(note_id: int, chat_id: int) -> bool:
 
 
 def search_notes(chat_id: int, query: str, limit: int = 5) -> List[Dict]:
-    """Full-text search via FTS5 with LIKE fallback for short queries (trigram needs >=3 chars)."""
+    """Full-text search via FTS5 trigram + per-token LIKE fallback.
+
+    Korean queries often have many 2-char tokens that don't trigger trigram FTS.
+    We always also try a per-token OR LIKE so '점심 만난 사람' matches a note
+    containing '점심에 김철수 만남'."""
     q = _fts_safe(query)
+    seen: Dict[int, Dict] = {}
     with _conn() as c:
         if q:
-            rows = c.execute(
+            for r in c.execute(
                 "SELECT n.id, n.content, n.tags, n.created_at, "
                 "  snippet(notes_fts, 0, '«', '»', '…', 12) AS snippet "
                 "FROM notes_fts JOIN notes n ON n.id = notes_fts.rowid "
                 "WHERE notes_fts MATCH ? AND n.chat_id=? "
                 "ORDER BY rank LIMIT ?",
                 (q, chat_id, limit),
-            ).fetchall()
-            if rows:
-                return [dict(r) for r in rows]
-        # LIKE fallback for short / non-trigrammable queries
-        rows = c.execute(
-            "SELECT id, content, tags, created_at, content AS snippet FROM notes "
-            "WHERE chat_id=? AND content LIKE ? ORDER BY created_at DESC LIMIT ?",
-            (chat_id, f"%{query.strip()}%", limit),
-        ).fetchall()
-        return [dict(r) for r in rows]
+            ).fetchall():
+                seen[r["id"]] = dict(r)
+        if len(seen) < limit:
+            for r in _like_fallback(c, "notes", chat_id, query, limit, "tags"):
+                if r["id"] not in seen:
+                    seen[r["id"]] = r
+                    if len(seen) >= limit:
+                        break
+    return list(seen.values())[:limit]
 
 
 # ---------------- chat log (episodic memory) ----------------
@@ -602,30 +616,96 @@ def log_chat(chat_id: int, role: str, content: str) -> None:
 
 def search_chat_log(chat_id: int, query: str, limit: int = 5) -> List[Dict]:
     q = _fts_safe(query)
+    seen: Dict[int, Dict] = {}
     with _conn() as c:
         if q:
-            rows = c.execute(
+            for r in c.execute(
                 "SELECT cl.id, cl.role, cl.content, cl.created_at, "
                 "  snippet(chat_log_fts, 0, '«', '»', '…', 14) AS snippet "
                 "FROM chat_log_fts JOIN chat_log cl ON cl.id = chat_log_fts.rowid "
                 "WHERE chat_log_fts MATCH ? AND cl.chat_id=? "
                 "ORDER BY rank LIMIT ?",
                 (q, chat_id, limit),
-            ).fetchall()
-            if rows:
-                return [dict(r) for r in rows]
-        rows = c.execute(
-            "SELECT id, role, content, created_at, content AS snippet FROM chat_log "
-            "WHERE chat_id=? AND content LIKE ? ORDER BY created_at DESC LIMIT ?",
-            (chat_id, f"%{query.strip()}%", limit),
-        ).fetchall()
-        return [dict(r) for r in rows]
+            ).fetchall():
+                d = dict(r)
+                seen[d["id"]] = d
+        if len(seen) < limit:
+            for r in _like_fallback(c, "chat_log", chat_id, query, limit, role_col=True):
+                if r["id"] not in seen:
+                    seen[r["id"]] = r
+                    if len(seen) >= limit:
+                        break
+    return list(seen.values())[:limit]
 
 
 def _fts_safe(query: str) -> str:
-    """Build an FTS5 MATCH clause. Drops tokens <3 chars (trigram tokenizer requires >=3).
-    Returns '' if nothing usable — caller should fall back to LIKE."""
-    tokens = [t for t in re.split(r"\s+", query.strip()) if len(t) >= 3]
-    if not tokens:
+    """Build an FTS5 MATCH clause for the trigram tokenizer.
+
+    Trigram FTS5 needs each MATCH term to be ≥3 chars. We ALSO accept 2-char
+    tokens by stitching them onto adjacent tokens — so '점심 만난' becomes
+    '점심만난' (5 chars, indexed via the trigram windows '점심만'/'심만난'/'만난').
+    Tokens that can't be combined are dropped (caller has LIKE fallback)."""
+    raw = [t.replace(chr(34), "") for t in re.split(r"\s+", query.strip()) if t]
+    if not raw:
         return ""
-    return " ".join(f'"{t.replace(chr(34), "")}"' for t in tokens)
+    out: List[str] = []
+    i = 0
+    while i < len(raw):
+        tok = raw[i]
+        if len(tok) >= 3:
+            out.append(tok)
+            i += 1
+            continue
+        # Stitch with next short token if available, else with previous.
+        if i + 1 < len(raw) and len(raw[i + 1]) < 3:
+            out.append(tok + raw[i + 1])
+            i += 2
+        elif i + 1 < len(raw):
+            out.append(tok + raw[i + 1])
+            i += 2
+        elif out:
+            out[-1] = out[-1] + tok
+            i += 1
+        else:
+            i += 1
+    out = [t for t in out if len(t) >= 3]
+    if not out:
+        return ""
+    return " OR ".join(f'"{t}"' for t in out)
+
+
+def _like_fallback(
+    c: sqlite3.Connection,
+    table: str,
+    chat_id: int,
+    query: str,
+    limit: int,
+    extra_field: Optional[str] = None,
+    role_col: bool = False,
+) -> List[Dict]:
+    """Per-token OR LIKE search — works for any short Korean token the trigram FTS
+    can't index. Tokens of len 1 are also kept (cheap and harmless on a small DB)."""
+    tokens = [t for t in re.split(r"\s+", query.strip()) if t]
+    if not tokens:
+        return []
+    parts: List[str] = []
+    params: List = [chat_id]
+    for t in tokens:
+        parts.append("content LIKE ?")
+        params.append(f"%{t}%")
+        if extra_field:
+            parts.append(f"{extra_field} LIKE ?")
+            params.append(f"%{t}%")
+    where = " OR ".join(parts)
+    if role_col:
+        sql = (
+            f"SELECT id, role, content, created_at, content AS snippet FROM {table} "
+            f"WHERE chat_id=? AND ({where}) ORDER BY created_at DESC LIMIT ?"
+        )
+    else:
+        sql = (
+            f"SELECT id, content, tags, created_at, content AS snippet FROM {table} "
+            f"WHERE chat_id=? AND ({where}) ORDER BY created_at DESC LIMIT ?"
+        )
+    params.append(limit)
+    return [dict(r) for r in c.execute(sql, params).fetchall()]

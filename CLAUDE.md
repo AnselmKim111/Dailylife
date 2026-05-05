@@ -38,6 +38,13 @@ A Telegram bot powered by OpenRouter LLMs, deployed on Railway as a worker.
 - Used for Naver Search API (local/blog/web — business hours, phone numbers).
 - Auth headers: `X-Naver-Client-Id`, `X-Naver-Client-Secret`.
 
+## Google Calendar OAuth
+
+- Client ID + Secret: stored in Railway as `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` (and in `.claude/secrets.local.md`).
+- Required scope: `https://www.googleapis.com/auth/calendar`.
+- Per-user `access_token` + `refresh_token` stored in `oauth_tokens` table (chat-scoped).
+- Bot exposes a small HTTP callback (`/oauth/google/callback`) on the Railway public domain to receive the OAuth redirect.
+
 ## Required Railway env vars
 
 | Name                 | Purpose                          |
