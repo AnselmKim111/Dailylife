@@ -9,10 +9,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
 
-from telegram import Update
+import secrets
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
+    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -54,6 +57,8 @@ SYSTEM_PROMPT_TEMPLATE = (
 
 # Per-chat in-memory short-term history (raw tool turns retained).
 chat_history: Dict[int, List[Dict]] = {}
+# token -> (kind, chat_id) — short-lived in-memory map of pending undo opportunities.
+_pending_undos: Dict[str, tuple] = {}
 
 
 # ---------------- helpers ----------------
@@ -179,8 +184,18 @@ def tool_delete_event(chat_id: int, args: Dict) -> Dict:
     eid = args.get("event_id")
     if not eid:
         return {"ok": False, "error": "event_id required"}
+    row = db.get_event(int(eid))
+    if not row or row["chat_id"] != chat_id:
+        return {"ok": False, "error": "event not found"}
+    payload = dict(row)
     ok = db.delete_event(int(eid), chat_id)
-    return {"ok": ok, "event_id": int(eid)}
+    if ok:
+        token = secrets.token_urlsafe(8)
+        db.push_deleted_audit(chat_id, "event", payload, token)
+        _pending_undos[token] = ("event", chat_id)
+    return {"ok": ok, "event_id": int(eid),
+            "undo_token": token if ok else None,
+            "undo_label": f"이벤트 #{eid} '{payload.get('title')}' 삭제 — 취소"}
 
 
 # ---------------- facts ----------------
@@ -199,7 +214,17 @@ def tool_forget_fact(chat_id: int, args: Dict) -> Dict:
     key = (args.get("key") or "").strip()
     if not key:
         return {"ok": False, "error": "key required"}
-    return {"ok": db.forget_fact(chat_id, key), "key": key}
+    # Capture pre-delete value for undo.
+    rows = [r for r in db.list_facts(chat_id) if r["key"] == key]
+    payload = dict(rows[0]) if rows else None
+    ok = db.forget_fact(chat_id, key)
+    token = None
+    if ok and payload:
+        token = secrets.token_urlsafe(8)
+        db.push_deleted_audit(chat_id, "fact", payload, token)
+        _pending_undos[token] = ("fact", chat_id)
+    return {"ok": ok, "key": key, "undo_token": token,
+            "undo_label": f"기억 '{key}' 삭제 — 취소"}
 
 
 # ---------------- recurring tasks ----------------
@@ -242,10 +267,19 @@ def tool_delete_recurring_task(chat_id: int, args: Dict) -> Dict:
     tid = args.get("task_id")
     if not tid:
         return {"ok": False, "error": "task_id required"}
+    row = db.get_recurring_task(int(tid))
+    if not row or row["chat_id"] != chat_id:
+        return {"ok": False, "error": "task not found"}
+    payload = dict(row)
     ok = db.delete_recurring_task(int(tid), chat_id)
+    token = None
     if ok:
         scheduler.cancel_recurring(int(tid))
-    return {"ok": ok, "task_id": int(tid)}
+        token = secrets.token_urlsafe(8)
+        db.push_deleted_audit(chat_id, "recurring", payload, token)
+        _pending_undos[token] = ("recurring", chat_id)
+    return {"ok": ok, "task_id": int(tid), "undo_token": token,
+            "undo_label": f"정기작업 #{tid} 삭제 — 취소"}
 
 
 # ---------------- goals (long-horizon, proactive) ----------------
@@ -448,7 +482,7 @@ async def run_agent(chat_id: int, user_text: str, history: Optional[List[Dict]] 
     final_text = ""
     for hop in range(max_hops):
         messages = [_system_message(chat_id), *history]
-        data = await chat_completion(messages, tools=TOOLS)
+        data = await chat_completion(messages, tools=TOOLS, chat_id=chat_id, kind="chat")
         msg = data["choices"][0]["message"]
         history.append(
             {
@@ -596,15 +630,21 @@ _app: Optional[Application] = None
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        "안녕하세요! Dailylife입니다. 일정 + 잡일 + 검색 도와드려요.\n\n"
-        "예) '내일 3시에 치과, 30분 전 알림'\n"
-        "    '내 집은 DMC 파크뷰 자이야. 기억해줘'\n"
-        "    '신촌 근처 지금 열린 한식집 찾아줘'\n"
-        "    '매일 7시에 우도 가는 배 운항 정보 알려줘'\n\n"
-        "/today /week /agenda — 일정 조회\n"
-        "/facts — 기억하고 있는 정보\n"
-        "/tasks — 정기 작업 목록\n"
-        "/reset — 대화 메모리 초기화"
+        "안녕하세요! Dailylife입니다. 일정·기억·검색·장기 골 챙김 다 도와드려요.\n\n"
+        "예시:\n"
+        "  • '내일 3시에 치과, 30분 전 알림'\n"
+        "  • '내 집은 DMC 파크뷰 자이야. 기억해줘'\n"
+        "  • '12월 25일 경서 프로포즈 여행 골 등록'\n"
+        "  • '신촌 근처 지금 열린 한식집 추천'\n"
+        "  • '매일 7시에 우도 운항 정보 알려줘'\n"
+        "  • 음성 메시지 / 사진 (포스터·영수증) 그냥 보내도 OK\n\n"
+        "명령어:\n"
+        "  /setup — 가이드 온보딩 (이름·집·자대·큰 일정 한 번에 등록)\n"
+        "  /today /week /agenda — 일정 조회\n"
+        "  /goals — 장기 골 목록    /review — 지금 골 리뷰 돌리기\n"
+        "  /notes — 메모 모음       /facts — 기억하는 정보\n"
+        "  /tasks — 정기 작업       /cost — OpenRouter 사용량\n"
+        "  /reset — 대화 메모리 초기화 (DB는 보존)"
     )
 
 
@@ -704,6 +744,133 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("대화 메모리 초기화 완료. 일정/기억은 그대로 보존.")
 
 
+SETUP_PROMPT = (
+    "사용자가 /setup을 실행해서 온보딩 모드야. 친근한 한국어로 다음을 멀티턴 흐름처럼 한번에 안내하고, "
+    "사용자가 '시작' 또는 '응' 등으로 응답하면 한 가지씩 받아서 remember_fact로 즉시 저장해. "
+    "묻는 순서:\n"
+    "  1) 어떻게 불러드리면 좋을지 (이름·별명) → fact 'preferred_name'\n"
+    "  2) 집 주소나 동네 → fact 'home_address' (가능하면 kakao_local_search로 좌표도 조회)\n"
+    "  3) 자대·직장 위치 → fact 'unit_location' or 'workplace'\n"
+    "  4) 외출/외박 정기 패턴 (매주 X요일 등) → 필요하면 add_recurring_task로 안내 메시지 등록\n"
+    "  5) 장기적으로 신경 쓰고 있는 큰 일정 (3개월+ 남은 것) — add_goal 여러 개\n"
+    "  6) 매주 일요일 9시 KST에 골 리뷰 보내드릴 거라 안내. 끄려면 'goal_review_enabled=false' 기억해달라고 말하면 됨.\n"
+    "한 번에 하나씩만 묻고, 사용자가 답하면 즉시 도구로 저장해. 친근하게."
+)
+
+
+async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    # Reset short-term history so the setup turn starts clean
+    chat_history.pop(chat_id, None)
+    history = _history(chat_id)
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    try:
+        reply = await run_agent(chat_id, SETUP_PROMPT, history=history)
+    except Exception as exc:
+        logger.exception("/setup failed")
+        await update.message.reply_text(f"⚠️ 온보딩 시작 실패: {exc}")
+        return
+    db.log_chat(chat_id, "assistant", reply)
+    for i in range(0, len(reply), 4000):
+        await update.message.reply_text(reply[i : i + 4000])
+
+
+async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    s = db.usage_summary(chat_id)
+    today = s["today"]
+    month = s["month"]
+    by_model = s["by_model_month"]
+    lines = [
+        "💰 OpenRouter 사용량",
+        "",
+        f"오늘:  {today['n']}콜  ·  ${today['cost']:.4f}  ·  in {today['pt']}/out {today['ct']} tok",
+        f"이번달: {month['n']}콜  ·  ${month['cost']:.4f}  ·  in {month['pt']}/out {month['ct']} tok",
+    ]
+    if by_model:
+        lines.append("")
+        lines.append("모델별 (이번달):")
+        for r in by_model[:5]:
+            lines.append(f"  • {r['model']}: {r['n']}콜  ${r['cost']:.4f}")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ---------------- inline-keyboard undo ----------------
+
+
+def _undo_keyboard(token: str, label: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton(text=f"↩️ {label}", callback_data=f"undo:{token}")]]
+    )
+
+
+def _collect_undo_offers(history_after_run: List[Dict]) -> List[tuple]:
+    """Walk the most recent assistant->tool turns and collect any (token, label)
+    from delete-style tool results so we can attach undo buttons."""
+    offers = []
+    for msg in history_after_run[-12:]:
+        if msg.get("role") != "tool":
+            continue
+        try:
+            content = json.loads(msg.get("content") or "{}")
+        except Exception:
+            continue
+        token = content.get("undo_token")
+        label = content.get("undo_label")
+        if token and label:
+            offers.append((token, label))
+    return offers
+
+
+async def on_callback_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cq = update.callback_query
+    if not cq or not (cq.data or "").startswith("undo:"):
+        return
+    token = cq.data.split(":", 1)[1]
+    audit = db.get_deleted_audit(token)
+    if not audit:
+        await cq.answer("이미 처리됐거나 만료된 취소 요청이에요.", show_alert=True)
+        return
+    chat_id = audit["chat_id"]
+    if cq.from_user and cq.message and cq.message.chat_id != chat_id:
+        await cq.answer("권한 없음.", show_alert=True)
+        return
+    payload = json.loads(audit["payload_json"])
+    kind = audit["kind"]
+    msg = ""
+    if kind == "event":
+        eid = db.add_event(
+            chat_id,
+            payload["title"],
+            datetime.fromisoformat(payload["when_utc"]),
+            payload.get("notes"),
+            payload.get("remind_lead_minutes"),
+        )
+        new_row = db.get_event(eid)
+        if new_row:
+            scheduler.schedule_for(new_row)
+        msg = f"이벤트 복구 완료 (#{eid})."
+    elif kind == "fact":
+        db.remember_fact(chat_id, payload["key"], payload["value"])
+        msg = f"기억 '{payload['key']}' 복구 완료."
+    elif kind == "recurring":
+        tid = db.add_recurring_task(chat_id, payload["cron_kst"], payload["prompt"])
+        new_row = db.get_recurring_task(tid)
+        if new_row:
+            scheduler.schedule_recurring(new_row)
+        msg = f"정기 작업 복구 완료 (#{tid})."
+    else:
+        msg = "복구 미지원 종류."
+    db.mark_audit_restored(audit["id"])
+    _pending_undos.pop(token, None)
+    await cq.answer("복구 완료.", show_alert=False)
+    try:
+        await cq.edit_message_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await context.bot.send_message(chat_id=chat_id, text=f"↩️ {msg}")
+
+
 async def _process_user_text(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -728,8 +895,16 @@ async def _process_user_text(
 
     db.log_chat(chat_id, "assistant", reply)
     _trim_history(chat_id)
+    undo_offers = _collect_undo_offers(history)
     for i in range(0, len(reply), 4000):
-        await update.message.reply_text(reply[i : i + 4000])
+        chunk = reply[i : i + 4000]
+        # Attach undo button (only first one) to the FINAL message chunk.
+        is_last = i + 4000 >= len(reply)
+        if is_last and undo_offers:
+            token, label = undo_offers[0]
+            await update.message.reply_text(chunk, reply_markup=_undo_keyboard(token, label))
+        else:
+            await update.message.reply_text(chunk)
 
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -829,6 +1004,9 @@ def main() -> None:
     app.add_handler(CommandHandler("notes", cmd_notes))
     app.add_handler(CommandHandler("tasks", cmd_tasks))
     app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("cost", cmd_cost))
+    app.add_handler(CommandHandler("setup", cmd_setup))
+    app.add_handler(CallbackQueryHandler(on_callback_undo, pattern=r"^undo:"))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))

@@ -441,6 +441,8 @@ async def chat_completion(
     messages: List[Dict],
     tools: Optional[List[Dict]] = None,
     tool_choice: Optional[str] = None,
+    chat_id: Optional[int] = None,
+    kind: str = "chat",
 ) -> Dict:
     payload: Dict = {"model": OPENROUTER_MODEL, "messages": messages}
     if tools:
@@ -458,7 +460,29 @@ async def chat_completion(
         if resp.status_code >= 400:
             logger.error("OpenRouter %s: %s", resp.status_code, resp.text)
             resp.raise_for_status()
-        return resp.json()
+        data = resp.json()
+    # Best-effort usage logging — never let logging failure poison the call.
+    try:
+        u = data.get("usage") or {}
+        # OpenRouter sometimes returns string cost; coerce.
+        cost = u.get("cost") or 0
+        if isinstance(cost, str):
+            try:
+                cost = float(cost)
+            except ValueError:
+                cost = 0.0
+        import db as _db   # local import to avoid circular
+        _db.log_usage(
+            chat_id=chat_id,
+            model=data.get("model") or OPENROUTER_MODEL,
+            prompt_tokens=int(u.get("prompt_tokens") or 0),
+            completion_tokens=int(u.get("completion_tokens") or 0),
+            cost_usd=float(cost or 0),
+            kind=kind,
+        )
+    except Exception:
+        logger.exception("usage logging failed (ignored)")
+    return data
 
 
 def parse_tool_calls(message: Dict) -> List[Dict]:

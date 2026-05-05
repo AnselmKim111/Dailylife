@@ -43,6 +43,29 @@ CREATE TABLE IF NOT EXISTS recurring_tasks (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+CREATE TABLE IF NOT EXISTS usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER,
+    model TEXT,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    cost_usd REAL,
+    kind TEXT,                  -- 'chat' | 'vision' | 'transcribe'
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_usage_created ON usage(created_at);
+
+CREATE TABLE IF NOT EXISTS deleted_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,           -- 'event' | 'goal' | 'recurring' | 'fact' | 'note'
+    payload_json TEXT NOT NULL,   -- full row at time of delete (for restore)
+    callback_token TEXT NOT NULL UNIQUE,  -- short token for callback_data
+    deleted_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    restored INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_audit_token ON deleted_audit(callback_token);
+
 CREATE TABLE IF NOT EXISTS goals (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER NOT NULL,
@@ -287,6 +310,81 @@ def mark_recurring_run(task_id: int) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with _conn() as c:
         c.execute("UPDATE recurring_tasks SET last_run_utc=? WHERE id=?", (now, task_id))
+
+
+# ---------------- usage / cost ----------------
+
+
+def log_usage(
+    chat_id: Optional[int],
+    model: Optional[str],
+    prompt_tokens: int,
+    completion_tokens: int,
+    cost_usd: float,
+    kind: str,
+) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO usage (chat_id, model, prompt_tokens, completion_tokens, cost_usd, kind) "
+            "VALUES (?,?,?,?,?,?)",
+            (chat_id, model, prompt_tokens, completion_tokens, cost_usd, kind),
+        )
+
+
+def usage_summary(chat_id: int) -> Dict:
+    """Return today/this-month totals + last 7-day daily series."""
+    today_local = datetime.now(timezone.utc).astimezone().date()
+    month_start = today_local.replace(day=1)
+    today_iso = today_local.isoformat()
+    month_start_iso = month_start.isoformat()
+    with _conn() as c:
+        today_row = c.execute(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(cost_usd),0) AS cost, "
+            "  COALESCE(SUM(prompt_tokens),0) AS pt, COALESCE(SUM(completion_tokens),0) AS ct "
+            "FROM usage WHERE chat_id=? AND created_at >= ?",
+            (chat_id, today_iso),
+        ).fetchone()
+        month_row = c.execute(
+            "SELECT COUNT(*) AS n, COALESCE(SUM(cost_usd),0) AS cost, "
+            "  COALESCE(SUM(prompt_tokens),0) AS pt, COALESCE(SUM(completion_tokens),0) AS ct "
+            "FROM usage WHERE chat_id=? AND created_at >= ?",
+            (chat_id, month_start_iso),
+        ).fetchone()
+        by_model = c.execute(
+            "SELECT model, COUNT(*) AS n, COALESCE(SUM(cost_usd),0) AS cost "
+            "FROM usage WHERE chat_id=? AND created_at >= ? GROUP BY model ORDER BY cost DESC",
+            (chat_id, month_start_iso),
+        ).fetchall()
+    return {
+        "today": dict(today_row),
+        "month": dict(month_row),
+        "by_model_month": [dict(r) for r in by_model],
+    }
+
+
+# ---------------- delete audit (for undo) ----------------
+
+
+def push_deleted_audit(chat_id: int, kind: str, payload: Dict, token: str) -> int:
+    payload_json = _json.dumps(payload, ensure_ascii=False)
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO deleted_audit (chat_id, kind, payload_json, callback_token) VALUES (?,?,?,?)",
+            (chat_id, kind, payload_json, token),
+        )
+        return cur.lastrowid
+
+
+def get_deleted_audit(token: str) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM deleted_audit WHERE callback_token=? AND restored=0", (token,)
+        ).fetchone()
+
+
+def mark_audit_restored(audit_id: int) -> None:
+    with _conn() as c:
+        c.execute("UPDATE deleted_audit SET restored=1 WHERE id=?", (audit_id,))
 
 
 # ---------------- goals ----------------
