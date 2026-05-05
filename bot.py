@@ -24,6 +24,8 @@ from telegram.ext import (
 
 import db
 import external
+import gcal
+import oauth_server
 import scheduler
 import transcribe
 from llm import TOOLS, USER_TZ, chat_completion, parse_tool_calls
@@ -48,10 +50,11 @@ SYSTEM_PROMPT_TEMPLATE = (
     "- Stable identity facts (집 주소, 자대 위치, 가족 이름, 선호도) → remember_fact.\n"
     "- Free-form short notes the user wants saved (점심 약속 메모, 책 추천, 선물 후보) → save_note.\n"
     "- 'What did I say about X' / '지난주에 X 얘기 어땠지' style recall → search_memory.\n"
-    "- Time-bound appointment with a clock time → add_event.\n"
+    "- Time-bound appointment with a clock time → add_event AND, if user has connected Google Calendar, also gcal_create_event for cross-device sync.\n"
     "- Daily recurring briefing ('매일 X시에 …') → add_recurring_task.\n"
     "- Live data (영업시간, 길찾기, 운항정보, 시간표) → use web_search / kakao_local_search / "
-    "  fetch_url / kakao_directions_drive — don't guess.\n\n"
+    "  fetch_url / kakao_directions_drive — don't guess.\n"
+    "- Google Calendar specifically (구글 캘린더 / Google Calendar 키워드) → use gcal_* tools.\n\n"
     "Known facts about this user:\n{facts_block}"
 )
 
@@ -442,6 +445,69 @@ async def tool_fetch_url(chat_id: int, args: Dict) -> Dict:
     )
 
 
+# ---------------- Google Calendar tool handlers ----------------
+
+
+async def tool_gcal_list_events(chat_id: int, args: Dict) -> Dict:
+    try:
+        events = await gcal.list_events(
+            chat_id,
+            time_min_iso=args.get("time_min_iso"),
+            time_max_iso=args.get("time_max_iso"),
+            max_results=int(args.get("max_results", 25)),
+        )
+        return {"ok": True, "events": events}
+    except gcal.NotConnected as e:
+        return {"ok": False, "error": str(e), "needs_connect": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def tool_gcal_create_event(chat_id: int, args: Dict) -> Dict:
+    try:
+        ev = await gcal.create_event(
+            chat_id,
+            summary=args["summary"],
+            start_iso=args["start_iso"],
+            end_iso=args.get("end_iso"),
+            description=args.get("description"),
+            location=args.get("location"),
+        )
+        return {"ok": True, "event_id": ev.get("id"), "html_link": ev.get("htmlLink")}
+    except gcal.NotConnected as e:
+        return {"ok": False, "error": str(e), "needs_connect": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def tool_gcal_update_event(chat_id: int, args: Dict) -> Dict:
+    try:
+        ev = await gcal.update_event(
+            chat_id,
+            event_id=args["event_id"],
+            summary=args.get("summary"),
+            start_iso=args.get("start_iso"),
+            end_iso=args.get("end_iso"),
+            description=args.get("description"),
+            location=args.get("location"),
+        )
+        return {"ok": True, "event_id": ev.get("id")}
+    except gcal.NotConnected as e:
+        return {"ok": False, "error": str(e), "needs_connect": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def tool_gcal_delete_event(chat_id: int, args: Dict) -> Dict:
+    try:
+        await gcal.delete_event(chat_id, event_id=args["event_id"])
+        return {"ok": True, "event_id": args["event_id"]}
+    except gcal.NotConnected as e:
+        return {"ok": False, "error": str(e), "needs_connect": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 SYNC_HANDLERS = {
     "add_event": tool_add_event,
     "list_events": tool_list_events,
@@ -467,6 +533,10 @@ ASYNC_HANDLERS = {
     "kakao_local_search": tool_kakao_local,
     "kakao_directions_drive": tool_kakao_drive,
     "fetch_url": tool_fetch_url,
+    "gcal_list_events": tool_gcal_list_events,
+    "gcal_create_event": tool_gcal_create_event,
+    "gcal_update_event": tool_gcal_update_event,
+    "gcal_delete_event": tool_gcal_delete_event,
 }
 
 
@@ -775,6 +845,47 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(reply[i : i + 4000])
 
 
+async def cmd_connect_gcal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    if not gcal.is_configured():
+        await update.message.reply_text(
+            "Google Calendar 연동이 아직 설정되지 않았어요. "
+            "관리자가 GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET을 추가해야 합니다."
+        )
+        return
+    auth_url = gcal.build_auth_url(chat_id)
+    await update.message.reply_text(
+        "📅 Google 캘린더 연동\n\n"
+        "아래 링크에서 본인 Google 계정으로 로그인 + 캘린더 권한을 허용해주세요.\n"
+        "허용이 끝나면 자동으로 이 채팅에 연동 완료 메시지가 옵니다.\n\n"
+        f"{auth_url}\n\n"
+        "(링크는 한 번만 사용 가능. 만료되면 /connect_gcal 다시 입력)"
+    )
+
+
+async def cmd_gcal_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    row = db.get_oauth_token(chat_id, "google")
+    if not row:
+        await update.message.reply_text("Google 캘린더 미연결. /connect_gcal 로 연결하세요.")
+        return
+    txt = (
+        "✅ Google 캘린더 연결됨\n"
+        f"• scope: {row['scopes']}\n"
+        f"• 갱신: {row['updated_at']}\n"
+        f"• 만료: {row['expires_at_utc']}"
+    )
+    await update.message.reply_text(txt)
+
+
+async def cmd_disconnect_gcal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    ok = db.delete_oauth_token(chat_id, "google")
+    await update.message.reply_text(
+        "🔌 Google 캘린더 연동 해제됨." if ok else "이미 연동되어 있지 않아요."
+    )
+
+
 async def cmd_cost(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     s = db.usage_summary(chat_id)
@@ -982,7 +1093,13 @@ async def post_init(app: Application) -> None:
         run_weekly_goal_review,
         run_daily_imminent_check,
     )
-    logger.info("post_init: db ready, scheduler running")
+    # Start the aiohttp OAuth/health server alongside polling. Failure here is
+    # non-fatal — bot keeps polling, only the Google Calendar OAuth flow breaks.
+    try:
+        await oauth_server.start_oauth_server(app.bot)
+        logger.info("post_init: db + scheduler + oauth server ready")
+    except Exception:
+        logger.exception("oauth server failed to start (bot continues without it)")
 
 
 def main() -> None:
@@ -1006,6 +1123,9 @@ def main() -> None:
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("cost", cmd_cost))
     app.add_handler(CommandHandler("setup", cmd_setup))
+    app.add_handler(CommandHandler("connect_gcal", cmd_connect_gcal))
+    app.add_handler(CommandHandler("gcal_status", cmd_gcal_status))
+    app.add_handler(CommandHandler("disconnect_gcal", cmd_disconnect_gcal))
     app.add_handler(CallbackQueryHandler(on_callback_undo, pattern=r"^undo:"))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))

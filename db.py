@@ -126,6 +126,18 @@ END;
 CREATE TRIGGER IF NOT EXISTS chat_log_ad AFTER DELETE ON chat_log BEGIN
     INSERT INTO chat_log_fts(chat_log_fts, rowid, content) VALUES('delete', old.id, old.content);
 END;
+
+CREATE TABLE IF NOT EXISTS oauth_tokens (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    provider TEXT NOT NULL,           -- 'google'
+    access_token TEXT NOT NULL,
+    refresh_token TEXT,
+    expires_at_utc TEXT,              -- ISO 8601 UTC; NULL = no known expiry
+    scopes TEXT,                       -- space-separated
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(chat_id, provider)
+);
 """
 
 _lock = threading.Lock()
@@ -709,3 +721,53 @@ def _like_fallback(
         )
     params.append(limit)
     return [dict(r) for r in c.execute(sql, params).fetchall()]
+
+
+# ---------------- oauth tokens (Google Calendar etc.) ----------------
+
+
+def save_oauth_token(
+    chat_id: int,
+    provider: str,
+    access_token: str,
+    refresh_token: Optional[str],
+    expires_at_utc: Optional[str],
+    scopes: Optional[str],
+) -> None:
+    """Upsert tokens. We KEEP the existing refresh_token if Google omits one
+    on a refresh response (which they often do)."""
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as c:
+        existing = c.execute(
+            "SELECT refresh_token FROM oauth_tokens WHERE chat_id=? AND provider=?",
+            (chat_id, provider),
+        ).fetchone()
+        if existing and not refresh_token:
+            refresh_token = existing["refresh_token"]
+        c.execute(
+            "INSERT INTO oauth_tokens (chat_id, provider, access_token, refresh_token, "
+            "expires_at_utc, scopes, updated_at) VALUES (?,?,?,?,?,?,?) "
+            "ON CONFLICT(chat_id, provider) DO UPDATE SET "
+            "  access_token=excluded.access_token, "
+            "  refresh_token=excluded.refresh_token, "
+            "  expires_at_utc=excluded.expires_at_utc, "
+            "  scopes=excluded.scopes, "
+            "  updated_at=excluded.updated_at",
+            (chat_id, provider, access_token, refresh_token, expires_at_utc, scopes, now),
+        )
+
+
+def get_oauth_token(chat_id: int, provider: str) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM oauth_tokens WHERE chat_id=? AND provider=?",
+            (chat_id, provider),
+        ).fetchone()
+
+
+def delete_oauth_token(chat_id: int, provider: str) -> bool:
+    with _conn() as c:
+        cur = c.execute(
+            "DELETE FROM oauth_tokens WHERE chat_id=? AND provider=?", (chat_id, provider)
+        )
+        return cur.rowcount > 0

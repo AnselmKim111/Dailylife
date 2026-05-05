@@ -434,6 +434,80 @@ TOOLS: List[Dict] = [
             },
         },
     },
+    # ---- Google Calendar (per-user OAuth) ----
+    {
+        "type": "function",
+        "function": {
+            "name": "gcal_list_events",
+            "description": (
+                "List events on the user's Google Calendar in a time window. "
+                "Use any time the user asks about Google Calendar specifically OR when "
+                "they ask 'what's on my schedule' and you need authoritative data. "
+                "Returns google event ids that can be passed to gcal_update_event / gcal_delete_event."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "time_min_iso": {"type": "string", "description": f"Inclusive start in {USER_TZ}. Omit = now."},
+                    "time_max_iso": {"type": "string", "description": f"Inclusive end in {USER_TZ}. Omit = no upper bound."},
+                    "max_results": {"type": "integer", "description": "Default 25, max 100."},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "gcal_create_event",
+            "description": (
+                "Create an event on the user's Google Calendar. Use whenever the user "
+                "wants something on their actual Google Calendar (not just bot's local store). "
+                "If you also use add_event for a local reminder, that's fine — both can coexist."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string", "description": "Event title."},
+                    "start_iso": {"type": "string", "description": f"Start datetime in {USER_TZ} ISO 8601."},
+                    "end_iso": {"type": "string", "description": "Optional. Defaults to start + 1h."},
+                    "description": {"type": "string"},
+                    "location": {"type": "string"},
+                },
+                "required": ["summary", "start_iso"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "gcal_update_event",
+            "description": "Modify a Google Calendar event. event_id comes from gcal_list_events.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "event_id": {"type": "string"},
+                    "summary": {"type": "string"},
+                    "start_iso": {"type": "string"},
+                    "end_iso": {"type": "string"},
+                    "description": {"type": "string"},
+                    "location": {"type": "string"},
+                },
+                "required": ["event_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "gcal_delete_event",
+            "description": "Delete a Google Calendar event by id.",
+            "parameters": {
+                "type": "object",
+                "properties": {"event_id": {"type": "string"}},
+                "required": ["event_id"],
+            },
+        },
+    },
 ]
 
 
