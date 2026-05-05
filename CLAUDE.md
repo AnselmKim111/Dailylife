@@ -44,9 +44,14 @@ A Telegram bot powered by OpenRouter LLMs, deployed on Railway as a worker.
 |----------------------|----------------------------------|
 | `TELEGRAM_BOT_TOKEN` | Telegram Bot API HTTP token      |
 | `OPENROUTER_API_KEY` | OpenRouter API key               |
-| `OPENROUTER_MODEL`   | Optional model id override       |
-| `SYSTEM_PROMPT`      | Optional system prompt override  |
-| `HISTORY_LIMIT`      | Max conversation turns kept (default 12) |
+| `OPENROUTER_MODEL`   | Optional model id override (default `anthropic/claude-haiku-4.5`) |
+| `OPENROUTER_VISION_MODEL` | Optional vision model id (default same as OPENROUTER_MODEL) |
+| `KAKAO_REST_API_KEY` | Kakao Local + Mobility           |
+| `NAVER_CLIENT_ID` / `NAVER_CLIENT_SECRET` | Naver Search API |
+| `OPENAI_API_KEY`     | Whisper STT for Telegram voice notes (optional — voice falls back gracefully if missing) |
+| `USER_TZ`            | Default `Asia/Seoul`             |
+| `HISTORY_LIMIT`      | Max conversation turns kept (default 16) |
+| `DAILYLIFE_DB_PATH`  | Default `/data/dailylife.db` (Railway volume) |
 
 ## Common commands
 
@@ -71,6 +76,20 @@ RAILWAY_TOKEN=$RAILWAY_TOKEN railway up --service Dailylife --ci
 pip install -r requirements.txt
 TELEGRAM_BOT_TOKEN=... OPENROUTER_API_KEY=... python bot.py
 ```
+
+## Bot capabilities (current state)
+
+- **Memory**: schedule events (with reminders), free-form notes (FTS5 trigram + LIKE fallback), facts (key/value), full chat-log search.
+- **Long-horizon goals** with auto-armed proactive crons:
+    - Sun 09:00 KST: full agent-driven weekly goal review (web_search/fetch_url for `watch_query`, can add sub-tasks/events).
+    - Daily 08:00 KST: silent unless any open goal is within D-7.
+    - Opt-out via fact `goal_review_enabled=false`.
+- **Multi-modal input**: voice (Whisper, needs `OPENAI_API_KEY`), photo (Haiku 4.5 vision via OpenRouter — extracts events/expenses/places/notes from images).
+- **External tools**: Naver Search, Kakao Local + Address, Kakao Mobility (driving), generic `fetch_url`.
+- **Recurring tasks**: arbitrary daily prompt at HH:MM KST runs the agent loop with full tool access and pushes the answer.
+- **Cost tracking**: every OpenRouter call logged with usage + cost; `/cost` rolls up today / this-month + per-model.
+- **Inline-keyboard undo**: every destructive tool call (delete event/fact/recurring) snapshots the row and surfaces an `↩️ 취소` button on the bot's reply.
+- **/setup**: one-shot guided onboarding that walks the user through name, home, unit, recurring patterns, and long-horizon goals.
 
 ## Branch
 
