@@ -247,6 +247,105 @@ def tool_delete_recurring_task(chat_id: int, args: Dict) -> Dict:
     return {"ok": ok, "task_id": int(tid)}
 
 
+# ---------------- goals (long-horizon, proactive) ----------------
+
+
+def tool_add_goal(chat_id: int, args: Dict) -> Dict:
+    title = (args.get("title") or "").strip()
+    if not title:
+        return {"ok": False, "error": "title required"}
+    gid = db.add_goal(
+        chat_id,
+        title,
+        why=args.get("why"),
+        target_date_local=args.get("target_date_local"),
+        horizon=args.get("horizon", "long"),
+        sub_tasks=args.get("sub_tasks") or [],
+        watch_query=args.get("watch_query"),
+    )
+    # First time a goal is added on this chat, ensure the proactive crons are armed.
+    scheduler.ensure_proactive_for(chat_id)
+    return {"ok": True, "goal_id": gid}
+
+
+def tool_list_goals(chat_id: int, args: Dict) -> Dict:
+    status = args.get("status") or "open"
+    if status == "all":
+        rows = db.list_goals(chat_id, status=None)
+    else:
+        rows = db.list_goals(chat_id, status=status)
+    return {
+        "ok": True,
+        "goals": [
+            {
+                "id": r["id"],
+                "title": r["title"],
+                "why": r["why"],
+                "target_date_local": r["target_date_local"],
+                "horizon": r["horizon"],
+                "status": r["status"],
+                "sub_tasks": _parse_sub_tasks(r["sub_tasks_json"]),
+                "watch_query": r["watch_query"],
+                "last_reviewed_utc": r["last_reviewed_utc"],
+            }
+            for r in rows
+        ],
+    }
+
+
+def tool_update_goal(chat_id: int, args: Dict) -> Dict:
+    gid = args.get("goal_id")
+    if not gid:
+        return {"ok": False, "error": "goal_id required"}
+    ok = db.update_goal(
+        int(gid),
+        chat_id,
+        title=args.get("title"),
+        why=args.get("why"),
+        target_date_local=args.get("target_date_local"),
+        horizon=args.get("horizon"),
+        status=args.get("status"),
+        watch_query=args.get("watch_query"),
+    )
+    return {"ok": ok, "goal_id": int(gid)}
+
+
+def tool_complete_goal(chat_id: int, args: Dict) -> Dict:
+    gid = args.get("goal_id")
+    if not gid:
+        return {"ok": False, "error": "goal_id required"}
+    return {"ok": db.update_goal(int(gid), chat_id, status="done"), "goal_id": int(gid)}
+
+
+def tool_add_goal_subtask(chat_id: int, args: Dict) -> Dict:
+    gid = args.get("goal_id")
+    text = (args.get("text") or "").strip()
+    if not gid or not text:
+        return {"ok": False, "error": "goal_id + text required"}
+    return {"ok": db.add_goal_subtask(int(gid), chat_id, text), "goal_id": int(gid)}
+
+
+def tool_complete_goal_subtask(chat_id: int, args: Dict) -> Dict:
+    gid = args.get("goal_id")
+    idx = args.get("sub_index")
+    if not gid or idx is None:
+        return {"ok": False, "error": "goal_id + sub_index required"}
+    return {
+        "ok": db.complete_goal_subtask(int(gid), chat_id, int(idx)),
+        "goal_id": int(gid),
+        "sub_index": int(idx),
+    }
+
+
+def _parse_sub_tasks(raw: Optional[str]) -> list:
+    if not raw:
+        return []
+    try:
+        return json.loads(raw)
+    except Exception:
+        return []
+
+
 # ---------------- notes + episodic memory ----------------
 
 
@@ -320,6 +419,12 @@ SYNC_HANDLERS = {
     "delete_recurring_task": tool_delete_recurring_task,
     "save_note": tool_save_note,
     "search_memory": tool_search_memory,
+    "add_goal": tool_add_goal,
+    "list_goals": tool_list_goals,
+    "update_goal": tool_update_goal,
+    "complete_goal": tool_complete_goal,
+    "add_goal_subtask": tool_add_goal_subtask,
+    "complete_goal_subtask": tool_complete_goal_subtask,
 }
 
 ASYNC_HANDLERS = {
@@ -404,6 +509,84 @@ async def run_recurring_task(task_id: int) -> None:
     db.mark_recurring_run(task_id)
 
 
+# ---------------- proactive runners (weekly review + daily imminent) ----------------
+
+
+def _days_until(target_date_local: Optional[str]) -> Optional[int]:
+    if not target_date_local:
+        return None
+    try:
+        target = datetime.fromisoformat(target_date_local).date()
+    except ValueError:
+        return None
+    today = datetime.now(TZ).date()
+    return (target - today).days
+
+
+def _format_goal_summary(goal_row) -> str:
+    d = _days_until(goal_row["target_date_local"])
+    head = f"#{goal_row['id']} · {goal_row['title']}"
+    if d is not None:
+        head += f"  (D-{d})" if d >= 0 else f"  (D+{-d})"
+    if goal_row["why"]:
+        head += f"\n  ↳ {goal_row['why']}"
+    subs = _parse_sub_tasks(goal_row["sub_tasks_json"])
+    open_subs = [s for s in subs if not s.get("done")]
+    if open_subs:
+        head += "\n  ↳ 남은 작업: " + ", ".join(s["text"] for s in open_subs[:3])
+    if goal_row["watch_query"]:
+        head += f"\n  ↳ watch: {goal_row['watch_query']}"
+    return head
+
+
+WEEKLY_REVIEW_PROMPT = (
+    "이번 주 골 리뷰 시간이야. 사용자가 잊지 않도록 봇이 능동적으로 챙기는 자리.\n"
+    "아래는 현재 open 상태인 모든 goals (sub_tasks 포함). 각 goal에 대해:\n"
+    "  1) 일정대로 굴러가는지 (마감 D-n 보고)\n"
+    "  2) 이번 주 안에 하면 좋은 액션 1~2개를 sub_task로 추가하거나 add_event\n"
+    "  3) watch_query가 있으면 web_search 또는 fetch_url로 최근 정보(가격/혜택/이벤트)를 한 번 확인해 알림\n"
+    "  4) 너무 늦거나 흐려진 goal은 사용자에게 status 변경(paused/dropped) 제안\n"
+    "필요한 도구는 자유롭게 사용. 마지막 답은 사용자에게 보낼 깔끔한 한국어 요약.\n\n"
+    "현재 goals:\n{goals_block}"
+)
+
+
+async def run_weekly_goal_review(chat_id: int) -> None:
+    """Proactive weekly review fired by scheduler (Sun 09:00 KST or forced trigger)."""
+    rows = db.list_goals(chat_id, status="open")
+    bot = _app.bot if _app else None
+    if not rows:
+        return
+    goals_block = "\n\n".join(_format_goal_summary(r) for r in rows)
+    user_msg = WEEKLY_REVIEW_PROMPT.format(goals_block=goals_block)
+    logger.info("weekly review for chat=%s with %d goals", chat_id, len(rows))
+    try:
+        reply = await run_agent(chat_id, user_msg, history=[], max_hops=10)
+    except Exception as exc:
+        logger.exception("weekly review agent failed")
+        reply = f"⚠️ 주간 골 리뷰 중 오류: {exc}"
+    for r in rows:
+        db.mark_goal_reviewed(r["id"])
+    if bot:
+        header = "📋 이번 주 골 리뷰\n\n"
+        text = header + reply
+        for i in range(0, len(text), 4000):
+            await bot.send_message(chat_id=chat_id, text=text[i : i + 4000])
+
+
+async def run_daily_imminent_check(chat_id: int) -> None:
+    """Daily 08:00 — push only if any goal target_date is within D-7."""
+    rows = db.goals_due_within(chat_id, days=7)
+    bot = _app.bot if _app else None
+    if not rows or not bot:
+        return
+    lines = ["📌 임박한 골 (D-7 이내)"]
+    for r in rows:
+        d = _days_until(r["target_date_local"])
+        lines.append(f"• D-{d} · #{r['id']} {r['title']}")
+    await bot.send_message(chat_id=chat_id, text="\n".join(lines))
+
+
 # ---------------- Telegram handlers ----------------
 
 
@@ -463,6 +646,29 @@ async def cmd_facts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     body = "\n".join(f"• {r['key']}: {r['value']}" for r in rows)
     await update.message.reply_text("기억하고 있는 정보:\n" + body)
+
+
+async def cmd_goals(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    rows = db.list_goals(chat_id, status="open")
+    if not rows:
+        await update.message.reply_text(
+            "등록된 골 없음. 자유롭게 말씀해주시면 큰 일정·장기 목표는 자동으로 골로 넣을게요."
+        )
+        return
+    body = "\n\n".join(_format_goal_summary(r) for r in rows)
+    await update.message.reply_text("📋 진행 중인 골:\n\n" + body)
+
+
+async def cmd_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Force the weekly review for the current chat (otherwise it fires Sun 09:00 KST)."""
+    chat_id = update.effective_chat.id
+    rows = db.list_goals(chat_id, status="open")
+    if not rows:
+        await update.message.reply_text("리뷰할 골이 없어요. 먼저 큰 목표 몇 개 알려주세요.")
+        return
+    await update.message.reply_text("주간 리뷰 돌리는 중… 잠시만요. 도구 호출이 많을 수 있어요.")
+    await run_weekly_goal_review(chat_id)
 
 
 async def cmd_notes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -529,7 +735,12 @@ async def post_init(app: Application) -> None:
     global _app
     _app = app
     db.init_db()
-    scheduler.init(app.bot, run_recurring_task)
+    scheduler.init(
+        app.bot,
+        run_recurring_task,
+        run_weekly_goal_review,
+        run_daily_imminent_check,
+    )
     logger.info("post_init: db ready, scheduler running")
 
 
@@ -547,6 +758,8 @@ def main() -> None:
     app.add_handler(CommandHandler("week", cmd_week))
     app.add_handler(CommandHandler("agenda", cmd_agenda))
     app.add_handler(CommandHandler("facts", cmd_facts))
+    app.add_handler(CommandHandler("goals", cmd_goals))
+    app.add_handler(CommandHandler("review", cmd_review))
     app.add_handler(CommandHandler("notes", cmd_notes))
     app.add_handler(CommandHandler("tasks", cmd_tasks))
     app.add_handler(CommandHandler("reset", cmd_reset))

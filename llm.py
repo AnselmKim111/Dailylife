@@ -248,6 +248,128 @@ TOOLS: List[Dict] = [
             },
         },
     },
+    # ---- long-horizon goals (proactive engine) ----
+    {
+        "type": "function",
+        "function": {
+            "name": "add_goal",
+            "description": (
+                "Save a LONG-HORIZON goal (weeks/months away, big enough that the user is likely "
+                "to forget without a system). Examples: '12월 말 프로포즈 여행', '6월 동기들과 제주', "
+                "'약혼반지 살 상품권 미리 알아보기', '신혼여행 2월'. Different from add_event "
+                "(specific clock time soon) and save_note (no horizon). "
+                "If the goal involves periodic price/availability watching (gift cards, hotel rates, "
+                "concert tickets), set watch_query so the weekly review can fetch fresh info."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string"},
+                    "why": {"type": "string", "description": "Why this matters / context."},
+                    "target_date_local": {
+                        "type": "string",
+                        "description": f"YYYY-MM-DD in {USER_TZ}. Omit if vague.",
+                    },
+                    "horizon": {
+                        "type": "string",
+                        "enum": ["short", "medium", "long"],
+                        "description": "short (~1mo), medium (~3mo), long (3mo+).",
+                    },
+                    "sub_tasks": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional initial breakdown.",
+                    },
+                    "watch_query": {
+                        "type": "string",
+                        "description": (
+                            "Optional Naver-search-friendly query for periodic monitoring. "
+                            "Example: '신세계상품권 5% 할인'. Bot will run web_search on this weekly."
+                        ),
+                    },
+                },
+                "required": ["title"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_goals",
+            "description": "List the user's goals (default: open).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["open", "done", "paused", "dropped", "all"],
+                    },
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_goal",
+            "description": "Modify fields of an existing goal. Use to push out target_date, refine why, or change watch_query.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal_id": {"type": "integer"},
+                    "title": {"type": "string"},
+                    "why": {"type": "string"},
+                    "target_date_local": {"type": "string"},
+                    "horizon": {"type": "string", "enum": ["short", "medium", "long"]},
+                    "status": {"type": "string", "enum": ["open", "done", "paused", "dropped"]},
+                    "watch_query": {"type": "string"},
+                },
+                "required": ["goal_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "complete_goal",
+            "description": "Mark a goal as done.",
+            "parameters": {
+                "type": "object",
+                "properties": {"goal_id": {"type": "integer"}},
+                "required": ["goal_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_goal_subtask",
+            "description": "Add a sub-step to an existing goal.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal_id": {"type": "integer"},
+                    "text": {"type": "string"},
+                },
+                "required": ["goal_id", "text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "complete_goal_subtask",
+            "description": "Mark a sub-step done by its 0-based index in the sub_tasks list.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal_id": {"type": "integer"},
+                    "sub_index": {"type": "integer"},
+                },
+                "required": ["goal_id", "sub_index"],
+            },
+        },
+    },
     # ---- notes + episodic memory ----
     {
         "type": "function",

@@ -1,4 +1,4 @@
-"""APScheduler-driven reminders + recurring agent tasks."""
+"""APScheduler-driven reminders + recurring agent tasks + proactive goal cron."""
 
 from __future__ import annotations
 
@@ -19,13 +19,21 @@ TZ = ZoneInfo(USER_TZ)
 _scheduler: Optional[AsyncIOScheduler] = None
 _bot: Optional[Bot] = None
 _recurring_runner: Optional[Callable[[int], Awaitable[None]]] = None
+_weekly_review_runner: Optional[Callable[[int], Awaitable[None]]] = None
+_daily_imminent_runner: Optional[Callable[[int], Awaitable[None]]] = None
 
 
-def init(bot: Bot, recurring_runner: Callable[[int], Awaitable[None]]) -> None:
-    """Boot the scheduler. recurring_runner is an async fn(task_id) -> None."""
-    global _scheduler, _bot, _recurring_runner
+def init(
+    bot: Bot,
+    recurring_runner: Callable[[int], Awaitable[None]],
+    weekly_review_runner: Callable[[int], Awaitable[None]],
+    daily_imminent_runner: Callable[[int], Awaitable[None]],
+) -> None:
+    global _scheduler, _bot, _recurring_runner, _weekly_review_runner, _daily_imminent_runner
     _bot = bot
     _recurring_runner = recurring_runner
+    _weekly_review_runner = weekly_review_runner
+    _daily_imminent_runner = daily_imminent_runner
     _scheduler = AsyncIOScheduler(timezone=TZ)
     _scheduler.start()
 
@@ -39,10 +47,16 @@ def init(bot: Bot, recurring_runner: Callable[[int], Awaitable[None]]) -> None:
         if schedule_recurring(row):
             rearmed_tasks += 1
 
+    proactive_users = 0
+    for chat_id in db.all_chat_ids_with_goals():
+        ensure_proactive_for(chat_id)
+        proactive_users += 1
+
     logger.info(
-        "scheduler started; re-armed %d reminders, %d recurring tasks",
+        "scheduler started; re-armed %d reminders, %d recurring tasks, %d goal-tracking chats",
         rearmed_reminders,
         rearmed_tasks,
+        proactive_users,
     )
 
 
@@ -147,3 +161,96 @@ async def _run_recurring(task_id: int) -> None:
         await _recurring_runner(task_id)
     except Exception:
         logger.exception("recurring task %s failed", task_id)
+
+
+# ---------------- proactive goal cron (per-chat, idempotent) ----------------
+
+
+def _goal_review_disabled(chat_id: int) -> bool:
+    """User can opt out by setting fact goal_review_enabled=false."""
+    for row in db.list_facts(chat_id):
+        if row["key"] == "goal_review_enabled" and row["value"].strip().lower() in {"false", "off", "0", "no"}:
+            return True
+    return False
+
+
+def ensure_proactive_for(chat_id: int) -> None:
+    """Idempotently arm the weekly goal review (Sun 09:00 KST) and daily imminent check
+    (08:00 KST) for this chat. Safe to call repeatedly — replace_existing=True."""
+    if _scheduler is None:
+        return
+    if _goal_review_disabled(chat_id):
+        return
+    _scheduler.add_job(
+        _run_weekly_review,
+        CronTrigger(day_of_week="sun", hour=9, minute=0, timezone=TZ),
+        args=[chat_id],
+        id=f"weekly-review-{chat_id}",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    _scheduler.add_job(
+        _run_daily_imminent,
+        CronTrigger(hour=8, minute=0, timezone=TZ),
+        args=[chat_id],
+        id=f"daily-imminent-{chat_id}",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    logger.info("proactive cron armed for chat %s (Sun 09:00 + daily 08:00 KST)", chat_id)
+
+
+def disable_proactive_for(chat_id: int) -> None:
+    if _scheduler is None:
+        return
+    for jid in (f"weekly-review-{chat_id}", f"daily-imminent-{chat_id}"):
+        if _scheduler.get_job(jid):
+            _scheduler.remove_job(jid)
+    logger.info("proactive cron disabled for chat %s", chat_id)
+
+
+def trigger_weekly_review_now(chat_id: int) -> None:
+    """Force-fire weekly review immediately (for testing or explicit user request)."""
+    if _scheduler is None:
+        return
+    _scheduler.add_job(
+        _run_weekly_review,
+        "date",
+        run_date=datetime.now(timezone.utc) + timedelta(seconds=2),
+        args=[chat_id],
+        id=f"weekly-review-{chat_id}-once-{int(datetime.now(timezone.utc).timestamp())}",
+        misfire_grace_time=120,
+    )
+
+
+def trigger_daily_imminent_now(chat_id: int) -> None:
+    if _scheduler is None:
+        return
+    _scheduler.add_job(
+        _run_daily_imminent,
+        "date",
+        run_date=datetime.now(timezone.utc) + timedelta(seconds=2),
+        args=[chat_id],
+        id=f"daily-imminent-{chat_id}-once-{int(datetime.now(timezone.utc).timestamp())}",
+        misfire_grace_time=120,
+    )
+
+
+async def _run_weekly_review(chat_id: int) -> None:
+    assert _weekly_review_runner is not None
+    if _goal_review_disabled(chat_id):
+        return
+    try:
+        await _weekly_review_runner(chat_id)
+    except Exception:
+        logger.exception("weekly goal review failed for chat %s", chat_id)
+
+
+async def _run_daily_imminent(chat_id: int) -> None:
+    assert _daily_imminent_runner is not None
+    if _goal_review_disabled(chat_id):
+        return
+    try:
+        await _daily_imminent_runner(chat_id)
+    except Exception:
+        logger.exception("daily imminent check failed for chat %s", chat_id)

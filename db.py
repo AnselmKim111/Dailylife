@@ -43,6 +43,22 @@ CREATE TABLE IF NOT EXISTS recurring_tasks (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
+CREATE TABLE IF NOT EXISTS goals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    why TEXT,
+    target_date_local TEXT,                       -- "YYYY-MM-DD" in user's TZ; nullable
+    horizon TEXT NOT NULL DEFAULT 'long',         -- 'short' | 'medium' | 'long'
+    status TEXT NOT NULL DEFAULT 'open',          -- 'open' | 'done' | 'paused' | 'dropped'
+    sub_tasks_json TEXT NOT NULL DEFAULT '[]',    -- [{text, done}]
+    watch_query TEXT,                              -- optional periodic search query
+    last_reviewed_utc TEXT,
+    last_action_utc TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_goals_chat_status ON goals(chat_id, status);
+
 CREATE TABLE IF NOT EXISTS notes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER NOT NULL,
@@ -271,6 +287,156 @@ def mark_recurring_run(task_id: int) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with _conn() as c:
         c.execute("UPDATE recurring_tasks SET last_run_utc=? WHERE id=?", (now, task_id))
+
+
+# ---------------- goals ----------------
+
+
+import json as _json
+
+
+def add_goal(
+    chat_id: int,
+    title: str,
+    why: Optional[str] = None,
+    target_date_local: Optional[str] = None,
+    horizon: str = "long",
+    sub_tasks: Optional[List[str]] = None,
+    watch_query: Optional[str] = None,
+) -> int:
+    sub_tasks_json = _json.dumps(
+        [{"text": t, "done": False} for t in (sub_tasks or [])], ensure_ascii=False
+    )
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO goals (chat_id, title, why, target_date_local, horizon, sub_tasks_json, watch_query) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (chat_id, title.strip(), why, target_date_local, horizon, sub_tasks_json, watch_query),
+        )
+        return cur.lastrowid
+
+
+def list_goals(chat_id: int, status: Optional[str] = "open") -> List[sqlite3.Row]:
+    with _conn() as c:
+        if status:
+            return list(
+                c.execute(
+                    "SELECT * FROM goals WHERE chat_id=? AND status=? "
+                    "ORDER BY (target_date_local IS NULL), target_date_local ASC, id",
+                    (chat_id, status),
+                )
+            )
+        return list(
+            c.execute("SELECT * FROM goals WHERE chat_id=? ORDER BY id", (chat_id,))
+        )
+
+
+def get_goal(goal_id: int) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute("SELECT * FROM goals WHERE id=?", (goal_id,)).fetchone()
+
+
+def update_goal(
+    goal_id: int,
+    chat_id: int,
+    *,
+    title: Optional[str] = None,
+    why: Optional[str] = None,
+    target_date_local: Optional[str] = None,
+    horizon: Optional[str] = None,
+    status: Optional[str] = None,
+    watch_query: Optional[str] = None,
+) -> bool:
+    fields: List[str] = []
+    params: List = []
+    for k, v in (
+        ("title", title),
+        ("why", why),
+        ("target_date_local", target_date_local),
+        ("horizon", horizon),
+        ("status", status),
+        ("watch_query", watch_query),
+    ):
+        if v is not None:
+            fields.append(f"{k}=?")
+            params.append(v)
+    if not fields:
+        return False
+    params.extend([goal_id, chat_id])
+    with _conn() as c:
+        cur = c.execute(
+            f"UPDATE goals SET {', '.join(fields)} WHERE id=? AND chat_id=?", params
+        )
+        return cur.rowcount > 0
+
+
+def add_goal_subtask(goal_id: int, chat_id: int, text: str) -> bool:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT sub_tasks_json FROM goals WHERE id=? AND chat_id=?", (goal_id, chat_id)
+        ).fetchone()
+        if row is None:
+            return False
+        items = _json.loads(row["sub_tasks_json"] or "[]")
+        items.append({"text": text.strip(), "done": False})
+        c.execute(
+            "UPDATE goals SET sub_tasks_json=?, last_action_utc=? WHERE id=?",
+            (
+                _json.dumps(items, ensure_ascii=False),
+                datetime.now(timezone.utc).isoformat(),
+                goal_id,
+            ),
+        )
+        return True
+
+
+def complete_goal_subtask(goal_id: int, chat_id: int, sub_index: int) -> bool:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT sub_tasks_json FROM goals WHERE id=? AND chat_id=?", (goal_id, chat_id)
+        ).fetchone()
+        if row is None:
+            return False
+        items = _json.loads(row["sub_tasks_json"] or "[]")
+        if not (0 <= sub_index < len(items)):
+            return False
+        items[sub_index]["done"] = True
+        c.execute(
+            "UPDATE goals SET sub_tasks_json=?, last_action_utc=? WHERE id=?",
+            (
+                _json.dumps(items, ensure_ascii=False),
+                datetime.now(timezone.utc).isoformat(),
+                goal_id,
+            ),
+        )
+        return True
+
+
+def mark_goal_reviewed(goal_id: int) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as c:
+        c.execute("UPDATE goals SET last_reviewed_utc=? WHERE id=?", (now, goal_id))
+
+
+def goals_due_within(chat_id: int, days: int) -> List[sqlite3.Row]:
+    """Open goals with target_date_local within today..today+days (inclusive)."""
+    today = datetime.now(timezone.utc).astimezone().date()
+    upper = today.fromordinal(today.toordinal() + max(0, days))
+    with _conn() as c:
+        return list(
+            c.execute(
+                "SELECT * FROM goals WHERE chat_id=? AND status='open' "
+                "AND target_date_local IS NOT NULL "
+                "AND target_date_local >= ? AND target_date_local <= ? "
+                "ORDER BY target_date_local",
+                (chat_id, today.isoformat(), upper.isoformat()),
+            )
+        )
+
+
+def all_chat_ids_with_goals() -> List[int]:
+    with _conn() as c:
+        return [r[0] for r in c.execute("SELECT DISTINCT chat_id FROM goals WHERE status='open'")]
 
 
 # ---------------- notes ----------------
