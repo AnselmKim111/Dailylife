@@ -2,11 +2,13 @@
 
 - transcribe_voice: OpenAI Whisper API (needs OPENAI_API_KEY)
 - describe_image: OpenRouter vision (Haiku 4.5) — extracts schedule/note/place info
+- extract_pdf_text: local pypdf, no network call
 """
 
 from __future__ import annotations
 
 import base64
+import io
 import logging
 import os
 from typing import Optional
@@ -93,3 +95,38 @@ async def describe_image(file_bytes: bytes, mime: str, caption: Optional[str] = 
             r.raise_for_status()
         data = r.json()
     return data["choices"][0]["message"]["content"].strip()
+
+
+def extract_pdf_text(file_bytes: bytes, max_pages: int = 30, max_chars: int = 12000) -> str:
+    """Extract text from a PDF using pypdf. Pure Python, no system deps.
+
+    Returns plain text; '' if extraction fails (encrypted, scanned-only, etc.).
+    Caps at max_pages and max_chars to keep prompts bounded."""
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        logger.error("pypdf not installed")
+        return ""
+    try:
+        reader = PdfReader(io.BytesIO(file_bytes))
+    except Exception as e:
+        logger.warning("pypdf failed to open: %s", e)
+        return ""
+    if reader.is_encrypted:
+        try:
+            reader.decrypt("")  # try empty password
+        except Exception:
+            return ""
+    out: list[str] = []
+    total = 0
+    for i, page in enumerate(reader.pages[:max_pages]):
+        try:
+            t = page.extract_text() or ""
+        except Exception:
+            t = ""
+        if t.strip():
+            out.append(f"--- page {i + 1} ---\n{t.strip()}")
+            total += len(t)
+            if total >= max_chars:
+                break
+    return "\n\n".join(out)[:max_chars]

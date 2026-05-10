@@ -54,7 +54,10 @@ SYSTEM_PROMPT_TEMPLATE = (
     "- Daily recurring briefing ('매일 X시에 …') → add_recurring_task.\n"
     "- Live data (영업시간, 길찾기, 운항정보, 시간표) → use web_search / kakao_local_search / "
     "  fetch_url / kakao_directions_drive — don't guess.\n"
-    "- Google Calendar specifically (구글 캘린더 / Google Calendar 키워드) → use gcal_* tools.\n\n"
+    "- Google Calendar specifically (구글 캘린더 / Google Calendar 키워드) → use gcal_* tools.\n"
+    "- Document/image attachments arrive as text starting with '[pdf 첨부 · …]' or "
+    "'[image 첨부 · …]'. Pull out events/notes/facts you find (date, place, name, "
+    "amount) and call the right save tools — don't just acknowledge the upload.\n\n"
     "Known facts about this user:\n{facts_block}"
 )
 
@@ -1050,6 +1053,81 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _process_user_text(update, context, text, log_prefix="[voice] ")
 
 
+DOC_IMAGE_MIMES = {"image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"}
+DOC_MAX_BYTES = 19 * 1024 * 1024  # Telegram bot file size cap is 20MB
+
+
+async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle PDF or image-as-document attachments. Extract content and feed
+    through the agent so it picks the right tool (save_note / add_event / ...)."""
+    if not update.message or not update.message.document:
+        return
+    chat_id = update.effective_chat.id
+    doc = update.message.document
+    mime = (doc.mime_type or "").lower()
+    fname = doc.file_name or "file"
+    caption = (update.message.caption or "").strip()
+    size = doc.file_size or 0
+    logger.info("doc from %s: name=%r mime=%s size=%s caption=%r",
+                chat_id, fname, mime, size, caption[:80])
+
+    if size and size > DOC_MAX_BYTES:
+        await update.message.reply_text(
+            f"⚠ 파일이 너무 커요 ({size // (1024*1024)}MB). "
+            "Telegram 봇 한도가 20MB라서 못 받아요."
+        )
+        return
+
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+    try:
+        tg_file = await doc.get_file()
+        bio = await tg_file.download_as_bytearray()
+    except Exception as exc:
+        logger.exception("doc download failed")
+        await update.message.reply_text(f"⚠ 파일 받기 실패: {exc}")
+        return
+
+    extracted = ""
+    extraction_kind = ""
+
+    if mime == "application/pdf" or fname.lower().endswith(".pdf"):
+        extraction_kind = "pdf"
+        extracted = transcribe.extract_pdf_text(bytes(bio))
+        if not extracted:
+            await update.message.reply_text(
+                "📄 PDF에서 텍스트를 못 뽑았어요 (스캔본이거나 암호화된 듯). "
+                "필요하면 사진으로 다시 찍어 보내주세요 — 비전으로 읽어볼게요."
+            )
+            return
+        preview = extracted[:600] + ("…" if len(extracted) > 600 else "")
+        await update.message.reply_text(f"📄 PDF 텍스트 추출 ({len(extracted)}자):\n\n{preview}\n\n처리 중…")
+
+    elif mime in DOC_IMAGE_MIMES or fname.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+        extraction_kind = "image"
+        try:
+            extracted = await transcribe.describe_image(bytes(bio), mime=mime or "image/jpeg",
+                                                         caption=caption or None)
+        except Exception as exc:
+            logger.exception("vision (doc) failed")
+            await update.message.reply_text(f"⚠ 이미지 처리 실패: {exc}")
+            return
+        preview = extracted[:1200]
+        await update.message.reply_text(f"🖼️ 이미지에서 추출:\n\n{preview}\n\n처리 중…")
+
+    else:
+        await update.message.reply_text(
+            f"📎 {fname} ({mime or '알 수 없는 형식'}) — 아직 PDF랑 이미지만 읽을 수 있어요."
+        )
+        return
+
+    user_text = (
+        f"[{extraction_kind} 첨부 · {fname}]\n"
+        f"caption: {caption!r}\n\n"
+        f"추출된 내용:\n{extracted}"
+    )
+    await _process_user_text(update, context, user_text, log_prefix=f"[{extraction_kind}] ")
+
+
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not update.message or not update.message.photo:
         return
@@ -1129,6 +1207,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_callback_undo, pattern=r"^undo:"))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
+    app.add_handler(MessageHandler(filters.Document.ALL, on_document))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
