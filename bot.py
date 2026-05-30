@@ -27,9 +27,11 @@ import db
 import external
 import gcal
 import gmail as gmail_mod
+import korean_calendar
 import oauth_server
 import scheduler
 import transcribe
+import weather as weather_mod
 from llm import TOOLS, USER_TZ, chat_completion, parse_tool_calls
 
 logging.basicConfig(
@@ -64,8 +66,13 @@ SYSTEM_PROMPT_TEMPLATE = (
     "the system injects, and call recall_person / log_contact_with as needed. "
     "Birthdays/anniversaries → important_dates with recurring_yearly=true.\n"
     "- Document/image attachments arrive as text starting with '[pdf 첨부 · …]' or "
-    "'[image 첨부 · …]'. Pull out events/notes/facts you find (date, place, name, "
-    "amount) and call the right save tools — don't just acknowledge the upload.\n\n"
+    "'[image 첨부 · …]' or '[사진 첨부 · …]'. The header includes classified=<kind> hint: "
+    "use it as a strong prior. receipt → log_expense, business_card → add_person, "
+    "event/poster → add_event (+ gcal_create_event), document_text → save_note. "
+    "Always extract the concrete details (date, place, name, amount) and call the right save tool — "
+    "don't just acknowledge the upload.\n"
+    "- Spending mention with a price ('스벅 6500원') → log_expense. Habit mention "
+    "('운동 1시간', '책 30분') → log_habit. Both have inline-undo if mis-categorized.\n\n"
     "Known facts about this user:\n{facts_block}"
 )
 
@@ -582,8 +589,9 @@ def tool_add_goal(chat_id: int, args: Dict) -> Dict:
         sub_tasks=args.get("sub_tasks") or [],
         watch_query=args.get("watch_query"),
     )
-    # First time a goal is added on this chat, ensure the proactive crons are armed.
+    # First time a goal is added on this chat, ensure the proactive + daily-rhythm crons are armed.
     scheduler.ensure_proactive_for(chat_id)
+    scheduler.ensure_daily_rhythm_for(chat_id)
     return {"ok": True, "goal_id": gid}
 
 
@@ -663,6 +671,161 @@ def _parse_sub_tasks(raw: Optional[str]) -> list:
         return json.loads(raw)
     except Exception:
         return []
+
+
+# ---------------- expenses + habits ----------------
+
+
+def tool_log_expense(chat_id: int, args: Dict) -> Dict:
+    amt = args.get("amount_won")
+    if amt is None:
+        return {"ok": False, "error": "amount_won required"}
+    eid = db.log_expense(
+        chat_id,
+        amount_won=int(amt),
+        category=args.get("category"),
+        merchant=args.get("merchant"),
+        when_local=args.get("when_local"),
+        notes=args.get("notes"),
+    )
+    return {"ok": True, "expense_id": eid}
+
+
+def tool_summarize_expenses(chat_id: int, args: Dict) -> Dict:
+    days = int(args.get("days", 30))
+    return {"ok": True, **db.summarize_expenses(chat_id, days=days)}
+
+
+def tool_log_habit(chat_id: int, args: Dict) -> Dict:
+    key = (args.get("habit_key") or "").strip()
+    if not key:
+        return {"ok": False, "error": "habit_key required"}
+    hid = db.log_habit(
+        chat_id, habit_key=key,
+        duration_min=int(args["duration_min"]) if args.get("duration_min") is not None else None,
+        notes=args.get("notes"),
+    )
+    return {"ok": True, "habit_id": hid}
+
+
+def tool_summarize_habits(chat_id: int, args: Dict) -> Dict:
+    days = int(args.get("days", 7))
+    return {"ok": True, **db.summarize_habits(chat_id, days=days)}
+
+
+# ---------------- Korean-life helpers + wedding timeline ----------------
+
+
+def tool_korean_holiday_check(chat_id: int, args: Dict) -> Dict:
+    d = (args.get("date_local") or "").strip()
+    if not d:
+        return {"ok": False, "error": "date_local required"}
+    is_h = korean_calendar.is_holiday(d)
+    nxt = korean_calendar.next_holiday(d)
+    return {"ok": True, "date": d, "is_holiday": is_h, "next_holiday": nxt}
+
+
+async def tool_weather(chat_id: int, args: Dict) -> Dict:
+    return await weather_mod.weather(args["location"], days=int(args.get("days", 1)))
+
+
+async def tool_track_parcel(chat_id: int, args: Dict) -> Dict:
+    return await weather_mod.track_parcel(
+        tracking_no=args["tracking_no"],
+        carrier=args.get("carrier"),
+    )
+
+
+async def tool_transit_text_query(chat_id: int, args: Dict) -> Dict:
+    return await weather_mod.transit_text_query(
+        origin=args["origin"],
+        destination=args["destination"],
+        arrive_by_iso=args.get("arrive_by_iso"),
+    )
+
+
+def tool_add_wedding_timeline(chat_id: int, args: Dict) -> Dict:
+    """One-shot template: creates canonical engagement→marriage→honeymoon goals."""
+    propose = args.get("propose_date_local")
+    marry = args.get("marriage_date_local")
+    honey = args.get("honeymoon_date_local")
+    partner = (args.get("partner_name") or "").strip()
+    created: List[int] = []
+
+    if propose:
+        gid = db.add_goal(
+            chat_id,
+            title=(f"{partner} 프로포즈 여행 준비" if partner else "프로포즈 여행 준비"),
+            why="장기 추적 — 사용자가 가장 잊기 쉬운 큰 일정",
+            target_date_local=propose,
+            horizon="long",
+            sub_tasks=[
+                "장소 후보 3곳 추리기",
+                "항공권/숙소 평균가 모니터링",
+                "반지 사이즈 자연스럽게 파악",
+                "당일 동선/타이밍 시뮬",
+                "사진/영상 기록 담당 정하기",
+            ],
+            watch_query=("제주 호텔 12월" if propose.startswith(("2026-12", "2027-12")) else None),
+        )
+        created.append(gid)
+        gid2 = db.add_goal(
+            chat_id,
+            title="약혼반지 구입 (상품권 활용)",
+            why="비용 효율 — 상품권 할인 윈도우가 비정기적이라 미리 모니터링 필요",
+            target_date_local=propose,
+            horizon="long",
+            sub_tasks=[
+                "백화점 상품권 할인율 비교",
+                "반지 디자인 후보 3개 좁히기",
+                "사이즈 확인",
+                "구입 D-30 결정",
+            ],
+            watch_query="신세계상품권 5% 할인",
+        )
+        created.append(gid2)
+
+    if marry:
+        gid = db.add_goal(
+            chat_id,
+            title="결혼식 준비",
+            why="식장·스드메·하객 일정 등 다층 의존",
+            target_date_local=marry,
+            horizon="long",
+            sub_tasks=[
+                "양가 인사 일정",
+                "예식장 답사 후보",
+                "스드메 견적 비교",
+                "청첩장 디자인/발송 일정",
+                "본식 도우미 결정",
+            ],
+        )
+        created.append(gid)
+
+    if honey:
+        gid = db.add_goal(
+            chat_id,
+            title="신혼여행 예약 윈도우",
+            why="얼리버드 vs 라스트미닛 가격 차이 큼 → 모니터링 필요",
+            target_date_local=honey,
+            horizon="long",
+            sub_tasks=[
+                "지역 후보 2-3개 선정",
+                "비행기 예약 골든 윈도우 확인",
+                "호텔/풀빌라 가격 추이 모니터",
+                "비자/여권 만료일 확인",
+            ],
+            watch_query="신혼여행 항공권 특가",
+        )
+        created.append(gid)
+
+    if partner:
+        # Try to ensure partner is registered as a person (idempotent)
+        db.add_person(chat_id, partner, role="약혼녀")
+
+    scheduler.ensure_proactive_for(chat_id)
+    scheduler.ensure_daily_rhythm_for(chat_id)
+    return {"ok": True, "goal_ids": created, "partner": partner or None}
 
 
 # ---------------- people / relationships ----------------
@@ -1001,6 +1164,12 @@ SYNC_HANDLERS = {
     "list_people": tool_list_people,
     "recall_person": tool_recall_person,
     "log_contact_with": tool_log_contact_with,
+    "log_expense": tool_log_expense,
+    "summarize_expenses": tool_summarize_expenses,
+    "log_habit": tool_log_habit,
+    "summarize_habits": tool_summarize_habits,
+    "korean_holiday_check": tool_korean_holiday_check,
+    "add_wedding_timeline": tool_add_wedding_timeline,
 }
 
 ASYNC_HANDLERS = {
@@ -1015,6 +1184,9 @@ ASYNC_HANDLERS = {
     "gmail_search": tool_gmail_search,
     "gmail_get_message": tool_gmail_get_message,
     "gmail_recent_summary": tool_gmail_recent_summary,
+    "weather": tool_weather,
+    "track_parcel": tool_track_parcel,
+    "transit_text_query": tool_transit_text_query,
 }
 
 
@@ -1200,6 +1372,131 @@ async def run_weekly_goal_review(chat_id: int) -> None:
             await bot.send_message(chat_id=chat_id, text=text[i : i + 4000])
 
 
+# ---------------- daily rhythm: morning briefing + evening reflection ----------------
+
+
+MORNING_BRIEFING_PROMPT = (
+    "지금부터 사용자에게 보낼 오늘 아침 브리핑을 작성해. 친근한 한국어로 1-2분 분량.\n"
+    "주어진 데이터를 잘 엮어서, 의미 있는 것만 강조하고 너무 형식적이지 않게.\n\n"
+    "오늘 일정 (로컬+구글 캘린더 통합):\n{schedule}\n\n"
+    "내일 미리보기:\n{tomorrow}\n\n"
+    "임박한 골 (D-14 이내):\n{goals}\n\n"
+    "오늘 important_date가 있는 사람:\n{people}\n\n"
+    "{extras}\n"
+    "구성 추천: '굿모닝 + 한줄 컨디션 코멘트' → '핵심 일정 3-4줄' → "
+    "'챙길 것 1-2개' → '응원 한마디'. 빈 섹션은 자연스럽게 묶거나 생략."
+)
+
+
+async def run_morning_briefing(chat_id: int) -> None:
+    """Build today's briefing and push as a single message."""
+    if _app is None or _app.bot is None:
+        return
+    today_local = datetime.now(TZ).date()
+    if db.get_daily_state(chat_id, today_local.isoformat()) and \
+            db.get_daily_state(chat_id, today_local.isoformat())["briefing_sent"]:
+        # Skip if already sent today (safe against duplicate triggers)
+        return
+
+    now_local = datetime.now(TZ)
+    end_today = now_local.replace(hour=23, minute=59, second=59)
+    tomorrow_start = (now_local + timedelta(days=1)).replace(hour=0, minute=0, second=0)
+    tomorrow_end = tomorrow_start + timedelta(hours=12)
+
+    today_items = await _merge_schedule(
+        chat_id, now_local.astimezone(timezone.utc), end_today.astimezone(timezone.utc))
+    tomorrow_items = await _merge_schedule(
+        chat_id, tomorrow_start.astimezone(timezone.utc), tomorrow_end.astimezone(timezone.utc))
+
+    def fmt_items(items: List[Dict]) -> str:
+        if not items:
+            return "  (없음)"
+        return "\n".join("  " + _format_merged_event(it) for it in items)
+
+    goals_due = db.goals_due_within(chat_id, days=14)
+    goals_str = "\n".join(
+        f"  - {r['title']} (D-{_days_until(r['target_date_local'])})" for r in goals_due
+    ) or "  (없음)"
+
+    people_today = []
+    today_md = today_local.strftime("%m-%d")
+    for r in db.list_people(chat_id):
+        for d in json.loads(r["important_dates_json"] or "[]"):
+            try:
+                dt = datetime.fromisoformat(d["date_local"]).date()
+                if dt.strftime("%m-%d") == today_md:
+                    people_today.append(f"  - {r['name']}: {d['label']}")
+            except Exception:
+                pass
+    people_str = "\n".join(people_today) or "  (없음)"
+
+    extras_parts = []
+    # Optional Gmail summary
+    if (not _toggle_off_local(chat_id, "gmail_morning_scan") and
+            db.get_oauth_token(chat_id, "google")):
+        try:
+            msgs = await gmail_mod.recent_summary(chat_id, hours=12, max_messages=8)
+            if msgs:
+                lines = []
+                for m in msgs:
+                    subject = (m.get("subject") or "(제목 없음)")[:60]
+                    lines.append(f"  - {subject}")
+                extras_parts.append("최근 12시간 메일:\n" + "\n".join(lines))
+        except Exception:
+            logger.exception("gmail_morning_scan failed (briefing continues)")
+
+    extras = "\n".join(extras_parts) if extras_parts else ""
+
+    user_msg = MORNING_BRIEFING_PROMPT.format(
+        schedule=fmt_items(today_items),
+        tomorrow=fmt_items(tomorrow_items),
+        goals=goals_str,
+        people=people_str,
+        extras=("기타:\n" + extras + "\n") if extras else "",
+    )
+
+    try:
+        reply = await run_agent(chat_id, user_msg, history=[], max_hops=4)
+    except Exception as exc:
+        logger.exception("morning briefing agent failed")
+        reply = f"☀️ 굿모닝! (브리핑 생성 중 오류: {exc})"
+
+    header = f"☀️ 오늘 아침 브리핑 — {today_local.strftime('%m월 %d일 (%a)')}\n\n"
+    text = header + reply
+    for i in range(0, len(text), 4000):
+        await _app.bot.send_message(chat_id=chat_id, text=text[i:i + 4000])
+    db.mark_briefing_sent(chat_id, today_local.isoformat())
+
+
+def _toggle_off_local(chat_id: int, key: str) -> bool:
+    for row in db.list_facts(chat_id):
+        if row["key"] == key and row["value"].strip().lower() in {"false", "off", "0", "no"}:
+            return True
+    return False
+
+
+REFLECTION_OPENERS = [
+    "오늘 어땠어? 한 줄로라도 좋아.",
+    "🌙 하루 어떻게 흘렀는지 한마디만.",
+    "오늘 가장 기억에 남는 순간은?",
+    "🌙 오늘 컨디션·기분 어땠어?",
+    "오늘 잘한 거 하나 + 아쉬운 거 하나만.",
+]
+
+
+async def run_evening_reflection(chat_id: int) -> None:
+    if _app is None or _app.bot is None:
+        return
+    today_local = datetime.now(TZ).date()
+    state = db.get_daily_state(chat_id, today_local.isoformat())
+    if state and state["reflection_prompted"]:
+        return  # already asked today
+    import random
+    opener = random.choice(REFLECTION_OPENERS)
+    await _app.bot.send_message(chat_id=chat_id, text=opener)
+    db.mark_reflection_prompted(chat_id, today_local.isoformat())
+
+
 async def run_daily_imminent_check(chat_id: int) -> None:
     """Daily 08:00 — push only if any goal target_date is within D-7."""
     rows = db.goals_due_within(chat_id, days=7)
@@ -1382,6 +1679,141 @@ async def cmd_tasks(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("정기 작업:\n" + "\n\n".join(lines))
 
 
+async def cmd_spending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    days = 30
+    if context.args:
+        try:
+            days = max(1, min(int(context.args[0]), 365))
+        except Exception:
+            pass
+    s = db.summarize_expenses(chat_id, days=days)
+    if s["count"] == 0:
+        await update.message.reply_text(f"최근 {days}일 지출 기록 없음. 자연어로 '스벅 6500원' 같이 흘려도 자동 저장돼요.")
+        return
+    lines = [f"💸 최근 {days}일 지출 — 합계 ₩{s['total_won']:,} ({s['count']}건)"]
+    for cat, won in s["by_category"][:8]:
+        lines.append(f"  • {cat or '기타'}: ₩{won:,}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_habits(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    days = 7
+    if context.args:
+        try:
+            days = max(1, min(int(context.args[0]), 90))
+        except Exception:
+            pass
+    s = db.summarize_habits(chat_id, days=days)
+    if not s["by_habit"]:
+        await update.message.reply_text(f"최근 {days}일 습관 기록 없음.")
+        return
+    lines = [f"🌿 최근 {days}일 습관:"]
+    for h in s["by_habit"]:
+        total_min = h.get("mins") or 0
+        bit = f"  • {h['habit_key']}: {h['n']}회"
+        if total_min:
+            bit += f", 총 {total_min}분"
+        lines.append(bit)
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/briefing` → force now; `/briefing off`/`on` → toggle; `/briefing 07:30` → time."""
+    chat_id = update.effective_chat.id
+    arg = (context.args[0] if context.args else "").strip().lower()
+    if arg in {"off", "0", "false"}:
+        db.remember_fact(chat_id, "briefing_enabled", "false")
+        scheduler.disable_daily_rhythm_for(chat_id)
+        scheduler.ensure_daily_rhythm_for(chat_id)  # reflection only
+        await update.message.reply_text("☀️ 아침 브리핑 OFF.")
+        return
+    if arg in {"on", "1", "true"}:
+        db.forget_fact(chat_id, "briefing_enabled")
+        scheduler.ensure_daily_rhythm_for(chat_id)
+        await update.message.reply_text("☀️ 아침 브리핑 ON (기본 07:30 KST).")
+        return
+    if re.fullmatch(r"\d{1,2}:\d{2}", arg):
+        db.remember_fact(chat_id, "briefing_time", arg)
+        scheduler.ensure_daily_rhythm_for(chat_id)
+        await update.message.reply_text(f"☀️ 아침 브리핑 시간을 {arg} KST 로 변경.")
+        return
+    await update.message.reply_text("☀️ 지금 한 번 브리핑 보내드릴게요…")
+    scheduler.trigger_morning_briefing_now(chat_id)
+
+
+async def cmd_reflect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/reflect` → force now; `/reflect on`/`off` → toggle; `/reflect 21:30` → time."""
+    chat_id = update.effective_chat.id
+    arg = (context.args[0] if context.args else "").strip().lower()
+    if arg in {"off", "0", "false"}:
+        db.remember_fact(chat_id, "reflection_enabled", "false")
+        scheduler.disable_daily_rhythm_for(chat_id)
+        scheduler.ensure_daily_rhythm_for(chat_id)
+        await update.message.reply_text("🌙 저녁 회고 OFF.")
+        return
+    if arg in {"on", "1", "true"}:
+        db.forget_fact(chat_id, "reflection_enabled")
+        scheduler.ensure_daily_rhythm_for(chat_id)
+        await update.message.reply_text("🌙 저녁 회고 ON (기본 21:30 KST).")
+        return
+    if re.fullmatch(r"\d{1,2}:\d{2}", arg):
+        db.remember_fact(chat_id, "reflection_time", arg)
+        scheduler.ensure_daily_rhythm_for(chat_id)
+        await update.message.reply_text(f"🌙 저녁 회고 시간을 {arg} KST 로 변경.")
+        return
+    scheduler.trigger_evening_reflection_now(chat_id)
+
+
+async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    pending_gcal = [r for r in db.list_pending_gcal_sync() if r["chat_id"] == chat_id]
+    missed = db.missed_reminders(chat_id, hours=72)
+    cost = db.usage_summary(chat_id)
+    facts = db.list_facts(chat_id)
+    people = db.list_people(chat_id)
+    goals = db.list_goals(chat_id, status="open")
+    expenses = db.summarize_expenses(chat_id, days=30)
+    lines = [
+        "🛠 진단",
+        f"  • 누적 비용 이번달: ${cost['month']['cost']:.4f} ({cost['month']['n']}콜)",
+        f"  • 등록 facts: {len(facts)} / 사람: {len(people)} / open 골: {len(goals)}",
+        f"  • 최근 30일 지출 합계: ₩{expenses['total_won']:,} ({expenses['count']}건)",
+        f"  • GCal pending sync: {len(pending_gcal)}",
+        f"  • 최근 72h missed 리마인더: {len(missed)}",
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a snapshot of the user's local data as a markdown summary."""
+    chat_id = update.effective_chat.id
+    lines = ["# Dailylife 데이터 스냅샷", ""]
+    lines.append("## Facts")
+    for f in db.list_facts(chat_id):
+        lines.append(f"- **{f['key']}**: {f['value']}")
+    lines.append("")
+    lines.append("## People")
+    for p in db.list_people(chat_id):
+        bits = [p["name"]]
+        if p["role"]:
+            bits.append(p["role"])
+        lines.append(f"- {' · '.join(bits)}")
+    lines.append("")
+    lines.append("## Open goals")
+    for g in db.list_goals(chat_id, status="open"):
+        lines.append(f"- #{g['id']} {g['title']} (target {g['target_date_local']})")
+    lines.append("")
+    lines.append("## Recent notes (10)")
+    for n in db.list_notes(chat_id, limit=10):
+        lines.append(f"- {n['created_at'][:10]}: {n['content'][:120]}")
+    body = "\n".join(lines)
+    # Send as a regular text message (chunked) — user can copy/save
+    for i in range(0, len(body), 4000):
+        await update.message.reply_text(body[i:i + 4000])
+
+
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_history.pop(update.effective_chat.id, None)
     await update.message.reply_text("대화 메모리 초기화 완료. 일정/기억은 그대로 보존.")
@@ -1506,6 +1938,65 @@ def _collect_undo_offers(history_after_run: List[Dict]) -> List[tuple]:
     return offers
 
 
+async def on_callback_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inline action keyboard for events/goals — done / pause / remind."""
+    cq = update.callback_query
+    if not cq or not (cq.data or "").startswith("act:"):
+        return
+    parts = cq.data.split(":")
+    if len(parts) < 3:
+        await cq.answer("잘못된 액션")
+        return
+    _, kind, rest = parts[0], parts[1], ":".join(parts[2:])
+    chat_id = cq.message.chat_id if cq.message else None
+    if chat_id is None:
+        await cq.answer("권한 없음")
+        return
+    try:
+        if kind == "evt_done":
+            eid = int(rest)
+            row = db.get_event(eid)
+            if not row or row["chat_id"] != chat_id:
+                await cq.answer("이미 처리됨", show_alert=False)
+                return
+            payload = dict(row)
+            db.delete_event(eid, chat_id)
+            tok = secrets.token_urlsafe(8)
+            db.push_deleted_audit(chat_id, "event", payload, tok)
+            _pending_undos[tok] = ("event", chat_id)
+            await cq.answer("완료 처리 — 취소 가능", show_alert=False)
+            try:
+                await cq.edit_message_reply_markup(
+                    reply_markup=_undo_keyboard(tok, f"이벤트 #{eid} 완료 취소"))
+            except Exception:
+                pass
+        elif kind == "evt_remind":
+            eid = int(rest)
+            row = db.get_event(eid)
+            if row and row["chat_id"] == chat_id:
+                await scheduler._send_reminder(eid)
+                await cq.answer("리마인더 발사", show_alert=False)
+            else:
+                await cq.answer("없는 이벤트")
+        elif kind == "goal_done":
+            gid = int(rest)
+            db.update_goal(gid, chat_id, status="done")
+            await cq.answer("골 완료 ✅", show_alert=False)
+            try:
+                await cq.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        elif kind == "goal_pause":
+            gid = int(rest)
+            db.update_goal(gid, chat_id, status="paused")
+            await cq.answer("골 보류 ⏸", show_alert=False)
+        else:
+            await cq.answer(f"미구현 액션: {kind}")
+    except Exception as e:
+        logger.exception("callback action failed")
+        await cq.answer(f"⚠ {e}", show_alert=True)
+
+
 async def on_callback_undo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cq = update.callback_query
     if not cq or not (cq.data or "").startswith("undo:"):
@@ -1565,6 +2056,15 @@ async def _process_user_text(
     """Shared agent dispatch used by text, voice, and photo handlers."""
     chat_id = update.effective_chat.id
     db.log_chat(chat_id, "user", f"{log_prefix}{user_text}")
+    # If we asked for a reflection today and haven't captured it yet, this
+    # message is the response (best-effort heuristic — works for short replies).
+    try:
+        today_iso = datetime.now(TZ).date().isoformat()
+        state = db.get_daily_state(chat_id, today_iso)
+        if state and state["reflection_prompted"] and not state["reflection_response"]:
+            db.save_reflection_response(chat_id, today_iso, user_text)
+    except Exception:
+        logger.exception("reflection capture failed (non-fatal)")
     # Opportunistic cleanup of idle chats (no extra cost — only sweeps every msg).
     _sweep_idle_chats()
     history = _history(chat_id)
@@ -1695,8 +2195,15 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
+    # Cheap classifier hint to help the main agent pick the right tool fast.
+    try:
+        cls = await transcribe.classify_content(extracted, hint=caption or fname)
+    except Exception:
+        cls = {"kind": "none", "confidence": 0.0, "summary": ""}
     user_text = (
-        f"[{extraction_kind} 첨부 · {fname}]\n"
+        f"[{extraction_kind} 첨부 · file={fname} · "
+        f"classified={cls['kind']}({cls['confidence']:.1f})]\n"
+        f"요약: {cls['summary']}\n"
         f"caption: {caption!r}\n\n"
         f"추출된 내용:\n{extracted}"
     )
@@ -1724,7 +2231,16 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     logger.info("vision (%d chars): %r", len(description), description[:160])
     await update.message.reply_text(f"📷 사진에서 추출:\n\n{description[:1500]}\n\n처리 중…")
 
-    user_text = f"[사진 첨부] caption={caption!r}\n추출된 정보:\n{description}"
+    try:
+        cls = await transcribe.classify_content(description, hint=caption or None)
+    except Exception:
+        cls = {"kind": "none", "confidence": 0.0, "summary": ""}
+    user_text = (
+        f"[사진 첨부 · classified={cls['kind']}({cls['confidence']:.1f})]\n"
+        f"요약: {cls['summary']}\n"
+        f"caption: {caption!r}\n"
+        f"추출된 정보:\n{description}"
+    )
     await _process_user_text(update, context, user_text, log_prefix="[photo] ")
 
 
@@ -1745,6 +2261,8 @@ async def post_init(app: Application) -> None:
         run_recurring_task,
         run_weekly_goal_review,
         run_daily_imminent_check,
+        morning_briefing_runner=run_morning_briefing,
+        evening_reflection_runner=run_evening_reflection,
     )
     # Start the aiohttp OAuth/health server alongside polling. Failure here is
     # non-fatal — bot keeps polling, only the Google Calendar OAuth flow breaks.
@@ -1777,10 +2295,17 @@ def main() -> None:
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("cost", cmd_cost))
     app.add_handler(CommandHandler("setup", cmd_setup))
+    app.add_handler(CommandHandler("briefing", cmd_briefing))
+    app.add_handler(CommandHandler("reflect", cmd_reflect))
+    app.add_handler(CommandHandler("spending", cmd_spending))
+    app.add_handler(CommandHandler("habits", cmd_habits))
+    app.add_handler(CommandHandler("diag", cmd_diag))
+    app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("connect_gcal", cmd_connect_gcal))
     app.add_handler(CommandHandler("gcal_status", cmd_gcal_status))
     app.add_handler(CommandHandler("disconnect_gcal", cmd_disconnect_gcal))
     app.add_handler(CallbackQueryHandler(on_callback_undo, pattern=r"^undo:"))
+    app.add_handler(CallbackQueryHandler(on_callback_action, pattern=r"^act:"))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
     app.add_handler(MessageHandler(filters.PHOTO, on_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, on_document))

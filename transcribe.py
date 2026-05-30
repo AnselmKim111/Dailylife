@@ -97,6 +97,83 @@ async def describe_image(file_bytes: bytes, mime: str, caption: Optional[str] = 
     return data["choices"][0]["message"]["content"].strip()
 
 
+CLASSIFY_PROMPT = (
+    "다음 텍스트가 어떤 종류의 자료인지 한 줄 JSON으로 분류해. "
+    "허용 카테고리: receipt(영수증·가격표), event(일정·행사·예약), "
+    "business_card(명함·연락처), poster(포스터·공지·홍보), document_text(일반 글), none(분류 불가).\n"
+    'JSON 형식: {"kind": <카테고리>, "confidence": 0.0~1.0, "summary": "한국어로 ≤140자 요약"}\n'
+    "오직 JSON 한 줄만 출력. 그 외 텍스트 금지."
+)
+
+
+async def classify_content(text: str, hint: Optional[str] = None) -> dict:
+    """Tiny LLM call (~$0.0002) that routes uploaded content to the right tool.
+
+    Falls back to {kind: 'none'} on any failure so the caller can still pass
+    raw text to the main agent. Tolerant JSON parser handles models that
+    wrap output in code fences or add commentary."""
+    if not text or not text.strip():
+        return {"kind": "none", "confidence": 1.0, "summary": ""}
+    if not OPENROUTER_API_KEY:
+        return {"kind": "none", "confidence": 0.0, "summary": ""}
+    user_msg = (f"hint: {hint}\n\n" if hint else "") + f"text:\n{text[:1500]}"
+    payload = {
+        "model": os.environ.get("OPENROUTER_CLASSIFY_MODEL",
+                                  os.environ.get("OPENROUTER_MODEL",
+                                                 "anthropic/claude-haiku-4.5")),
+        "max_tokens": 200,
+        "messages": [
+            {"role": "user", "content": CLASSIFY_PROMPT + "\n\n" + user_msg},
+        ],
+    }
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": os.environ.get("OPENROUTER_REFERER", "https://t.me/AnselmsSlave7bot"),
+        "X-Title": "Dailylife Classify",
+    }
+    async with httpx.AsyncClient(timeout=20.0) as c:
+        try:
+            r = await c.post(OPENROUTER_URL, json=payload, headers=headers)
+            if r.status_code >= 400:
+                logger.warning("classify_content %s: %s", r.status_code, r.text[:200])
+                return {"kind": "none", "confidence": 0.0, "summary": ""}
+            data = r.json()
+        except Exception:
+            logger.exception("classify_content network failure")
+            return {"kind": "none", "confidence": 0.0, "summary": ""}
+    content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+    # Strip fences and find the JSON object.
+    import json as _json
+    import re as _re
+    blob = content
+    # remove ```json … ``` fences
+    blob = _re.sub(r"^\s*```(?:json)?\s*", "", blob.strip(), flags=_re.IGNORECASE)
+    blob = _re.sub(r"\s*```\s*$", "", blob)
+    # If model said extra text, take first {…} block
+    m = _re.search(r"\{[\s\S]*\}", blob)
+    if m:
+        blob = m.group(0)
+    try:
+        parsed = _json.loads(blob)
+    except Exception:
+        logger.warning("classify_content non-JSON: %r", content[:200])
+        return {"kind": "none", "confidence": 0.0, "summary": ""}
+    kind = parsed.get("kind", "none")
+    if kind not in {"receipt", "event", "business_card", "poster",
+                    "document_text", "none"}:
+        kind = "none"
+    try:
+        conf = float(parsed.get("confidence") or 0.0)
+    except Exception:
+        conf = 0.0
+    return {
+        "kind": kind,
+        "confidence": conf,
+        "summary": (parsed.get("summary") or "")[:140],
+    }
+
+
 def extract_pdf_text(file_bytes: bytes, max_pages: int = 30, max_chars: int = 12000) -> str:
     """Extract text from a PDF using pypdf. Pure Python, no system deps.
 

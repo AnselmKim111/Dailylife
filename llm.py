@@ -534,6 +534,157 @@ TOOLS: List[Dict] = [
             },
         },
     },
+    # ---- spending + habits ----
+    {
+        "type": "function",
+        "function": {
+            "name": "weather",
+            "description": (
+                "Korean weather forecast for an address or place name (서대문구, "
+                "DMC파크뷰자이아파트, 해운대 등). Uses Open-Meteo so no API key needed."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "location": {"type": "string"},
+                    "days": {"type": "integer", "description": "1-7, default 1."},
+                },
+                "required": ["location"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "korean_holiday_check",
+            "description": "Check if a given KST date is a Korean public holiday + nearest upcoming one.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date_local": {"type": "string", "description": "YYYY-MM-DD (KST)."},
+                },
+                "required": ["date_local"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "track_parcel",
+            "description": "Best-effort 택배 추적. Returns raw page text the model can interpret.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "tracking_no": {"type": "string"},
+                    "carrier": {"type": "string", "description": "Optional: cj, 한진, 우체국, etc."},
+                },
+                "required": ["tracking_no"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "transit_text_query",
+            "description": (
+                "Stopgap public-transit query (until ODsay key arrives). Pulls a "
+                "Naver mobile search page for the route and returns raw text; "
+                "you then parse the times. Not precision-grade."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "origin": {"type": "string"},
+                    "destination": {"type": "string"},
+                    "arrive_by_iso": {"type": "string", "description": "Optional KST ISO 8601 target arrival."},
+                },
+                "required": ["origin", "destination"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_wedding_timeline",
+            "description": (
+                "Bulk-create the canonical 약혼·결혼·신혼여행 long-horizon goals + "
+                "their sub-tasks in one shot. Use when the user shares the dates "
+                "for propose/marriage/honeymoon and wants the bot to start tracking."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "propose_date_local": {"type": "string", "description": "YYYY-MM-DD KST."},
+                    "marriage_date_local": {"type": "string", "description": "YYYY-MM-DD KST."},
+                    "honeymoon_date_local": {"type": "string", "description": "YYYY-MM-DD KST."},
+                    "partner_name": {"type": "string"},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "log_expense",
+            "description": (
+                "Log a money spend. Use whenever the user mentions a price they paid "
+                "('스타벅스 6500원', '점심 12000원 식비'). Korean Won (정수). category is "
+                "free-form: 식비/카페/교통/선물/생활/문화/etc."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "amount_won": {"type": "integer"},
+                    "category": {"type": "string"},
+                    "merchant": {"type": "string"},
+                    "when_local": {"type": "string", "description": "Optional KST ISO 8601 datetime; defaults to now."},
+                    "notes": {"type": "string"},
+                },
+                "required": ["amount_won"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "summarize_expenses",
+            "description": "Roll up expenses for /spending — last N days by category. Default 30 days.",
+            "parameters": {
+                "type": "object",
+                "properties": {"days": {"type": "integer"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "log_habit",
+            "description": (
+                "Log a habit event. Use for '오늘 운동 1시간', '책 30분 읽음', '물 2L 마심'. "
+                "habit_key is a short slug (exercise, reading, water, study, …)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "habit_key": {"type": "string"},
+                    "duration_min": {"type": "integer"},
+                    "notes": {"type": "string"},
+                },
+                "required": ["habit_key"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "summarize_habits",
+            "description": "Roll up habits — last N days by habit_key. Default 7 days.",
+            "parameters": {
+                "type": "object",
+                "properties": {"days": {"type": "integer"}},
+            },
+        },
+    },
     # ---- people / relationships ----
     {
         "type": "function",

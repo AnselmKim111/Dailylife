@@ -127,6 +127,39 @@ CREATE TRIGGER IF NOT EXISTS chat_log_ad AFTER DELETE ON chat_log BEGIN
     INSERT INTO chat_log_fts(chat_log_fts, rowid, content) VALUES('delete', old.id, old.content);
 END;
 
+CREATE TABLE IF NOT EXISTS expenses (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    amount_won INTEGER NOT NULL,
+    category TEXT,
+    merchant TEXT,
+    when_local TEXT NOT NULL,
+    notes TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_expenses_chat_when ON expenses(chat_id, when_local DESC);
+
+CREATE TABLE IF NOT EXISTS habits (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    habit_key TEXT NOT NULL,
+    duration_min INTEGER,
+    notes TEXT,
+    when_local TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_habits_chat_when ON habits(chat_id, when_local DESC);
+
+CREATE TABLE IF NOT EXISTS daily_state (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    date_local TEXT NOT NULL,
+    briefing_sent INTEGER NOT NULL DEFAULT 0,
+    reflection_prompted INTEGER NOT NULL DEFAULT 0,
+    reflection_response TEXT,
+    UNIQUE(chat_id, date_local)
+);
+CREATE INDEX IF NOT EXISTS idx_daily_state_chat ON daily_state(chat_id, date_local DESC);
+
 CREATE TABLE IF NOT EXISTS people (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER NOT NULL,
@@ -1014,6 +1047,133 @@ def mark_contact(person_id: int) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with _conn() as c:
         c.execute("UPDATE people SET last_contact_utc=? WHERE id=?", (now, person_id))
+
+
+# ---------------- daily_state (briefing + reflection) ----------------
+
+
+def get_daily_state(chat_id: int, date_local: str) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM daily_state WHERE chat_id=? AND date_local=?",
+            (chat_id, date_local),
+        ).fetchone()
+
+
+def mark_briefing_sent(chat_id: int, date_local: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO daily_state (chat_id, date_local, briefing_sent) VALUES (?,?,1) "
+            "ON CONFLICT(chat_id, date_local) DO UPDATE SET briefing_sent=1",
+            (chat_id, date_local),
+        )
+
+
+def mark_reflection_prompted(chat_id: int, date_local: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO daily_state (chat_id, date_local, reflection_prompted) VALUES (?,?,1) "
+            "ON CONFLICT(chat_id, date_local) DO UPDATE SET reflection_prompted=1",
+            (chat_id, date_local),
+        )
+
+
+def save_reflection_response(chat_id: int, date_local: str, text: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO daily_state (chat_id, date_local, reflection_response) VALUES (?,?,?) "
+            "ON CONFLICT(chat_id, date_local) DO UPDATE SET reflection_response=excluded.reflection_response",
+            (chat_id, date_local, text.strip()),
+        )
+
+
+def recent_reflections(chat_id: int, days: int = 7) -> List[sqlite3.Row]:
+    with _conn() as c:
+        cutoff_date = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
+        return list(c.execute(
+            "SELECT * FROM daily_state WHERE chat_id=? AND date_local >= ? "
+            "AND reflection_response IS NOT NULL ORDER BY date_local DESC",
+            (chat_id, cutoff_date),
+        ))
+
+
+# ---------------- expenses + habits ----------------
+
+
+def log_expense(
+    chat_id: int,
+    amount_won: int,
+    category: Optional[str] = None,
+    merchant: Optional[str] = None,
+    when_local: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> int:
+    when = when_local or datetime.now(_USER_TZ).strftime("%Y-%m-%dT%H:%M:%S")
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO expenses (chat_id, amount_won, category, merchant, when_local, notes) "
+            "VALUES (?,?,?,?,?,?)",
+            (chat_id, int(amount_won), category, merchant, when, notes),
+        )
+        return cur.lastrowid
+
+
+def list_expenses(chat_id: int, days: int = 30) -> List[sqlite3.Row]:
+    cutoff = (datetime.now(_USER_TZ) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+    with _conn() as c:
+        return list(c.execute(
+            "SELECT * FROM expenses WHERE chat_id=? AND when_local>=? ORDER BY when_local DESC",
+            (chat_id, cutoff),
+        ))
+
+
+def summarize_expenses(chat_id: int, days: int = 30) -> Dict:
+    rows = list_expenses(chat_id, days=days)
+    total = sum(r["amount_won"] for r in rows)
+    by_cat: Dict[str, int] = {}
+    for r in rows:
+        cat = r["category"] or "기타"
+        by_cat[cat] = by_cat.get(cat, 0) + r["amount_won"]
+    return {
+        "days": days, "count": len(rows), "total_won": total,
+        "by_category": sorted(by_cat.items(), key=lambda x: -x[1]),
+    }
+
+
+def delete_expense(expense_id: int, chat_id: int) -> Optional[Dict]:
+    with _conn() as c:
+        row = c.execute("SELECT * FROM expenses WHERE id=? AND chat_id=?",
+                         (expense_id, chat_id)).fetchone()
+        if row is None:
+            return None
+        payload = dict(row)
+        c.execute("DELETE FROM expenses WHERE id=? AND chat_id=?", (expense_id, chat_id))
+        return payload
+
+
+def log_habit(
+    chat_id: int,
+    habit_key: str,
+    duration_min: Optional[int] = None,
+    notes: Optional[str] = None,
+) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO habits (chat_id, habit_key, duration_min, notes) VALUES (?,?,?,?)",
+            (chat_id, habit_key.strip(), duration_min, notes),
+        )
+        return cur.lastrowid
+
+
+def summarize_habits(chat_id: int, days: int = 7) -> Dict:
+    cutoff = (datetime.now(_USER_TZ) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+    with _conn() as c:
+        rows = list(c.execute(
+            "SELECT habit_key, COUNT(*) AS n, COALESCE(SUM(duration_min),0) AS mins "
+            "FROM habits WHERE chat_id=? AND when_local>=? GROUP BY habit_key ORDER BY n DESC",
+            (chat_id, cutoff),
+        ))
+    return {"days": days, "by_habit": [dict(r) for r in rows]}
 
 
 def find_people_in_text(chat_id: int, text: str) -> List[sqlite3.Row]:

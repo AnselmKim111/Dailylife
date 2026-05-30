@@ -21,6 +21,8 @@ _bot: Optional[Bot] = None
 _recurring_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _weekly_review_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _daily_imminent_runner: Optional[Callable[[int], Awaitable[None]]] = None
+_morning_briefing_runner: Optional[Callable[[int], Awaitable[None]]] = None
+_evening_reflection_runner: Optional[Callable[[int], Awaitable[None]]] = None
 
 
 def init(
@@ -28,12 +30,17 @@ def init(
     recurring_runner: Callable[[int], Awaitable[None]],
     weekly_review_runner: Callable[[int], Awaitable[None]],
     daily_imminent_runner: Callable[[int], Awaitable[None]],
+    morning_briefing_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    evening_reflection_runner: Optional[Callable[[int], Awaitable[None]]] = None,
 ) -> None:
     global _scheduler, _bot, _recurring_runner, _weekly_review_runner, _daily_imminent_runner
+    global _morning_briefing_runner, _evening_reflection_runner
     _bot = bot
     _recurring_runner = recurring_runner
     _weekly_review_runner = weekly_review_runner
     _daily_imminent_runner = daily_imminent_runner
+    _morning_briefing_runner = morning_briefing_runner
+    _evening_reflection_runner = evening_reflection_runner
     _scheduler = AsyncIOScheduler(timezone=TZ)
     _scheduler.start()
 
@@ -50,6 +57,7 @@ def init(
     proactive_users = 0
     for chat_id in db.all_chat_ids_with_goals():
         ensure_proactive_for(chat_id)
+        ensure_daily_rhythm_for(chat_id)
         proactive_users += 1
 
     # House-keeping crons (idempotent — replace_existing).
@@ -230,6 +238,109 @@ def disable_proactive_for(chat_id: int) -> None:
         if _scheduler.get_job(jid):
             _scheduler.remove_job(jid)
     logger.info("proactive cron disabled for chat %s", chat_id)
+
+
+# ---------------- daily rhythm (morning briefing + evening reflection) ----------------
+
+
+def _fact_value(chat_id: int, key: str) -> Optional[str]:
+    for row in db.list_facts(chat_id):
+        if row["key"] == key:
+            return row["value"]
+    return None
+
+
+def _toggle_off(chat_id: int, key: str) -> bool:
+    v = _fact_value(chat_id, key)
+    return v is not None and v.strip().lower() in {"false", "off", "0", "no"}
+
+
+def _parse_hhmm(s: str, default_h: int, default_m: int) -> tuple:
+    try:
+        hh, mm = s.split(":")
+        return (int(hh), int(mm))
+    except Exception:
+        return (default_h, default_m)
+
+
+def ensure_daily_rhythm_for(chat_id: int) -> None:
+    """Idempotently arm morning briefing + evening reflection crons. Respects
+    facts.briefing_enabled / facts.reflection_enabled (off when set to false)."""
+    if _scheduler is None:
+        return
+    if _morning_briefing_runner and not _toggle_off(chat_id, "briefing_enabled"):
+        t = _fact_value(chat_id, "briefing_time") or "07:30"
+        hour, minute = _parse_hhmm(t, 7, 30)
+        _scheduler.add_job(
+            _run_morning_briefing,
+            CronTrigger(hour=hour, minute=minute, timezone=TZ),
+            args=[chat_id],
+            id=f"morning-briefing-{chat_id}",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+    if _evening_reflection_runner and not _toggle_off(chat_id, "reflection_enabled"):
+        t = _fact_value(chat_id, "reflection_time") or "21:30"
+        hour, minute = _parse_hhmm(t, 21, 30)
+        _scheduler.add_job(
+            _run_evening_reflection,
+            CronTrigger(hour=hour, minute=minute, timezone=TZ),
+            args=[chat_id],
+            id=f"evening-reflection-{chat_id}",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+    logger.info("daily rhythm armed for chat %s", chat_id)
+
+
+def disable_daily_rhythm_for(chat_id: int) -> None:
+    if _scheduler is None:
+        return
+    for jid in (f"morning-briefing-{chat_id}", f"evening-reflection-{chat_id}"):
+        if _scheduler.get_job(jid):
+            _scheduler.remove_job(jid)
+
+
+async def _run_morning_briefing(chat_id: int) -> None:
+    if _morning_briefing_runner is None or _toggle_off(chat_id, "briefing_enabled"):
+        return
+    try:
+        await _morning_briefing_runner(chat_id)
+    except Exception:
+        logger.exception("morning briefing failed for chat %s", chat_id)
+
+
+async def _run_evening_reflection(chat_id: int) -> None:
+    if _evening_reflection_runner is None or _toggle_off(chat_id, "reflection_enabled"):
+        return
+    try:
+        await _evening_reflection_runner(chat_id)
+    except Exception:
+        logger.exception("evening reflection failed for chat %s", chat_id)
+
+
+def trigger_morning_briefing_now(chat_id: int) -> None:
+    if _scheduler is None:
+        return
+    _scheduler.add_job(
+        _run_morning_briefing, "date",
+        run_date=datetime.now(timezone.utc) + timedelta(seconds=2),
+        args=[chat_id],
+        id=f"morning-briefing-{chat_id}-once-{int(datetime.now(timezone.utc).timestamp())}",
+        misfire_grace_time=120,
+    )
+
+
+def trigger_evening_reflection_now(chat_id: int) -> None:
+    if _scheduler is None:
+        return
+    _scheduler.add_job(
+        _run_evening_reflection, "date",
+        run_date=datetime.now(timezone.utc) + timedelta(seconds=2),
+        args=[chat_id],
+        id=f"evening-reflection-{chat_id}-once-{int(datetime.now(timezone.utc).timestamp())}",
+        misfire_grace_time=120,
+    )
 
 
 def trigger_weekly_review_now(chat_id: int) -> None:
