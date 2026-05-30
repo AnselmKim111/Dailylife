@@ -883,3 +883,10 @@ def delete_oauth_token(chat_id: int, provider: str) -> bool:
             "DELETE FROM oauth_tokens WHERE chat_id=? AND provider=?", (chat_id, provider)
         )
         return cur.rowcount > 0
+
+
+def all_chat_ids_with_google_oauth() -> List[int]:
+    with _conn() as c:
+        return [r[0] for r in c.execute(
+            "SELECT DISTINCT chat_id FROM oauth_tokens WHERE provider='google'"
+        )]

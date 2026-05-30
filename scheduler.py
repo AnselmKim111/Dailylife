@@ -67,6 +67,13 @@ def init(
         replace_existing=True,
         misfire_grace_time=3600,
     )
+    _scheduler.add_job(
+        _run_gcal_mirror,
+        CronTrigger(hour=3, minute=0, timezone=TZ),
+        id="gcal-mirror",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
 
     logger.info(
         "scheduler started; re-armed %d reminders, %d recurring tasks, %d goal-tracking chats",
@@ -312,3 +319,66 @@ async def _run_gcal_pending_retry() -> None:
             logger.info("gcal retry success for event %s", row["id"])
         except Exception:
             logger.exception("gcal retry failed for event %s; leaving pending", row["id"])
+
+
+async def _run_gcal_mirror() -> None:
+    """Nightly: pull GCal events into local DB so /today /week show them too.
+
+    Direction is GCal → local only (one-way). Linked via events.gcal_event_id;
+    no remind_lead_minutes set so they don't double-fire reminders. Bot-created
+    events are dual-written elsewhere, this only catches what the user added
+    on the Google side."""
+    try:
+        import gcal
+    except Exception:
+        logger.exception("gcal import failed in mirror cron")
+        return
+    # We don't keep a list of chats in scheduler; iterate oauth_tokens for 'google' rows.
+    try:
+        chat_ids = db.all_chat_ids_with_google_oauth()
+    except Exception:
+        logger.exception("listing google-connected chats failed")
+        return
+    if not chat_ids:
+        return
+    from_utc = datetime.now(timezone.utc) - timedelta(hours=24)
+    to_utc = datetime.now(timezone.utc) + timedelta(days=14)
+    mirrored_total = 0
+    for chat_id in chat_ids:
+        try:
+            events = await gcal.list_events(
+                chat_id,
+                time_min_iso=from_utc.astimezone(TZ).isoformat(),
+                time_max_iso=to_utc.astimezone(TZ).isoformat(),
+                max_results=100,
+            )
+        except Exception:
+            logger.exception("gcal list failed for chat %s", chat_id)
+            continue
+        for e in events:
+            gid = e.get("id")
+            if not gid:
+                continue
+            if db.find_event_by_gcal_id(chat_id, gid):
+                continue
+            start = e.get("start")
+            if not start:
+                continue
+            try:
+                start_dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            title = (e.get("summary") or "(제목 없음)").strip()
+            db.add_event(
+                chat_id=chat_id,
+                title=title,
+                when_utc=start_dt,
+                notes=(e.get("description") or None),
+                remind_lead_minutes=None,  # gcal mirror events don't fire bot reminders
+                gcal_event_id=gid,
+                gcal_sync_state="mirrored",
+            )
+            mirrored_total += 1
+    if mirrored_total:
+        logger.info("gcal mirror: pulled %d new events across %d chats",
+                    mirrored_total, len(chat_ids))
