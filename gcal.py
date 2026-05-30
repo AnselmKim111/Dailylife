@@ -30,7 +30,10 @@ USER_TZ_NAME = os.environ.get("USER_TZ", "Asia/Seoul")
 TZ = ZoneInfo(USER_TZ_NAME)
 
 REDIRECT_PATH = "/oauth/google/callback"
-SCOPE = "https://www.googleapis.com/auth/calendar"
+# Multi-scope: Calendar (read+write) + Gmail (read-only). Space-separated as
+# Google requires. Existing tokens stay valid for whatever scope they were
+# issued under; a fresh /connect_gcal re-consents for the new scope set.
+SCOPE = "https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/gmail.readonly"
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 CAL_API_BASE = "https://www.googleapis.com/calendar/v3"

@@ -26,6 +26,7 @@ from telegram.ext import (
 import db
 import external
 import gcal
+import gmail as gmail_mod
 import oauth_server
 import scheduler
 import transcribe
@@ -56,6 +57,12 @@ SYSTEM_PROMPT_TEMPLATE = (
     "- Live data (영업시간, 길찾기, 운항정보, 시간표) → use web_search / kakao_local_search / "
     "  fetch_url / kakao_directions_drive — don't guess.\n"
     "- Google Calendar specifically (구글 캘린더 / Google Calendar 키워드) → use gcal_* tools.\n"
+    "- Gmail / 이메일 / 메일 키워드 (메일 왔어, 항공권 확인 메일, 어제 받은 메일 등) → use gmail_* tools.\n"
+    "  If a single message clearly contains a date/time/place (flight, dinner reservation), call gmail_get_message to read the body, then add_event (+ gcal_create_event if linked).\n"
+    "- A named person introduced or referenced by the user (약혼녀 경서, 동기 관현, 동료 김철수 등): "
+    "if new, call add_person; if known, use the 'Mentioned people in this turn' context block "
+    "the system injects, and call recall_person / log_contact_with as needed. "
+    "Birthdays/anniversaries → important_dates with recurring_yearly=true.\n"
     "- Document/image attachments arrive as text starting with '[pdf 첨부 · …]' or "
     "'[image 첨부 · …]'. Pull out events/notes/facts you find (date, place, name, "
     "amount) and call the right save tools — don't just acknowledge the upload.\n\n"
@@ -159,14 +166,61 @@ def _facts_block(chat_id: int) -> str:
     return "\n".join(f"  - {r['key']}: {r['value']}" for r in rows)
 
 
-def _system_message(chat_id: int) -> Dict:
+def _people_context_for_text(chat_id: int, text: str) -> str:
+    """Build a one-block summary of every known person mentioned in `text`.
+    Empty string if nothing matched. Also marks contact (last_contact_utc)."""
+    hits = db.find_people_in_text(chat_id, text)
+    if not hits:
+        return ""
+    now = datetime.now(timezone.utc)
+    lines = []
+    for p in hits:
+        bits = [p["name"]]
+        if p["role"]:
+            bits.append(p["role"])
+        if p["last_contact_utc"]:
+            try:
+                lc = datetime.fromisoformat(p["last_contact_utc"])
+                days = (now - lc).days
+                bits.append(f"last contact {days}d ago")
+            except Exception:
+                pass
+        dates = json.loads(p["important_dates_json"] or "[]")
+        for d in dates:
+            try:
+                dt = datetime.fromisoformat(d["date_local"]).date()
+                today = datetime.now(TZ).date()
+                # For recurring yearly, compute this-year occurrence
+                if d.get("recurring_yearly"):
+                    this_year = dt.replace(year=today.year)
+                    if this_year < today:
+                        this_year = dt.replace(year=today.year + 1)
+                    days_left = (this_year - today).days
+                    bits.append(f"{d['label']} D-{days_left}")
+                else:
+                    days_left = (dt - today).days
+                    bits.append(f"{d['label']} D-{days_left}")
+            except Exception:
+                pass
+        lines.append("  - " + " · ".join(bits))
+        # mark contact
+        try:
+            db.mark_contact(p["id"])
+        except Exception:
+            pass
+    return "Mentioned people in this turn:\n" + "\n".join(lines)
+
+
+def _system_message(chat_id: int, recent_user_text: str = "") -> Dict:
     now_local = datetime.now(TZ).strftime("%Y-%m-%d %H:%M (%a)")
-    return {
-        "role": "system",
-        "content": SYSTEM_PROMPT_TEMPLATE.format(
-            tz=USER_TZ, now=now_local, facts_block=_facts_block(chat_id)
-        ),
-    }
+    base = SYSTEM_PROMPT_TEMPLATE.format(
+        tz=USER_TZ, now=now_local, facts_block=_facts_block(chat_id)
+    )
+    if recent_user_text:
+        people_ctx = _people_context_for_text(chat_id, recent_user_text)
+        if people_ctx:
+            base = base + "\n\n" + people_ctx
+    return {"role": "system", "content": base}
 
 
 def _parse_local_iso(s: str) -> datetime:
@@ -611,6 +665,119 @@ def _parse_sub_tasks(raw: Optional[str]) -> list:
         return []
 
 
+# ---------------- people / relationships ----------------
+
+
+def tool_add_person(chat_id: int, args: Dict) -> Dict:
+    name = (args.get("name") or "").strip()
+    if not name:
+        return {"ok": False, "error": "name required"}
+    pid = db.add_person(
+        chat_id,
+        name,
+        aliases=args.get("aliases") or [],
+        role=args.get("role"),
+        notes=args.get("notes"),
+        important_dates=args.get("important_dates") or [],
+    )
+    return {"ok": True, "person_id": pid, "name": name}
+
+
+def tool_update_person(chat_id: int, args: Dict) -> Dict:
+    pid = args.get("person_id")
+    if not pid:
+        return {"ok": False, "error": "person_id required"}
+    ok = db.update_person(
+        int(pid), chat_id,
+        name=args.get("name"),
+        role=args.get("role"),
+        notes=args.get("notes"),
+        add_aliases=args.get("add_aliases") or [],
+        important_dates=args.get("important_dates") or [],
+    )
+    return {"ok": ok, "person_id": int(pid)}
+
+
+def tool_list_people(chat_id: int, args: Dict) -> Dict:
+    rows = db.list_people(chat_id, role=args.get("role"))
+    out = []
+    for r in rows:
+        out.append({
+            "id": r["id"], "name": r["name"], "role": r["role"],
+            "aliases": json.loads(r["aliases_json"] or "[]"),
+            "important_dates": _enrich_important_dates(
+                json.loads(r["important_dates_json"] or "[]")
+            ),
+            "last_contact_utc": r["last_contact_utc"],
+        })
+    return {"ok": True, "people": out}
+
+
+def _enrich_important_dates(raw: List[Dict]) -> List[Dict]:
+    """Add days_until/next_occurrence to each important_date so the model never
+    has to compute the calendar itself."""
+    today = datetime.now(TZ).date()
+    out = []
+    for d in raw:
+        item = dict(d)
+        try:
+            dt = datetime.fromisoformat(d["date_local"]).date()
+            if d.get("recurring_yearly"):
+                this_year = dt.replace(year=today.year)
+                if this_year < today:
+                    this_year = dt.replace(year=today.year + 1)
+                item["next_occurrence"] = this_year.isoformat()
+                item["days_until"] = (this_year - today).days
+            else:
+                item["days_until"] = (dt - today).days
+        except Exception:
+            pass
+        out.append(item)
+    return out
+
+
+def tool_recall_person(chat_id: int, args: Dict) -> Dict:
+    needle = (args.get("name_or_alias") or "").strip()
+    if not needle:
+        return {"ok": False, "error": "name_or_alias required"}
+    hits = db.find_people_in_text(chat_id, needle)
+    if not hits:
+        return {"ok": False, "error": f"no person matches {needle!r}"}
+    p = hits[0]
+    # Also gather any chat_log mentions
+    mentions = db.search_chat_log(chat_id, p["name"], limit=5)
+    dates = _enrich_important_dates(json.loads(p["important_dates_json"] or "[]"))
+    return {
+        "ok": True,
+        "person": {
+            "id": p["id"], "name": p["name"], "role": p["role"],
+            "aliases": json.loads(p["aliases_json"] or "[]"),
+            "notes": p["notes"],
+            "important_dates": dates,
+            "last_contact_utc": p["last_contact_utc"],
+        },
+        "recent_mentions": mentions,
+    }
+
+
+def tool_log_contact_with(chat_id: int, args: Dict) -> Dict:
+    needle = (args.get("name_or_alias") or "").strip()
+    if not needle:
+        return {"ok": False, "error": "name_or_alias required"}
+    hits = db.find_people_in_text(chat_id, needle)
+    if not hits:
+        return {"ok": False, "error": f"no person matches {needle!r}"}
+    p = hits[0]
+    db.mark_contact(p["id"])
+    # Also save a note so chat_log/notes have it
+    channel = args.get("channel") or "message"
+    note_text = f"[contact:{channel}] {p['name']}"
+    if args.get("notes"):
+        note_text += f" — {args['notes']}"
+    db.add_note(chat_id, note_text, tags="contact")
+    return {"ok": True, "person_id": p["id"], "name": p["name"]}
+
+
 # ---------------- notes + episodic memory ----------------
 
 
@@ -756,6 +923,59 @@ async def tool_gcal_delete_event(chat_id: int, args: Dict) -> Dict:
         return {"ok": False, "error": str(e)}
 
 
+# ---------------- Gmail (shared Google OAuth) ----------------
+
+
+async def tool_gmail_search(chat_id: int, args: Dict) -> Dict:
+    try:
+        ids = await gmail_mod.list_messages(
+            chat_id, query=args["query"], max_results=int(args.get("max_results", 10))
+        )
+        # Fetch lightweight metadata for each
+        out = []
+        for mid in ids[:10]:
+            try:
+                m = await gmail_mod.get_message(chat_id, mid, body_max_chars=0)
+                out.append({
+                    "id": m["id"], "subject": m["subject"],
+                    "from": m["from"], "date": m["date"], "snippet": m["snippet"],
+                })
+            except Exception as e:
+                logger.warning("gmail_search get failed for %s: %s", mid, e)
+        return {"ok": True, "messages": out}
+    except gcal.NotConnected as e:
+        return {"ok": False, "error": str(e), "needs_connect": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def tool_gmail_get_message(chat_id: int, args: Dict) -> Dict:
+    try:
+        m = await gmail_mod.get_message(
+            chat_id, args["message_id"],
+            body_max_chars=int(args.get("body_max_chars", 4000)),
+        )
+        return {"ok": True, **m}
+    except gcal.NotConnected as e:
+        return {"ok": False, "error": str(e), "needs_connect": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def tool_gmail_recent_summary(chat_id: int, args: Dict) -> Dict:
+    try:
+        msgs = await gmail_mod.recent_summary(
+            chat_id,
+            hours=min(max(int(args.get("hours", 24)), 1), 168),
+            max_messages=min(max(int(args.get("max_messages", 10)), 1), 50),
+        )
+        return {"ok": True, "messages": msgs}
+    except gcal.NotConnected as e:
+        return {"ok": False, "error": str(e), "needs_connect": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 SYNC_HANDLERS = {
     "add_event": tool_add_event,
     "list_events": tool_list_events,
@@ -776,6 +996,11 @@ SYNC_HANDLERS = {
     "complete_goal": tool_complete_goal,
     "add_goal_subtask": tool_add_goal_subtask,
     "complete_goal_subtask": tool_complete_goal_subtask,
+    "add_person": tool_add_person,
+    "update_person": tool_update_person,
+    "list_people": tool_list_people,
+    "recall_person": tool_recall_person,
+    "log_contact_with": tool_log_contact_with,
 }
 
 ASYNC_HANDLERS = {
@@ -787,6 +1012,9 @@ ASYNC_HANDLERS = {
     "gcal_create_event": tool_gcal_create_event,
     "gcal_update_event": tool_gcal_update_event,
     "gcal_delete_event": tool_gcal_delete_event,
+    "gmail_search": tool_gmail_search,
+    "gmail_get_message": tool_gmail_get_message,
+    "gmail_recent_summary": tool_gmail_recent_summary,
 }
 
 
@@ -801,7 +1029,7 @@ async def run_agent(chat_id: int, user_text: str, history: Optional[List[Dict]] 
 
     final_text = ""
     for hop in range(max_hops):
-        messages = [_system_message(chat_id), *history]
+        messages = [_system_message(chat_id, recent_user_text=user_text), *history]
         data = await chat_completion(messages, tools=TOOLS, chat_id=chat_id, kind="chat")
         msg = data["choices"][0]["message"]
         history.append(
@@ -1049,6 +1277,49 @@ async def cmd_agenda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     legend = "(📍 local · 🟦 gcal · ✅ both)"
     body = "\n".join(_format_merged_event(it) for it in items)
     await update.message.reply_text(f"앞으로 60일 일정 {legend}:\n{body}")
+
+
+async def cmd_people(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    rows = db.list_people(chat_id)
+    if not rows:
+        await update.message.reply_text(
+            "등록된 사람 없음. 자연어로 '경서는 약혼녀, 생일 7/12야'라고 하시면 자동으로 기억할게요."
+        )
+        return
+    now = datetime.now(timezone.utc)
+    today = datetime.now(TZ).date()
+    lines = []
+    for r in rows:
+        bits = [f"#{r['id']} · {r['name']}"]
+        if r["role"]:
+            bits.append(r["role"])
+        if r["last_contact_utc"]:
+            try:
+                lc = datetime.fromisoformat(r["last_contact_utc"])
+                bits.append(f"last {(now - lc).days}d")
+            except Exception:
+                pass
+        head = " · ".join(bits)
+        dates = json.loads(r["important_dates_json"] or "[]")
+        date_strs = []
+        for d in dates:
+            try:
+                dt = datetime.fromisoformat(d["date_local"]).date()
+                if d.get("recurring_yearly"):
+                    this_year = dt.replace(year=today.year)
+                    if this_year < today:
+                        this_year = dt.replace(year=today.year + 1)
+                    days_left = (this_year - today).days
+                else:
+                    days_left = (dt - today).days
+                date_strs.append(f"{d['label']} D-{days_left}")
+            except Exception:
+                pass
+        if date_strs:
+            head += "\n     ↳ " + ", ".join(date_strs)
+        lines.append(head)
+    await update.message.reply_text("👥 등록된 사람:\n" + "\n\n".join(lines))
 
 
 async def cmd_facts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1498,6 +1769,7 @@ def main() -> None:
     app.add_handler(CommandHandler("week", cmd_week))
     app.add_handler(CommandHandler("agenda", cmd_agenda))
     app.add_handler(CommandHandler("facts", cmd_facts))
+    app.add_handler(CommandHandler("people", cmd_people))
     app.add_handler(CommandHandler("goals", cmd_goals))
     app.add_handler(CommandHandler("review", cmd_review))
     app.add_handler(CommandHandler("notes", cmd_notes))

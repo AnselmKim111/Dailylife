@@ -127,6 +127,19 @@ CREATE TRIGGER IF NOT EXISTS chat_log_ad AFTER DELETE ON chat_log BEGIN
     INSERT INTO chat_log_fts(chat_log_fts, rowid, content) VALUES('delete', old.id, old.content);
 END;
 
+CREATE TABLE IF NOT EXISTS people (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    aliases_json TEXT NOT NULL DEFAULT '[]',
+    role TEXT,
+    notes TEXT,
+    important_dates_json TEXT NOT NULL DEFAULT '[]',
+    last_contact_utc TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_people_chat ON people(chat_id);
+
 CREATE TABLE IF NOT EXISTS oauth_tokens (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     chat_id INTEGER NOT NULL,
@@ -890,3 +903,142 @@ def all_chat_ids_with_google_oauth() -> List[int]:
         return [r[0] for r in c.execute(
             "SELECT DISTINCT chat_id FROM oauth_tokens WHERE provider='google'"
         )]
+
+
+# ---------------- people / relationships ----------------
+
+
+def add_person(
+    chat_id: int,
+    name: str,
+    aliases: Optional[List[str]] = None,
+    role: Optional[str] = None,
+    notes: Optional[str] = None,
+    important_dates: Optional[List[Dict]] = None,
+) -> int:
+    """Insert a new person. Updates if (chat_id, name) already exists — merge aliases."""
+    with _conn() as c:
+        existing = c.execute(
+            "SELECT id, aliases_json, important_dates_json FROM people WHERE chat_id=? AND name=?",
+            (chat_id, name.strip()),
+        ).fetchone()
+        if existing:
+            cur_aliases = set(_json.loads(existing["aliases_json"] or "[]"))
+            cur_aliases.update(aliases or [])
+            cur_dates = _json.loads(existing["important_dates_json"] or "[]")
+            new_dates = important_dates or []
+            seen_labels = {(d.get("label"), d.get("date_local")) for d in cur_dates}
+            for d in new_dates:
+                if (d.get("label"), d.get("date_local")) not in seen_labels:
+                    cur_dates.append(d)
+            c.execute(
+                "UPDATE people SET aliases_json=?, role=COALESCE(?, role), "
+                "notes=COALESCE(?, notes), important_dates_json=? WHERE id=?",
+                (_json.dumps(sorted(cur_aliases), ensure_ascii=False), role, notes,
+                 _json.dumps(cur_dates, ensure_ascii=False), existing["id"]),
+            )
+            return existing["id"]
+        cur = c.execute(
+            "INSERT INTO people (chat_id, name, aliases_json, role, notes, important_dates_json) "
+            "VALUES (?,?,?,?,?,?)",
+            (
+                chat_id, name.strip(),
+                _json.dumps(aliases or [], ensure_ascii=False),
+                role, notes,
+                _json.dumps(important_dates or [], ensure_ascii=False),
+            ),
+        )
+        return cur.lastrowid
+
+
+def update_person(
+    person_id: int,
+    chat_id: int,
+    *,
+    name: Optional[str] = None,
+    role: Optional[str] = None,
+    notes: Optional[str] = None,
+    add_aliases: Optional[List[str]] = None,
+    important_dates: Optional[List[Dict]] = None,
+) -> bool:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT * FROM people WHERE id=? AND chat_id=?", (person_id, chat_id)
+        ).fetchone()
+        if row is None:
+            return False
+        new_aliases = set(_json.loads(row["aliases_json"] or "[]"))
+        if add_aliases:
+            new_aliases.update(add_aliases)
+        cur_dates = _json.loads(row["important_dates_json"] or "[]")
+        if important_dates:
+            seen = {(d.get("label"), d.get("date_local")) for d in cur_dates}
+            for d in important_dates:
+                if (d.get("label"), d.get("date_local")) not in seen:
+                    cur_dates.append(d)
+        c.execute(
+            "UPDATE people SET name=COALESCE(?, name), role=COALESCE(?, role), "
+            "notes=COALESCE(?, notes), aliases_json=?, important_dates_json=? "
+            "WHERE id=? AND chat_id=?",
+            (name, role, notes,
+             _json.dumps(sorted(new_aliases), ensure_ascii=False),
+             _json.dumps(cur_dates, ensure_ascii=False),
+             person_id, chat_id),
+        )
+        return True
+
+
+def list_people(chat_id: int, role: Optional[str] = None) -> List[sqlite3.Row]:
+    with _conn() as c:
+        if role:
+            return list(c.execute(
+                "SELECT * FROM people WHERE chat_id=? AND role=? ORDER BY name",
+                (chat_id, role)))
+        return list(c.execute(
+            "SELECT * FROM people WHERE chat_id=? ORDER BY name", (chat_id,)))
+
+
+def get_person(person_id: int) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute("SELECT * FROM people WHERE id=?", (person_id,)).fetchone()
+
+
+def delete_person(person_id: int, chat_id: int) -> bool:
+    with _conn() as c:
+        cur = c.execute("DELETE FROM people WHERE id=? AND chat_id=?",
+                        (person_id, chat_id))
+        return cur.rowcount > 0
+
+
+def mark_contact(person_id: int) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as c:
+        c.execute("UPDATE people SET last_contact_utc=? WHERE id=?", (now, person_id))
+
+
+def find_people_in_text(chat_id: int, text: str) -> List[sqlite3.Row]:
+    """Return people whose name or any alias substring-matches in `text`.
+
+    Case-insensitive Latin; raw substring match for Korean. Returns full rows."""
+    people = list_people(chat_id)
+    if not people:
+        return []
+    lowered = text.lower()
+    hits = []
+    for p in people:
+        names: List[str] = [p["name"]]
+        try:
+            names.extend(_json.loads(p["aliases_json"] or "[]"))
+        except Exception:
+            pass
+        for n in names:
+            if not n:
+                continue
+            n_strip = n.strip()
+            if not n_strip:
+                continue
+            # Korean substring direct; Latin lowercased
+            if n_strip in text or n_strip.lower() in lowered:
+                hits.append(p)
+                break
+    return hits

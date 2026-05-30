@@ -534,6 +534,160 @@ TOOLS: List[Dict] = [
             },
         },
     },
+    # ---- people / relationships ----
+    {
+        "type": "function",
+        "function": {
+            "name": "add_person",
+            "description": (
+                "Persist a person the user mentioned (약혼녀, 가족, 동기, 친구, 동료, 후배 등). "
+                "Use whenever the user introduces a named person or shares a fact like '내 약혼녀는 경서야'. "
+                "If important_dates includes a birthday or anniversary, the assistant can later remind D-N."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Canonical short name, e.g. '경서'."},
+                    "aliases": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Other ways the user calls this person: ['경서야','우리 경서'].",
+                    },
+                    "role": {"type": "string", "description": "약혼녀 | 가족 | 동기 | 친구 | 직장 | 후배 | etc."},
+                    "notes": {"type": "string", "description": "Free-form facts/context."},
+                    "important_dates": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string", "description": "e.g. '생일', '기념일', '입대일'."},
+                                "date_local": {"type": "string", "description": "YYYY-MM-DD (KST)."},
+                                "recurring_yearly": {"type": "boolean"},
+                            },
+                            "required": ["label", "date_local"],
+                        },
+                    },
+                },
+                "required": ["name"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "update_person",
+            "description": "Modify or extend an existing person. Aliases and important_dates are merged, not replaced.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "person_id": {"type": "integer"},
+                    "name": {"type": "string"},
+                    "role": {"type": "string"},
+                    "notes": {"type": "string"},
+                    "add_aliases": {"type": "array", "items": {"type": "string"}},
+                    "important_dates": {
+                        "type": "array",
+                        "items": {"type": "object"},
+                    },
+                },
+                "required": ["person_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_people",
+            "description": "List all known people for the user (optionally filtered by role).",
+            "parameters": {
+                "type": "object",
+                "properties": {"role": {"type": "string"}},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "recall_person",
+            "description": "Look up everything we know about one person — facts/notes/dates/last_contact.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name_or_alias": {"type": "string"},
+                },
+                "required": ["name_or_alias"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "log_contact_with",
+            "description": "Record explicit contact with a person (call, message, meeting). Auto-updates last_contact_utc.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name_or_alias": {"type": "string"},
+                    "channel": {"type": "string", "description": "예: 'call','telegram','meet','message','letter'."},
+                    "notes": {"type": "string"},
+                },
+                "required": ["name_or_alias"],
+            },
+        },
+    },
+    # ---- Gmail read-only (shares Google OAuth with gcal) ----
+    {
+        "type": "function",
+        "function": {
+            "name": "gmail_search",
+            "description": (
+                "Search the user's Gmail with the same q syntax the Gmail UI accepts "
+                "(e.g. 'from:airline subject:항공권 newer_than:7d'). Returns small "
+                "message summaries (subject/from/date/snippet). Use get_message+id for full body."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer", "description": "1-50, default 10."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "gmail_get_message",
+            "description": "Fetch one Gmail message by id with full body (HTML stripped, up to 4000 chars).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message_id": {"type": "string"},
+                    "body_max_chars": {"type": "integer", "description": "Default 4000."},
+                },
+                "required": ["message_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "gmail_recent_summary",
+            "description": (
+                "Cheap overview of recent inbox — last N hours of messages "
+                "(subject/from/snippet only, no body). Use for 'today's mail' style "
+                "briefings or when the user asks 'anything important come in?'"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "hours": {"type": "integer", "description": "Default 24, max 168 (7d)."},
+                    "max_messages": {"type": "integer", "description": "Default 10, max 50."},
+                },
+            },
+        },
+    },
 ]
 
 
