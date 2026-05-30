@@ -41,6 +41,13 @@ TOOLS: List[Dict] = [
                         ),
                     },
                     "notes": {"type": "string", "description": "Optional details."},
+                    "location": {
+                        "type": "string",
+                        "description": (
+                            "Optional address or place name. When provided, the bot will "
+                            "auto-schedule a leave-by alert using kakao directions ETA."
+                        ),
+                    },
                     "remind_lead_minutes": {
                         "type": "integer",
                         "description": (
@@ -848,12 +855,15 @@ async def chat_completion(
     tool_choice: Optional[str] = None,
     chat_id: Optional[int] = None,
     kind: str = "chat",
+    max_tokens: Optional[int] = None,
 ) -> Dict:
     payload: Dict = {"model": OPENROUTER_MODEL, "messages": messages}
     if tools:
         payload["tools"] = tools
         if tool_choice:
             payload["tool_choice"] = tool_choice
+    if max_tokens is not None:
+        payload["max_tokens"] = int(max_tokens)
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",

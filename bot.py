@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -72,7 +73,10 @@ SYSTEM_PROMPT_TEMPLATE = (
     "Always extract the concrete details (date, place, name, amount) and call the right save tool — "
     "don't just acknowledge the upload.\n"
     "- Spending mention with a price ('스벅 6500원') → log_expense. Habit mention "
-    "('운동 1시간', '책 30분') → log_habit. Both have inline-undo if mis-categorized.\n\n"
+    "('운동 1시간', '책 30분') → log_habit. Both have inline-undo if mis-categorized.\n"
+    "- Pre-emptive nudges (메일→일정 자동 카드, 출발 알림(leave-by), 골 D-30/14/3/1, 점심 안부 체크인) "
+    "are armed by per-chat crons. If the user says '시끄러워' / '꺼' / '알림 줄여' point them to "
+    "/nudges for toggles instead of arguing.\n\n"
     "Known facts about this user:\n{facts_block}"
 )
 
@@ -373,20 +377,31 @@ def tool_add_event(chat_id: int, args: Dict) -> Dict:
     except ValueError as e:
         return {"ok": False, "error": f"invalid when_iso: {e}"}
     notes = args.get("notes")
+    location = (args.get("location") or "").strip() or None
     lead = args.get("remind_lead_minutes")
     lead = 30 if lead is None else int(lead)
     lead = lead if lead > 0 else None
     # Conflict pre-check against local DB (and best-effort GCal via merge view later).
     conflicts = _check_local_conflicts(chat_id, when_utc, lookahead_minutes=120)
-    eid = db.add_event(chat_id, title, when_utc, notes, lead)
+    eid = db.add_event(chat_id, title, when_utc, notes, lead, location=location)
     row = db.get_event(eid)
     armed = scheduler.schedule_for(row) if row else False
+    # Best-effort leave-by scheduling — fire-and-forget background task.
+    leave_by_queued = False
+    if row and location and not _toggle_off_local(chat_id, "leave_by_enabled"):
+        try:
+            asyncio.create_task(_try_schedule_leave_by(chat_id, row))
+            leave_by_queued = True
+        except Exception:
+            logger.exception("leave-by enqueue failed for event %s", eid)
     return {
         "ok": True,
         "event_id": eid,
         "when_local": when_utc.astimezone(TZ).isoformat(),
         "remind_lead_minutes": lead,
         "reminder_armed": armed,
+        "location": location,
+        "leave_by_queued": leave_by_queued,
         "conflicts": conflicts,
     }
 
@@ -1419,6 +1434,7 @@ async def run_morning_briefing(chat_id: int) -> None:
     ) or "  (없음)"
 
     people_today = []
+    person_ids_today: List[int] = []
     today_md = today_local.strftime("%m-%d")
     for r in db.list_people(chat_id):
         for d in json.loads(r["important_dates_json"] or "[]"):
@@ -1426,8 +1442,12 @@ async def run_morning_briefing(chat_id: int) -> None:
                 dt = datetime.fromisoformat(d["date_local"]).date()
                 if dt.strftime("%m-%d") == today_md:
                     people_today.append(f"  - {r['name']}: {d['label']}")
+                    if r["id"] not in person_ids_today:
+                        person_ids_today.append(r["id"])
             except Exception:
                 pass
+    # Persist for the 09:00 birthday-solo cron (opt-in via fact).
+    db.mark_birthdays_today(chat_id, today_local.isoformat(), person_ids_today)
     people_str = "\n".join(people_today) or "  (없음)"
 
     extras_parts = []
@@ -1498,16 +1518,451 @@ async def run_evening_reflection(chat_id: int) -> None:
 
 
 async def run_daily_imminent_check(chat_id: int) -> None:
-    """Daily 08:00 — push only if any goal target_date is within D-7."""
-    rows = db.goals_due_within(chat_id, days=7)
+    """Daily 08:00 — three responsibilities in one cron:
+      1. Push the legacy D-7 imminent goal digest (unchanged).
+      2. Fire one-off D-30 / D-14 / D-3 / D-1 milestone alerts (idempotent via
+         goal_milestones_sent table) so long-horizon goals get earlier signal.
+      3. Skip both if user opted out via fact goal_review_enabled=false (caught
+         upstream by scheduler._goal_review_disabled).
+    """
     bot = _app.bot if _app else None
-    if not rows or not bot:
+    if not bot:
         return
-    lines = ["📌 임박한 골 (D-7 이내)"]
-    for r in rows:
-        d = _days_until(r["target_date_local"])
-        lines.append(f"• D-{d} · #{r['id']} {r['title']}")
-    await bot.send_message(chat_id=chat_id, text="\n".join(lines))
+    today_local = datetime.now(TZ).date()
+    open_goals = db.list_goals(chat_id, status="open")
+
+    # ----- 1. legacy D-7 digest -----
+    soon = [r for r in open_goals if r["target_date_local"]
+            and 0 <= _days_until(r["target_date_local"]) <= 7]
+    if soon:
+        lines = ["📌 임박한 골 (D-7 이내)"]
+        for r in soon:
+            d = _days_until(r["target_date_local"])
+            lines.append(f"• D-{d} · #{r['id']} {r['title']}")
+        await bot.send_message(chat_id=chat_id, text="\n".join(lines))
+
+    # ----- 2. milestone alerts -----
+    if _toggle_off_local(chat_id, "goal_milestone_enabled"):
+        return
+    milestones = (30, 14, 3, 1)
+    for r in open_goals:
+        td = r["target_date_local"]
+        if not td:
+            continue
+        try:
+            target = datetime.fromisoformat(td).date()
+        except ValueError:
+            continue
+        days_left = (target - today_local).days
+        if days_left not in milestones:
+            continue
+        if db.milestone_already_sent(r["id"], days_left):
+            continue
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ 완료", callback_data=f"act:goal_done:{r['id']}"),
+            InlineKeyboardButton("⏸ 보류", callback_data=f"act:goal_pause:{r['id']}"),
+        ]])
+        text = f"🎯 D-{days_left} · #{r['id']} {r['title']}"
+        if r["why"]:
+            text += f"\n  ↳ {r['why'][:80]}"
+        try:
+            await bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+            db.record_milestone_sent(chat_id, r["id"], days_left)
+        except Exception:
+            logger.exception("milestone send failed for goal %s D-%s", r["id"], days_left)
+
+
+# ---------------- pre-emptive runners (gmail scan, evening preview, birthday, midday, leave-by) ----------------
+
+
+# Short-lived in-memory candidates from gmail event scan — token → payload.
+_pending_mail_cards: Dict[str, Dict] = {}
+
+
+EMAIL_EVENT_EXTRACT_PROMPT = (
+    "다음 이메일 본문에서 일정 한 건을 한 줄 JSON으로 뽑아.\n"
+    'JSON: {"title": "짧은 한국어 제목 ≤30자", "when_local": "YYYY-MM-DDTHH:MM:SS (사용자 KST)", '
+    '"location": "장소(없으면 빈 문자열)", "source_summary": "≤80자 요약"}\n'
+    "정확한 날짜·시간이 본문에 없으면 빈 JSON {} 만 출력. JSON만, 그 외 금지."
+)
+
+
+async def _extract_event_from_email_text(body: str, *, hint_now_kst: str) -> Optional[Dict]:
+    """Micro-LLM call: best-effort structured event extraction from one email body.
+    Returns dict on success, None on any failure / empty result."""
+    if not body or not body.strip():
+        return None
+    prompt = (
+        EMAIL_EVENT_EXTRACT_PROMPT
+        + f"\n현재 시각(KST): {hint_now_kst}\n\n본문:\n"
+        + body[:2400]
+    )
+    try:
+        data = await chat_completion(
+            [{"role": "user", "content": prompt}],
+            tools=None,
+            chat_id=0,
+            kind="mail_extract",
+            max_tokens=240,
+        )
+        content = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+    except Exception:
+        logger.exception("mail extract LLM call failed")
+        return None
+    import re as _re
+    blob = _re.sub(r"^\s*```(?:json)?\s*", "", content.strip(), flags=_re.IGNORECASE)
+    blob = _re.sub(r"\s*```\s*$", "", blob)
+    m = _re.search(r"\{[\s\S]*\}", blob)
+    if not m:
+        return None
+    try:
+        parsed = json.loads(m.group(0))
+    except Exception:
+        return None
+    if not parsed or not parsed.get("title") or not parsed.get("when_local"):
+        return None
+    return parsed
+
+
+_NOISY_EMAIL_KEYWORDS = ("광고", "홍보", "스팸", "마케팅", "unsubscribe", "프로모션", "이벤트 안내")
+
+
+async def run_gmail_event_scan(chat_id: int) -> None:
+    """Poll Gmail for recently received messages that look like events; surface
+    a card with [✅ 추가] / [✏️ 수정] / [❌ 아님] buttons. Every msg_id is dedup'd
+    in processed_gmail_msg_ids so we never re-offer the same message."""
+    if _app is None or _app.bot is None:
+        return
+    if _toggle_off_local(chat_id, "gmail_event_scan_enabled"):
+        return
+    if not db.get_oauth_token(chat_id, "google"):
+        return
+    try:
+        ids = await gmail_mod.list_messages(chat_id, query="newer_than:1d", max_results=20)
+    except Exception:
+        logger.exception("gmail_event_scan: list_messages failed")
+        return
+    for mid in ids:
+        if db.is_gmail_processed(chat_id, mid):
+            continue
+        try:
+            msg = await gmail_mod.get_message(chat_id, mid, body_max_chars=4000)
+        except Exception:
+            logger.exception("gmail_event_scan: get_message failed for %s", mid)
+            continue
+        body = msg.get("body") or msg.get("snippet") or ""
+        subject = msg.get("subject") or ""
+        combined = (subject + "\n" + body).strip()
+        # Cheap noise filter.
+        low = combined.lower()
+        if any(kw in low for kw in _NOISY_EMAIL_KEYWORDS):
+            db.mark_gmail_processed(chat_id, mid, "skipped")
+            continue
+        try:
+            cls = await transcribe.classify_content(combined, hint="email")
+        except Exception:
+            logger.exception("gmail_event_scan: classify failed")
+            db.mark_gmail_processed(chat_id, mid, "skipped")
+            continue
+        if cls.get("kind") != "event" or cls.get("confidence", 0.0) < 0.8:
+            db.mark_gmail_processed(chat_id, mid, "low_conf")
+            continue
+        now_kst = datetime.now(TZ).strftime("%Y-%m-%dT%H:%M:%S")
+        candidate = await _extract_event_from_email_text(combined, hint_now_kst=now_kst)
+        if not candidate:
+            db.mark_gmail_processed(chat_id, mid, "low_conf")
+            continue
+        # Build card.
+        token = secrets.token_urlsafe(8)
+        _pending_mail_cards[token] = {
+            "chat_id": chat_id,
+            "msg_id": mid,
+            "title": candidate.get("title", "")[:80],
+            "when_local": candidate.get("when_local"),
+            "location": (candidate.get("location") or "").strip() or None,
+            "source_summary": (candidate.get("source_summary") or "")[:160],
+            "subject": subject,
+        }
+        body_lines = [
+            "📬 메일에서 일정 후보를 찾았어",
+            f"• 제목: {candidate.get('title', '')}",
+            f"• 시각: {candidate.get('when_local')}",
+        ]
+        if candidate.get("location"):
+            body_lines.append(f"• 장소: {candidate['location']}")
+        if candidate.get("source_summary"):
+            body_lines.append(f"• 메일: {candidate['source_summary']}")
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ 추가", callback_data=f"act:mail_add:{token}"),
+            InlineKeyboardButton("❌ 아님", callback_data=f"act:mail_skip:{token}"),
+        ]])
+        try:
+            await _app.bot.send_message(chat_id=chat_id, text="\n".join(body_lines), reply_markup=kb)
+            db.mark_gmail_processed(chat_id, mid, "offered")
+        except Exception:
+            logger.exception("gmail_event_scan: send card failed")
+
+
+# ----- Leave-by: compute ETA + schedule the one-shot APScheduler job -----
+
+
+async def _resolve_to_coord(text: str) -> Optional[Dict]:
+    """Try address lookup first, then keyword search. Returns {x, y} or None."""
+    if not text or not text.strip():
+        return None
+    try:
+        addr = await external.kakao_address_to_coord(text)
+        if addr.get("ok") and addr.get("match"):
+            m = addr["match"]
+            return {"x": m["x"], "y": m["y"]}
+    except Exception:
+        pass
+    try:
+        kw = await external.kakao_local_keyword(query=text, size=1)
+        if kw.get("ok") and kw.get("places"):
+            p = kw["places"][0]
+            return {"x": float(p["x"]), "y": float(p["y"])}
+    except Exception:
+        pass
+    return None
+
+
+async def _try_schedule_leave_by(chat_id: int, event_row) -> None:
+    """Best-effort: resolve origin (home_address fact) + dest (event.location),
+    compute ETA via Kakao driving, schedule one-shot leave-by job. Silent on
+    any failure so add_event never appears to fail because of nudge plumbing."""
+    if _toggle_off_local(chat_id, "leave_by_enabled"):
+        return
+    location = event_row["location"] if event_row else None
+    if not location:
+        return
+    # Resolve origin: home_address fact (mandatory — no fallback to last_known).
+    home = None
+    for r in db.list_facts(chat_id):
+        if r["key"] == "home_address":
+            home = r["value"]
+            break
+    if not home:
+        logger.debug("leave-by: no home_address fact for chat %s — silent skip", chat_id)
+        return
+    o = await _resolve_to_coord(home)
+    d = await _resolve_to_coord(location)
+    if not o or not d:
+        return
+    try:
+        route = await external.kakao_directions(
+            origin_x=o["x"], origin_y=o["y"], dest_x=d["x"], dest_y=d["y"],
+        )
+    except Exception:
+        logger.exception("leave-by: kakao_directions failed for event %s", event_row["id"])
+        return
+    if not route.get("ok"):
+        return
+    summary = route.get("summary") or {}
+    duration_s = summary.get("duration_s")
+    if not duration_s:
+        return
+    try:
+        buf_min = int(_fact_value_local(chat_id, "leave_by_buffer_min") or "5")
+    except ValueError:
+        buf_min = 5
+    eta_min = int(duration_s // 60) + max(0, buf_min)
+    when_utc = datetime.fromisoformat(event_row["when_utc"])
+    leave_at_utc = when_utc - timedelta(minutes=eta_min)
+    if leave_at_utc <= datetime.now(timezone.utc):
+        return
+    job_id = scheduler.schedule_leave_by(event_row["id"], leave_at_utc)
+    if job_id:
+        db.set_event_leave_by_job(event_row["id"], job_id)
+        logger.info("leave-by armed event=%s eta=%dmin fire=%s",
+                    event_row["id"], eta_min, leave_at_utc.isoformat())
+
+
+def _fact_value_local(chat_id: int, key: str) -> Optional[str]:
+    for row in db.list_facts(chat_id):
+        if row["key"] == key:
+            return row["value"]
+    return None
+
+
+async def _send_leave_by_for_event(event_id: int) -> None:
+    if _app is None or _app.bot is None:
+        return
+    row = db.get_event(event_id)
+    if not row:
+        return
+    when_local = datetime.fromisoformat(row["when_utc"]).astimezone(TZ)
+    delta_min = max(0, int((when_local - datetime.now(TZ)).total_seconds() // 60))
+    text = (
+        f"🚗 지금 나가\n"
+        f"• {row['title']}"
+    )
+    if row["location"]:
+        text += f"\n• 장소: {row['location']}"
+    text += f"\n• 도착 목표: {when_local.strftime('%H:%M')} ({delta_min}분 뒤)"
+    try:
+        await _app.bot.send_message(chat_id=row["chat_id"], text=text)
+    except Exception:
+        logger.exception("leave-by send failed for event %s", event_id)
+
+
+async def run_leave_by_recompute(chat_id: int) -> None:
+    """Daily 03:30 — re-arm leave-by jobs for upcoming 48h. ETA may have shifted
+    (traffic, location change). Idempotent: schedule_leave_by uses replace_existing."""
+    if _toggle_off_local(chat_id, "leave_by_enabled"):
+        return
+    for row in db.events_with_location_in_window(chat_id, hours=48):
+        try:
+            await _try_schedule_leave_by(chat_id, row)
+        except Exception:
+            logger.exception("leave-by recompute failed for event %s", row["id"])
+
+
+# ----- Evening preview (tomorrow's first event + weather + holiday, terse) -----
+
+
+async def run_evening_preview(chat_id: int) -> None:
+    """22:00 KST — single-line preview of tomorrow. Silent unless tomorrow has
+    an event, is a Korean holiday, or weather flags rain/snow > 30%."""
+    if _app is None or _app.bot is None:
+        return
+    if _toggle_off_local(chat_id, "weather_preview_enabled"):
+        return
+    now_local = datetime.now(TZ)
+    tomorrow_local = (now_local + timedelta(days=1)).date()
+    tomorrow_start = datetime.combine(tomorrow_local, datetime.min.time()).replace(tzinfo=TZ)
+    tomorrow_end = tomorrow_start + timedelta(days=1)
+    items = await _merge_schedule(
+        chat_id, tomorrow_start.astimezone(timezone.utc), tomorrow_end.astimezone(timezone.utc))
+    holiday = korean_calendar.is_holiday(tomorrow_local.isoformat())
+
+    # Choose a weather location: first event with location, else default fact, else skip.
+    loc = None
+    for it in items:
+        if it.get("location"):
+            loc = it["location"]
+            break
+    if not loc:
+        loc = _fact_value_local(chat_id, "default_weather_location") \
+              or _fact_value_local(chat_id, "home_address")
+    weather_info = None
+    if loc:
+        try:
+            w = await weather_mod.weather(loc, days=2)
+            if w.get("ok"):
+                # Find tomorrow's max rain probability in samples.
+                td = tomorrow_local.isoformat()
+                rain_max = 0
+                tmin, tmax = None, None
+                for h in w.get("hourly", []):
+                    if h.get("time", "").startswith(td):
+                        if h.get("rain_pct") is not None and h["rain_pct"] > rain_max:
+                            rain_max = h["rain_pct"]
+                        if h.get("temp") is not None:
+                            tmin = h["temp"] if tmin is None else min(tmin, h["temp"])
+                            tmax = h["temp"] if tmax is None else max(tmax, h["temp"])
+                weather_info = {
+                    "location": w.get("location") or loc,
+                    "rain_pct": rain_max,
+                    "tmin": tmin, "tmax": tmax,
+                }
+        except Exception:
+            logger.exception("evening_preview: weather lookup failed")
+
+    # Silence rule — skip if no signal.
+    has_event = bool(items)
+    is_holiday = holiday["is_holiday"]
+    has_rain = bool(weather_info and (weather_info["rain_pct"] or 0) >= 30)
+    if not (has_event or is_holiday or has_rain):
+        return
+
+    parts = ["🌙 내일 미리보기"]
+    if is_holiday:
+        parts.append(f"  • 공휴일: {holiday['name']}")
+    if items:
+        first = items[0]
+        when = first["when_utc"].astimezone(TZ).strftime("%H:%M")
+        loc_str = f" @{first['location']}" if first.get("location") else ""
+        parts.append(f"  • 첫 일정 {when} {first['title']}{loc_str}")
+        if len(items) > 1:
+            parts.append(f"  • 그 외 {len(items) - 1}건")
+    if weather_info:
+        bits = [weather_info["location"]]
+        if weather_info["tmin"] is not None:
+            bits.append(f"{weather_info['tmin']:.0f}~{weather_info['tmax']:.0f}℃")
+        if has_rain:
+            bits.append(f"비/눈 {weather_info['rain_pct']}% — 우산 챙겨")
+        parts.append("  • " + ", ".join(bits))
+    try:
+        await _app.bot.send_message(chat_id=chat_id, text="\n".join(parts))
+    except Exception:
+        logger.exception("evening_preview send failed")
+
+
+# ----- Birthday solo (09:00, opt-in via fact birthday_alert_separate_enabled) -----
+
+
+async def run_birthday_solo(chat_id: int) -> None:
+    if _app is None or _app.bot is None:
+        return
+    if not _toggle_on_local(chat_id, "birthday_alert_separate_enabled"):
+        return
+    today_local = datetime.now(TZ).date()
+    today_md = today_local.strftime("%m-%d")
+    for p in db.list_people(chat_id):
+        for d in json.loads(p["important_dates_json"] or "[]"):
+            try:
+                dt = datetime.fromisoformat(d["date_local"]).date()
+            except Exception:
+                continue
+            if dt.strftime("%m-%d") != today_md:
+                continue
+            role_bit = f" ({p['role']})" if p["role"] else ""
+            label = d.get("label") or "기념일"
+            text = f"🎂 오늘 {p['name']}{role_bit} {label} — 한마디 어때?"
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("📩 메시지 초안", callback_data=f"act:bday_draft:{p['id']}"),
+            ]])
+            try:
+                await _app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+            except Exception:
+                logger.exception("birthday solo send failed for person %s", p["id"])
+
+
+def _toggle_on_local(chat_id: int, key: str) -> bool:
+    v = _fact_value_local(chat_id, key)
+    return v is not None and v.strip().lower() in {"true", "on", "1", "yes"}
+
+
+# ----- Midday check-in (13:00, terse if there are afternoon events) -----
+
+
+async def run_midday_checkin(chat_id: int) -> None:
+    if _app is None or _app.bot is None:
+        return
+    if _toggle_off_local(chat_id, "midday_checkin_enabled"):
+        return
+    today_local = datetime.now(TZ).date()
+    state = db.get_daily_state(chat_id, today_local.isoformat())
+    if state and state["midday_checkin_sent"]:
+        return
+    now_local = datetime.now(TZ)
+    end_today = now_local.replace(hour=23, minute=59, second=59)
+    items = await _merge_schedule(
+        chat_id, now_local.astimezone(timezone.utc), end_today.astimezone(timezone.utc))
+    if not items:
+        # Silent — no afternoon plans to nudge about.
+        return
+    first = items[0]
+    when = first["when_utc"].astimezone(TZ).strftime("%H:%M")
+    title = first["title"][:30]
+    loc = f" @{first['location']}" if first.get("location") else ""
+    text = f"☀️ {when} {title}{loc} — 준비 됐어?"
+    try:
+        await _app.bot.send_message(chat_id=chat_id, text=text)
+        db.mark_midday_checkin_sent(chat_id, today_local.isoformat())
+    except Exception:
+        logger.exception("midday checkin send failed")
 
 
 # ---------------- Telegram handlers ----------------
@@ -1766,6 +2221,116 @@ async def cmd_reflect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     scheduler.trigger_evening_reflection_now(chat_id)
 
 
+_NUDGE_KEYS = {
+    # alias → (fact_key, default_on, label)
+    "메일":       ("gmail_event_scan_enabled",         True,  "메일→일정 감지"),
+    "gmail":      ("gmail_event_scan_enabled",         True,  "메일→일정 감지"),
+    "leaveby":    ("leave_by_enabled",                  True,  "Leave-by"),
+    "출발":       ("leave_by_enabled",                  True,  "Leave-by"),
+    "preview":    ("weather_preview_enabled",           True,  "전날 밤 프리뷰"),
+    "프리뷰":     ("weather_preview_enabled",           True,  "전날 밤 프리뷰"),
+    "milestone":  ("goal_milestone_enabled",            True,  "골 마일스톤"),
+    "마일스톤":   ("goal_milestone_enabled",            True,  "골 마일스톤"),
+    "birthday":   ("birthday_alert_separate_enabled",   False, "생일 단독 알림"),
+    "생일":       ("birthday_alert_separate_enabled",   False, "생일 단독 알림"),
+    "checkin":    ("midday_checkin_enabled",            True,  "점심 체크인"),
+    "점심":       ("midday_checkin_enabled",            True,  "점심 체크인"),
+    "briefing":   ("briefing_enabled",                  True,  "아침 브리핑"),
+    "브리핑":     ("briefing_enabled",                  True,  "아침 브리핑"),
+    "reflect":    ("reflection_enabled",                True,  "저녁 회고"),
+    "회고":       ("reflection_enabled",                True,  "저녁 회고"),
+}
+
+
+def _nudge_status(chat_id: int, key: str, default_on: bool) -> bool:
+    v = _fact_value_local(chat_id, key)
+    if v is None:
+        return default_on
+    s = v.strip().lower()
+    if default_on:  # default-on toggles use the "off" set
+        return s not in {"false", "off", "0", "no"}
+    return s in {"true", "on", "1", "yes"}
+
+
+async def cmd_nudges(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/nudges` → 현재 상태; `/nudges on|off <alias> [HH:MM]` → 토글/시간 변경."""
+    chat_id = update.effective_chat.id
+    args = [a.lower() for a in (context.args or [])]
+    # Status print
+    if not args:
+        lines = ["📣 활성 알림"]
+        rows = [
+            ("gmail_event_scan_enabled",       True,  "메일→일정 감지", None,
+             f"매 {_fact_value_local(chat_id, 'gmail_event_scan_minutes') or '60'}분"),
+            ("leave_by_enabled",               True,  "Leave-by",          None, None),
+            ("weather_preview_enabled",        True,  "전날 밤 프리뷰",
+             _fact_value_local(chat_id, "weather_preview_time") or "22:00", None),
+            ("goal_milestone_enabled",         True,  "골 마일스톤",        None, "D-30/14/3/1"),
+            ("birthday_alert_separate_enabled", False, "생일 단독 알림",     "09:00", None),
+            ("midday_checkin_enabled",         True,  "점심 체크인",
+             _fact_value_local(chat_id, "midday_checkin_time") or "13:00", None),
+            ("briefing_enabled",               True,  "아침 브리핑",
+             _fact_value_local(chat_id, "briefing_time") or "07:30", None),
+            ("reflection_enabled",             True,  "저녁 회고",
+             _fact_value_local(chat_id, "reflection_time") or "21:30", None),
+        ]
+        for key, default_on, label, time_str, extra in rows:
+            on = _nudge_status(chat_id, key, default_on)
+            bits = ["ON" if on else "OFF"]
+            if time_str:
+                bits.append(f"@{time_str}")
+            if extra:
+                bits.append(extra)
+            lines.append(f"  • {label}: {' '.join(bits)}")
+        lines.append("")
+        lines.append("끄기/켜기: /nudges off 메일 (또는 leaveby/preview/milestone/birthday/checkin/briefing/reflect)")
+        lines.append("시간 변경: /nudges preview 22:30 / /nudges checkin 12:45")
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    # Mutation forms.
+    op = args[0]
+    if op in {"on", "off"} and len(args) >= 2:
+        alias = args[1]
+        if alias not in _NUDGE_KEYS:
+            await update.message.reply_text(f"모르는 알림: {alias}")
+            return
+        fact_key, default_on, label = _NUDGE_KEYS[alias]
+        if op == "off":
+            if default_on:
+                db.remember_fact(chat_id, fact_key, "false")
+            else:
+                db.forget_fact(chat_id, fact_key)
+            await update.message.reply_text(f"🔕 {label} OFF.")
+        else:
+            if default_on:
+                db.forget_fact(chat_id, fact_key)
+            else:
+                db.remember_fact(chat_id, fact_key, "true")
+            await update.message.reply_text(f"🔔 {label} ON.")
+        scheduler.ensure_daily_rhythm_for(chat_id)
+        return
+    # Time-change form: /nudges <alias> HH:MM
+    if op in _NUDGE_KEYS and len(args) >= 2 and re.fullmatch(r"\d{1,2}:\d{2}", args[1]):
+        fact_key, _, label = _NUDGE_KEYS[op]
+        time_fact_map = {
+            "weather_preview_enabled": "weather_preview_time",
+            "midday_checkin_enabled": "midday_checkin_time",
+            "briefing_enabled": "briefing_time",
+            "reflection_enabled": "reflection_time",
+        }
+        if fact_key not in time_fact_map:
+            await update.message.reply_text(f"{label} 은 시간 변경 미지원.")
+            return
+        db.remember_fact(chat_id, time_fact_map[fact_key], args[1])
+        scheduler.ensure_daily_rhythm_for(chat_id)
+        await update.message.reply_text(f"⏰ {label} 시간 → {args[1]} KST.")
+        return
+    await update.message.reply_text(
+        "사용법: /nudges (상태) | /nudges on|off <alias> | /nudges <alias> HH:MM"
+    )
+
+
 async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     pending_gcal = [r for r in db.list_pending_gcal_sync() if r["chat_id"] == chat_id]
@@ -1990,6 +2555,69 @@ async def on_callback_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
             gid = int(rest)
             db.update_goal(gid, chat_id, status="paused")
             await cq.answer("골 보류 ⏸", show_alert=False)
+        elif kind == "mail_add":
+            cand = _pending_mail_cards.pop(rest, None)
+            if not cand or cand["chat_id"] != chat_id:
+                await cq.answer("만료된 카드", show_alert=False)
+                return
+            try:
+                when_utc = _parse_local_iso(cand["when_local"])
+            except ValueError:
+                await cq.answer("시각 파싱 실패", show_alert=True)
+                return
+            eid = db.add_event(
+                chat_id, cand["title"], when_utc,
+                notes=cand.get("source_summary"),
+                remind_lead_minutes=30, location=cand.get("location"),
+            )
+            row = db.get_event(eid)
+            if row:
+                scheduler.schedule_for(row)
+                if cand.get("location") and not _toggle_off_local(chat_id, "leave_by_enabled"):
+                    asyncio.create_task(_try_schedule_leave_by(chat_id, row))
+            db.mark_gmail_processed(chat_id, cand["msg_id"], "added")
+            await cq.answer(f"✅ 일정 #{eid} 추가", show_alert=False)
+            try:
+                await cq.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"📌 추가 완료 — #{eid} {cand['title']} ({cand['when_local']})",
+            )
+        elif kind == "mail_skip":
+            cand = _pending_mail_cards.pop(rest, None)
+            if cand:
+                db.mark_gmail_processed(cand["chat_id"], cand["msg_id"], "skipped")
+            await cq.answer("건너뜀", show_alert=False)
+            try:
+                await cq.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+        elif kind == "bday_draft":
+            pid = int(rest)
+            people = [p for p in db.list_people(chat_id) if p["id"] == pid]
+            if not people:
+                await cq.answer("없는 사람", show_alert=False)
+                return
+            p = people[0]
+            await cq.answer("초안 생성 중…")
+            prompt = (
+                f"한국어로 {p['name']}({p['role'] or '지인'})에게 보낼 짧고 따뜻한 "
+                f"생일/기념일 축하 메시지 초안 1-2줄만 써. 이모지 1개 정도 OK. "
+                f"인사말이나 부연 설명 없이 메시지 본문만."
+            )
+            try:
+                data = await chat_completion(
+                    [{"role": "user", "content": prompt}],
+                    tools=None, chat_id=chat_id, kind="bday_draft", max_tokens=200,
+                )
+                draft = (data["choices"][0]["message"].get("content") or "").strip()
+            except Exception:
+                draft = f"{p['name']}야, 오늘 좋은 하루 보내! 🎂"
+            await context.bot.send_message(
+                chat_id=chat_id, text=f"📩 {p['name']}에게:\n\n{draft}",
+            )
         else:
             await cq.answer(f"미구현 액션: {kind}")
     except Exception as e:
@@ -2277,6 +2905,7 @@ BOT_COMMANDS: List[BotCommand] = [
     # Setup & ops
     BotCommand("setup", "가이드 온보딩"),
     BotCommand("cost", "OpenRouter 사용량 요약"),
+    BotCommand("nudges", "능동 알림 토글 + 상태"),
     BotCommand("diag", "봇 상태 진단"),
     BotCommand("export", "내 데이터 마크다운으로 보기"),
     BotCommand("reset", "이번 대화 메모리 초기화"),
@@ -2295,6 +2924,12 @@ async def post_init(app: Application) -> None:
         run_daily_imminent_check,
         morning_briefing_runner=run_morning_briefing,
         evening_reflection_runner=run_evening_reflection,
+        gmail_event_scan_runner=run_gmail_event_scan,
+        evening_preview_runner=run_evening_preview,
+        birthday_solo_runner=run_birthday_solo,
+        midday_checkin_runner=run_midday_checkin,
+        leave_by_recompute_runner=run_leave_by_recompute,
+        leave_by_runner=_send_leave_by_for_event,
     )
     # Register the slash-command menu so Telegram clients show autocomplete.
     # Failure is non-fatal (the bot still works without the menu).
@@ -2338,6 +2973,7 @@ def main() -> None:
     app.add_handler(CommandHandler("reflect", cmd_reflect))
     app.add_handler(CommandHandler("spending", cmd_spending))
     app.add_handler(CommandHandler("habits", cmd_habits))
+    app.add_handler(CommandHandler("nudges", cmd_nudges))
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("connect_gcal", cmd_connect_gcal))

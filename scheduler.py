@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.date import DateTrigger
 from telegram import Bot
 
 import db
@@ -23,6 +24,12 @@ _weekly_review_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _daily_imminent_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _morning_briefing_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _evening_reflection_runner: Optional[Callable[[int], Awaitable[None]]] = None
+_gmail_event_scan_runner: Optional[Callable[[int], Awaitable[None]]] = None
+_evening_preview_runner: Optional[Callable[[int], Awaitable[None]]] = None
+_birthday_solo_runner: Optional[Callable[[int], Awaitable[None]]] = None
+_midday_checkin_runner: Optional[Callable[[int], Awaitable[None]]] = None
+_leave_by_recompute_runner: Optional[Callable[[int], Awaitable[None]]] = None
+_leave_by_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = event_id
 
 
 def init(
@@ -32,15 +39,29 @@ def init(
     daily_imminent_runner: Callable[[int], Awaitable[None]],
     morning_briefing_runner: Optional[Callable[[int], Awaitable[None]]] = None,
     evening_reflection_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    gmail_event_scan_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    evening_preview_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    birthday_solo_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    midday_checkin_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    leave_by_recompute_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    leave_by_runner: Optional[Callable[[int], Awaitable[None]]] = None,
 ) -> None:
     global _scheduler, _bot, _recurring_runner, _weekly_review_runner, _daily_imminent_runner
     global _morning_briefing_runner, _evening_reflection_runner
+    global _gmail_event_scan_runner, _evening_preview_runner, _birthday_solo_runner
+    global _midday_checkin_runner, _leave_by_recompute_runner, _leave_by_runner
     _bot = bot
     _recurring_runner = recurring_runner
     _weekly_review_runner = weekly_review_runner
     _daily_imminent_runner = daily_imminent_runner
     _morning_briefing_runner = morning_briefing_runner
     _evening_reflection_runner = evening_reflection_runner
+    _gmail_event_scan_runner = gmail_event_scan_runner
+    _evening_preview_runner = evening_preview_runner
+    _birthday_solo_runner = birthday_solo_runner
+    _midday_checkin_runner = midday_checkin_runner
+    _leave_by_recompute_runner = leave_by_recompute_runner
+    _leave_by_runner = leave_by_runner
     _scheduler = AsyncIOScheduler(timezone=TZ)
     _scheduler.start()
 
@@ -264,8 +285,10 @@ def _parse_hhmm(s: str, default_h: int, default_m: int) -> tuple:
 
 
 def ensure_daily_rhythm_for(chat_id: int) -> None:
-    """Idempotently arm morning briefing + evening reflection crons. Respects
-    facts.briefing_enabled / facts.reflection_enabled (off when set to false)."""
+    """Idempotently arm all per-chat rhythm crons: morning briefing, evening
+    reflection, evening preview, birthday-solo, midday check-in, leave-by
+    recompute, gmail event scan. Each one respects its own fact toggle. Safe
+    to call repeatedly — `replace_existing=True` on every job id."""
     if _scheduler is None:
         return
     if _morning_briefing_runner and not _toggle_off(chat_id, "briefing_enabled"):
@@ -290,13 +313,85 @@ def ensure_daily_rhythm_for(chat_id: int) -> None:
             replace_existing=True,
             misfire_grace_time=3600,
         )
+    # Pre-emptive nudges — each gated by its own fact toggle.
+    if _evening_preview_runner and not _toggle_off(chat_id, "weather_preview_enabled"):
+        t = _fact_value(chat_id, "weather_preview_time") or "22:00"
+        hour, minute = _parse_hhmm(t, 22, 0)
+        _scheduler.add_job(
+            _run_evening_preview,
+            CronTrigger(hour=hour, minute=minute, timezone=TZ),
+            args=[chat_id],
+            id=f"evening-preview-{chat_id}",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+    if _birthday_solo_runner and _toggle_on(chat_id, "birthday_alert_separate_enabled"):
+        _scheduler.add_job(
+            _run_birthday_solo,
+            CronTrigger(hour=9, minute=0, timezone=TZ),
+            args=[chat_id],
+            id=f"birthday-solo-{chat_id}",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+    if _midday_checkin_runner and not _toggle_off(chat_id, "midday_checkin_enabled"):
+        t = _fact_value(chat_id, "midday_checkin_time") or "13:00"
+        hour, minute = _parse_hhmm(t, 13, 0)
+        _scheduler.add_job(
+            _run_midday_checkin,
+            CronTrigger(hour=hour, minute=minute, timezone=TZ),
+            args=[chat_id],
+            id=f"midday-checkin-{chat_id}",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+    if _leave_by_recompute_runner and not _toggle_off(chat_id, "leave_by_enabled"):
+        _scheduler.add_job(
+            _run_leave_by_recompute,
+            CronTrigger(hour=3, minute=30, timezone=TZ),
+            args=[chat_id],
+            id=f"leave-by-recompute-{chat_id}",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+    if _gmail_event_scan_runner and not _toggle_off(chat_id, "gmail_event_scan_enabled"):
+        try:
+            minutes = int(_fact_value(chat_id, "gmail_event_scan_minutes") or "60")
+        except ValueError:
+            minutes = 60
+        minutes = max(15, min(minutes, 360))
+        if minutes < 60:
+            trig = CronTrigger(minute=f"*/{minutes}", timezone=TZ)
+        else:
+            trig = CronTrigger(minute="0", hour=f"*/{max(1, minutes // 60)}", timezone=TZ)
+        _scheduler.add_job(
+            _run_gmail_event_scan, trig,
+            args=[chat_id],
+            id=f"gmail-event-scan-{chat_id}",
+            replace_existing=True,
+            misfire_grace_time=600,
+        )
     logger.info("daily rhythm armed for chat %s", chat_id)
+
+
+def _toggle_on(chat_id: int, key: str) -> bool:
+    """Default OFF — opt-in. True only when fact is explicitly true/on/1/yes."""
+    v = _fact_value(chat_id, key)
+    return v is not None and v.strip().lower() in {"true", "on", "1", "yes"}
 
 
 def disable_daily_rhythm_for(chat_id: int) -> None:
     if _scheduler is None:
         return
-    for jid in (f"morning-briefing-{chat_id}", f"evening-reflection-{chat_id}"):
+    for jid in (
+        f"morning-briefing-{chat_id}",
+        f"evening-reflection-{chat_id}",
+        f"evening-preview-{chat_id}",
+        f"birthday-solo-{chat_id}",
+        f"midday-checkin-{chat_id}",
+        f"leave-by-recompute-{chat_id}",
+        f"gmail-event-scan-{chat_id}",
+    ):
         if _scheduler.get_job(jid):
             _scheduler.remove_job(jid)
 
@@ -317,6 +412,128 @@ async def _run_evening_reflection(chat_id: int) -> None:
         await _evening_reflection_runner(chat_id)
     except Exception:
         logger.exception("evening reflection failed for chat %s", chat_id)
+
+
+# ---------------- pre-emptive runners (gmail scan, previews, birthday, midday, leave-by) ----------------
+
+
+async def _run_gmail_event_scan(chat_id: int) -> None:
+    if _gmail_event_scan_runner is None or _toggle_off(chat_id, "gmail_event_scan_enabled"):
+        return
+    try:
+        await _gmail_event_scan_runner(chat_id)
+    except Exception:
+        logger.exception("gmail event scan failed for chat %s", chat_id)
+
+
+async def _run_evening_preview(chat_id: int) -> None:
+    if _evening_preview_runner is None or _toggle_off(chat_id, "weather_preview_enabled"):
+        return
+    try:
+        await _evening_preview_runner(chat_id)
+    except Exception:
+        logger.exception("evening preview failed for chat %s", chat_id)
+
+
+async def _run_birthday_solo(chat_id: int) -> None:
+    if _birthday_solo_runner is None or not _toggle_on(chat_id, "birthday_alert_separate_enabled"):
+        return
+    try:
+        await _birthday_solo_runner(chat_id)
+    except Exception:
+        logger.exception("birthday solo failed for chat %s", chat_id)
+
+
+async def _run_midday_checkin(chat_id: int) -> None:
+    if _midday_checkin_runner is None or _toggle_off(chat_id, "midday_checkin_enabled"):
+        return
+    try:
+        await _midday_checkin_runner(chat_id)
+    except Exception:
+        logger.exception("midday checkin failed for chat %s", chat_id)
+
+
+async def _run_leave_by_recompute(chat_id: int) -> None:
+    if _leave_by_recompute_runner is None or _toggle_off(chat_id, "leave_by_enabled"):
+        return
+    try:
+        await _leave_by_recompute_runner(chat_id)
+    except Exception:
+        logger.exception("leave-by recompute failed for chat %s", chat_id)
+
+
+async def _run_leave_by_fire(event_id: int) -> None:
+    """One-shot job entry-point: fires the actual leave-by message via the runner."""
+    if _leave_by_runner is None:
+        return
+    try:
+        await _leave_by_runner(event_id)
+    except Exception:
+        logger.exception("leave-by fire failed for event %s", event_id)
+
+
+def schedule_leave_by(event_id: int, leave_at_utc: datetime) -> Optional[str]:
+    """Arm a one-shot APScheduler job to fire the leave-by message at `leave_at_utc`.
+    Returns the job id (or None if scheduler not available / fire-time already past)."""
+    if _scheduler is None or _leave_by_runner is None:
+        return None
+    now = datetime.now(timezone.utc)
+    if leave_at_utc <= now:
+        return None
+    job_id = f"leave-by-{event_id}"
+    _scheduler.add_job(
+        _run_leave_by_fire,
+        DateTrigger(run_date=leave_at_utc),
+        args=[event_id],
+        id=job_id,
+        replace_existing=True,
+        misfire_grace_time=300,
+    )
+    return job_id
+
+
+def cancel_leave_by(event_id: int) -> None:
+    if _scheduler is None:
+        return
+    jid = f"leave-by-{event_id}"
+    if _scheduler.get_job(jid):
+        _scheduler.remove_job(jid)
+
+
+def trigger_evening_preview_now(chat_id: int) -> None:
+    if _scheduler is None:
+        return
+    _scheduler.add_job(
+        _run_evening_preview, "date",
+        run_date=datetime.now(timezone.utc) + timedelta(seconds=2),
+        args=[chat_id],
+        id=f"evening-preview-{chat_id}-once-{int(datetime.now(timezone.utc).timestamp())}",
+        misfire_grace_time=120,
+    )
+
+
+def trigger_midday_checkin_now(chat_id: int) -> None:
+    if _scheduler is None:
+        return
+    _scheduler.add_job(
+        _run_midday_checkin, "date",
+        run_date=datetime.now(timezone.utc) + timedelta(seconds=2),
+        args=[chat_id],
+        id=f"midday-checkin-{chat_id}-once-{int(datetime.now(timezone.utc).timestamp())}",
+        misfire_grace_time=120,
+    )
+
+
+def trigger_gmail_scan_now(chat_id: int) -> None:
+    if _scheduler is None:
+        return
+    _scheduler.add_job(
+        _run_gmail_event_scan, "date",
+        run_date=datetime.now(timezone.utc) + timedelta(seconds=2),
+        args=[chat_id],
+        id=f"gmail-scan-{chat_id}-once-{int(datetime.now(timezone.utc).timestamp())}",
+        misfire_grace_time=120,
+    )
 
 
 def trigger_morning_briefing_now(chat_id: int) -> None:

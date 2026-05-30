@@ -184,6 +184,22 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     UNIQUE(chat_id, provider)
 );
+
+CREATE TABLE IF NOT EXISTS processed_gmail_msg_ids (
+    chat_id INTEGER NOT NULL,
+    message_id TEXT NOT NULL,
+    processed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    action TEXT NOT NULL,             -- 'offered' | 'added' | 'skipped' | 'low_conf'
+    PRIMARY KEY (chat_id, message_id)
+);
+
+CREATE TABLE IF NOT EXISTS goal_milestones_sent (
+    chat_id INTEGER NOT NULL,
+    goal_id INTEGER NOT NULL,
+    milestone INTEGER NOT NULL,       -- 30 | 14 | 3 | 1
+    sent_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (goal_id, milestone)
+);
 """
 
 _lock = threading.Lock()
@@ -197,8 +213,16 @@ _MIGRATIONS: List[Tuple[str, str, str]] = [
     # 'missed' marks reminders whose scheduled fire was past at bot startup
     # (bot was offline). Surfaced via /diag and folded into daily imminent push.
     ("events", "missed", "INTEGER NOT NULL DEFAULT 0"),
+    # Optional location string (free-form address or place name) — feeds leave-by.
+    ("events", "location", "TEXT"),
+    # APScheduler job id of the active leave-by trigger, if any.
+    ("events", "leave_by_job_id", "TEXT"),
     ("goals", "watch_frequency_days", "INTEGER NOT NULL DEFAULT 7"),
     ("goals", "last_watch_run_utc", "TEXT"),
+    # JSON list of person_ids whose important_date falls on this date_local.
+    # Populated by morning briefing; consumed by 09:00 birthday-solo cron.
+    ("daily_state", "birthdays_today_json", "TEXT"),
+    ("daily_state", "midday_checkin_sent", "INTEGER NOT NULL DEFAULT 0"),
 ]
 
 
@@ -236,16 +260,38 @@ def add_event(
     remind_lead_minutes: Optional[int] = None,
     gcal_event_id: Optional[str] = None,
     gcal_sync_state: Optional[str] = None,
+    location: Optional[str] = None,
 ) -> int:
     when_iso = when_utc.astimezone(timezone.utc).isoformat()
     with _conn() as c:
         cur = c.execute(
             "INSERT INTO events (chat_id, title, when_utc, notes, remind_lead_minutes, "
-            "gcal_event_id, gcal_sync_state) VALUES (?,?,?,?,?,?,?)",
+            "gcal_event_id, gcal_sync_state, location) VALUES (?,?,?,?,?,?,?,?)",
             (chat_id, title, when_iso, notes, remind_lead_minutes,
-             gcal_event_id, gcal_sync_state),
+             gcal_event_id, gcal_sync_state, location),
         )
         return cur.lastrowid
+
+
+def set_event_leave_by_job(event_id: int, job_id: Optional[str]) -> None:
+    with _conn() as c:
+        c.execute(
+            "UPDATE events SET leave_by_job_id=? WHERE id=?",
+            (job_id, event_id),
+        )
+
+
+def events_with_location_in_window(chat_id: int, hours: int = 48) -> List[sqlite3.Row]:
+    """Future events within the next N hours that have a non-empty location.
+    Used by the daily leave-by recompute cron."""
+    now_iso = datetime.now(timezone.utc).isoformat()
+    end_iso = (datetime.now(timezone.utc) + timedelta(hours=hours)).isoformat()
+    with _conn() as c:
+        return list(c.execute(
+            "SELECT * FROM events WHERE chat_id=? AND when_utc BETWEEN ? AND ? "
+            "AND location IS NOT NULL AND location <> '' ORDER BY when_utc ASC",
+            (chat_id, now_iso, end_iso),
+        ))
 
 
 def set_event_gcal(event_id: int, gcal_event_id: Optional[str], gcal_sync_state: str) -> None:
@@ -1176,6 +1222,64 @@ def summarize_habits(chat_id: int, days: int = 7) -> Dict:
     return {"days": days, "by_habit": [dict(r) for r in rows]}
 
 
+# ---------------- pre-emptive helpers (Gmail dedup, milestone dedup, daily state) ----------------
+
+
+def is_gmail_processed(chat_id: int, message_id: str) -> bool:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT 1 FROM processed_gmail_msg_ids WHERE chat_id=? AND message_id=?",
+            (chat_id, message_id),
+        ).fetchone()
+        return row is not None
+
+
+def mark_gmail_processed(chat_id: int, message_id: str, action: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO processed_gmail_msg_ids (chat_id, message_id, action) VALUES (?,?,?) "
+            "ON CONFLICT(chat_id, message_id) DO UPDATE SET action=excluded.action, "
+            "processed_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            (chat_id, message_id, action),
+        )
+
+
+def milestone_already_sent(goal_id: int, milestone: int) -> bool:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT 1 FROM goal_milestones_sent WHERE goal_id=? AND milestone=?",
+            (goal_id, milestone),
+        ).fetchone()
+        return row is not None
+
+
+def record_milestone_sent(chat_id: int, goal_id: int, milestone: int) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT OR IGNORE INTO goal_milestones_sent (chat_id, goal_id, milestone) VALUES (?,?,?)",
+            (chat_id, goal_id, milestone),
+        )
+
+
+def mark_birthdays_today(chat_id: int, date_local: str, person_ids: List[int]) -> None:
+    payload = _json.dumps(person_ids)
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO daily_state (chat_id, date_local, birthdays_today_json) VALUES (?,?,?) "
+            "ON CONFLICT(chat_id, date_local) DO UPDATE SET birthdays_today_json=excluded.birthdays_today_json",
+            (chat_id, date_local, payload),
+        )
+
+
+def mark_midday_checkin_sent(chat_id: int, date_local: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO daily_state (chat_id, date_local, midday_checkin_sent) VALUES (?,?,1) "
+            "ON CONFLICT(chat_id, date_local) DO UPDATE SET midday_checkin_sent=1",
+            (chat_id, date_local),
+        )
+
+
 def find_people_in_text(chat_id: int, text: str) -> List[sqlite3.Row]:
     """Return people whose name or any alias substring-matches in `text`.
 
@@ -1202,3 +1306,4 @@ def find_people_in_text(chat_id: int, text: str) -> List[sqlite3.Row]:
                 hits.append(p)
                 break
     return hits
+
