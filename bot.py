@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -63,6 +64,13 @@ SYSTEM_PROMPT_TEMPLATE = (
 
 # Per-chat in-memory short-term history (raw tool turns retained).
 chat_history: Dict[int, List[Dict]] = {}
+# Per-chat last-activity timestamps (UTC) for TTL sweeping idle chats.
+_chat_last_active: Dict[int, datetime] = {}
+# Idle chats older than this are dropped from in-memory state on next sweep.
+CHAT_IDLE_TTL = timedelta(hours=24)
+# How long to keep a compacted-summary marker in place.
+COMPACT_THRESHOLD = 40
+COMPACT_KEEP_RECENT = 20
 # token -> (kind, chat_id) — short-lived in-memory map of pending undo opportunities.
 _pending_undos: Dict[str, tuple] = {}
 
@@ -71,10 +79,74 @@ _pending_undos: Dict[str, tuple] = {}
 
 
 def _history(chat_id: int) -> List[Dict]:
+    _chat_last_active[chat_id] = datetime.now(timezone.utc)
     return chat_history.setdefault(chat_id, [])
 
 
+def _sweep_idle_chats() -> int:
+    """Drop in-memory state for chats idle longer than CHAT_IDLE_TTL.
+    Persistent data (events, facts, …) is untouched — only the LLM short-term
+    history. Called opportunistically per message."""
+    now = datetime.now(timezone.utc)
+    stale = [cid for cid, last in _chat_last_active.items() if (now - last) > CHAT_IDLE_TTL]
+    for cid in stale:
+        chat_history.pop(cid, None)
+        _chat_last_active.pop(cid, None)
+    if stale:
+        logger.info("swept %d idle chat histories", len(stale))
+    return len(stale)
+
+
+async def _compact_history_if_needed(chat_id: int) -> None:
+    """When in-memory history grows past COMPACT_THRESHOLD turns, ask the model
+    to summarize everything except the last COMPACT_KEEP_RECENT turns into a
+    single 'compacted:' system note. Saves cost + improves recall."""
+    h = chat_history.get(chat_id, [])
+    if len(h) <= COMPACT_THRESHOLD:
+        return
+    old, keep = h[:-COMPACT_KEEP_RECENT], h[-COMPACT_KEEP_RECENT:]
+    # Skip if the first kept message is already a compaction marker (avoid recursive growth)
+    if old and isinstance(old[0].get("content"), str) and old[0].get("content", "").startswith("compacted:"):
+        # Re-compact: merge previous compaction text + everything that came after into a new summary.
+        pass
+    # Build a tiny conversation excerpt for the summarizer
+    excerpt_lines: List[str] = []
+    for m in old[-60:]:  # cap at 60 messages of input
+        role = m.get("role", "")
+        if role == "tool":
+            excerpt_lines.append(f"[tool {m.get('name')} result]")
+            continue
+        text = (m.get("content") or "")[:400]
+        if text:
+            excerpt_lines.append(f"{role}: {text}")
+    if not excerpt_lines:
+        return
+    prompt = (
+        "Summarize the following Dailylife bot conversation into one compact "
+        "Korean paragraph (≤400 chars). Preserve: any commitments, named "
+        "people/places, decisions, ongoing topics. Drop pleasantries.\n\n"
+        + "\n".join(excerpt_lines)
+    )
+    try:
+        data = await chat_completion(
+            [{"role": "system", "content": "You compress long conversations into compact memory notes."},
+             {"role": "user", "content": prompt}],
+            tools=None, chat_id=chat_id, kind="compaction",
+        )
+        summary = (data["choices"][0]["message"].get("content") or "").strip()
+    except Exception:
+        logger.exception("history compaction failed; leaving history intact")
+        return
+    if not summary:
+        return
+    marker = {"role": "system", "content": f"compacted: {summary[:600]}"}
+    chat_history[chat_id] = [marker, *keep]
+    logger.info("compacted history for chat %s: %d → %d turns",
+                chat_id, len(h), len(chat_history[chat_id]))
+
+
 def _trim_history(chat_id: int) -> None:
+    """Hard cap as a final safety net even if compaction didn't fire."""
     h = chat_history.get(chat_id, [])
     if len(h) > HISTORY_LIMIT * 2:
         chat_history[chat_id] = h[-HISTORY_LIMIT * 2 :]
@@ -116,6 +188,117 @@ def _format_event_row(row) -> str:
     return base
 
 
+# ---------------- merged schedule view (local + Google Calendar) ----------------
+
+
+async def _merge_schedule(
+    chat_id: int,
+    from_utc: datetime,
+    to_utc: Optional[datetime] = None,
+) -> List[Dict]:
+    """Return a unified, time-sorted list of events from the local DB and Google
+    Calendar (if connected). Items with the same `gcal_event_id` are collapsed.
+    Items within ±10 min and >0.8 title similarity are deduped opportunistically."""
+    import difflib
+
+    local_rows = db.list_events(chat_id, from_utc, to_utc)
+    local_items: List[Dict] = []
+    for r in local_rows:
+        local_items.append({
+            "source": "local",
+            "id": r["id"],
+            "gcal_id": r["gcal_event_id"],
+            "title": r["title"],
+            "when_utc": datetime.fromisoformat(r["when_utc"]),
+            "notes": r["notes"],
+        })
+
+    gcal_items: List[Dict] = []
+    try:
+        if db.get_oauth_token(chat_id, "google"):
+            ge = await gcal.list_events(
+                chat_id,
+                time_min_iso=from_utc.astimezone(TZ).isoformat(),
+                time_max_iso=to_utc.astimezone(TZ).isoformat() if to_utc else None,
+                max_results=100,
+            )
+            for e in ge:
+                start = e.get("start")
+                if not start:
+                    continue
+                try:
+                    # GCal returns RFC3339 with offset; normalize
+                    dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                gcal_items.append({
+                    "source": "gcal",
+                    "id": None,
+                    "gcal_id": e.get("id"),
+                    "title": e.get("summary") or "(제목 없음)",
+                    "when_utc": dt.astimezone(timezone.utc),
+                    "notes": e.get("description"),
+                    "location": e.get("location"),
+                })
+    except Exception:
+        logger.exception("gcal fetch in _merge_schedule failed; showing local only")
+
+    # First pass — collapse by gcal_id linkage
+    by_gid: Dict[str, Dict] = {}
+    others: List[Dict] = []
+    for item in [*local_items, *gcal_items]:
+        gid = item.get("gcal_id")
+        if gid and gid in by_gid:
+            by_gid[gid]["source"] = "both"
+            # Prefer local id for action buttons; keep gcal extras
+            existing = by_gid[gid]
+            if existing.get("id") is None and item.get("id") is not None:
+                existing["id"] = item["id"]
+            existing.setdefault("location", item.get("location"))
+            continue
+        if gid:
+            by_gid[gid] = dict(item)
+        else:
+            others.append(item)
+
+    # Second pass — fuzzy dedup of "others" against by_gid (same time window, similar title)
+    final = list(by_gid.values()) + others
+    final.sort(key=lambda x: x["when_utc"])
+    deduped: List[Dict] = []
+    for item in final:
+        merged = False
+        for existing in deduped:
+            if abs((item["when_utc"] - existing["when_utc"]).total_seconds()) <= 600:
+                ratio = difflib.SequenceMatcher(
+                    None, item["title"], existing["title"]
+                ).ratio()
+                if ratio >= 0.8:
+                    existing["source"] = "both"
+                    if existing.get("id") is None and item.get("id") is not None:
+                        existing["id"] = item["id"]
+                    if existing.get("gcal_id") is None and item.get("gcal_id") is not None:
+                        existing["gcal_id"] = item["gcal_id"]
+                    merged = True
+                    break
+        if not merged:
+            deduped.append(item)
+    return deduped
+
+
+_SOURCE_ICONS = {"local": "📍", "gcal": "🟦", "both": "✅"}
+
+
+def _format_merged_event(item: Dict) -> str:
+    when_local = item["when_utc"].astimezone(TZ)
+    icon = _SOURCE_ICONS.get(item["source"], "•")
+    head = f"{icon} {when_local.strftime('%m-%d %H:%M')} · {item['title']}"
+    if item.get("id") is not None:
+        head += f"  (#{item['id']})"
+    if item.get("notes"):
+        head += f"\n     ↳ {item['notes'][:80]}"
+    return head
+
+
 # ---------------- sync schedule tool handlers ----------------
 
 
@@ -132,6 +315,8 @@ def tool_add_event(chat_id: int, args: Dict) -> Dict:
     lead = args.get("remind_lead_minutes")
     lead = 30 if lead is None else int(lead)
     lead = lead if lead > 0 else None
+    # Conflict pre-check against local DB (and best-effort GCal via merge view later).
+    conflicts = _check_local_conflicts(chat_id, when_utc, lookahead_minutes=120)
     eid = db.add_event(chat_id, title, when_utc, notes, lead)
     row = db.get_event(eid)
     armed = scheduler.schedule_for(row) if row else False
@@ -141,7 +326,24 @@ def tool_add_event(chat_id: int, args: Dict) -> Dict:
         "when_local": when_utc.astimezone(TZ).isoformat(),
         "remind_lead_minutes": lead,
         "reminder_armed": armed,
+        "conflicts": conflicts,
     }
+
+
+def _check_local_conflicts(chat_id: int, when_utc: datetime, lookahead_minutes: int = 120) -> List[Dict]:
+    """Look up local events within ±lookahead_minutes window. Returns a small
+    list the LLM can mention to the user before adding (or to dedupe)."""
+    lo = when_utc - timedelta(minutes=lookahead_minutes)
+    hi = when_utc + timedelta(minutes=lookahead_minutes)
+    rows = db.list_events(chat_id, lo, hi)
+    out = []
+    for r in rows[:5]:
+        out.append({
+            "id": r["id"],
+            "title": r["title"],
+            "when_local": datetime.fromisoformat(r["when_utc"]).astimezone(TZ).isoformat(),
+        })
+    return out
 
 
 def tool_list_events(chat_id: int, args: Dict) -> Dict:
@@ -286,6 +488,28 @@ def tool_delete_recurring_task(chat_id: int, args: Dict) -> Dict:
         _pending_undos[token] = ("recurring", chat_id)
     return {"ok": ok, "task_id": int(tid), "undo_token": token,
             "undo_label": f"정기작업 #{tid} 삭제 — 취소"}
+
+
+def tool_enable_recurring_task(chat_id: int, args: Dict) -> Dict:
+    tid = args.get("task_id")
+    if not tid:
+        return {"ok": False, "error": "task_id required"}
+    ok = db.set_recurring_enabled(int(tid), chat_id, True)
+    if ok:
+        row = db.get_recurring_task(int(tid))
+        if row:
+            scheduler.schedule_recurring(row)
+    return {"ok": ok, "task_id": int(tid)}
+
+
+def tool_disable_recurring_task(chat_id: int, args: Dict) -> Dict:
+    tid = args.get("task_id")
+    if not tid:
+        return {"ok": False, "error": "task_id required"}
+    ok = db.set_recurring_enabled(int(tid), chat_id, False)
+    if ok:
+        scheduler.cancel_recurring(int(tid))
+    return {"ok": ok, "task_id": int(tid)}
 
 
 # ---------------- goals (long-horizon, proactive) ----------------
@@ -467,6 +691,10 @@ async def tool_gcal_list_events(chat_id: int, args: Dict) -> Dict:
 
 
 async def tool_gcal_create_event(chat_id: int, args: Dict) -> Dict:
+    # If the LLM already called add_event for the same time and we created the
+    # local row, we can link the GCal id back to it. Best-effort linkage by
+    # matching most-recent local event without gcal_event_id in the same window.
+    local_link_id = args.get("link_local_event_id")  # optional hint
     try:
         ev = await gcal.create_event(
             chat_id,
@@ -476,11 +704,28 @@ async def tool_gcal_create_event(chat_id: int, args: Dict) -> Dict:
             description=args.get("description"),
             location=args.get("location"),
         )
-        return {"ok": True, "event_id": ev.get("id"), "html_link": ev.get("htmlLink")}
     except gcal.NotConnected as e:
+        # If a local id was indicated, mark it pending so nightly retry attempts again.
+        if local_link_id:
+            try:
+                db.set_event_gcal(int(local_link_id), None, "not_connected")
+            except Exception:
+                pass
         return {"ok": False, "error": str(e), "needs_connect": True}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        if local_link_id:
+            try:
+                db.set_event_gcal(int(local_link_id), None, "pending")
+            except Exception:
+                pass
+        return {"ok": False, "error": str(e), "gcal_sync_state": "pending"}
+    gid = ev.get("id")
+    if local_link_id and gid:
+        try:
+            db.set_event_gcal(int(local_link_id), gid, "synced")
+        except Exception:
+            logger.exception("set_event_gcal failed for local id %s", local_link_id)
+    return {"ok": True, "event_id": gid, "html_link": ev.get("htmlLink")}
 
 
 async def tool_gcal_update_event(chat_id: int, args: Dict) -> Dict:
@@ -521,6 +766,8 @@ SYNC_HANDLERS = {
     "add_recurring_task": tool_add_recurring_task,
     "list_recurring_tasks": tool_list_recurring_tasks,
     "delete_recurring_task": tool_delete_recurring_task,
+    "enable_recurring_task": tool_enable_recurring_task,
+    "disable_recurring_task": tool_disable_recurring_task,
     "save_note": tool_save_note,
     "search_memory": tool_search_memory,
     "add_goal": tool_add_goal,
@@ -596,15 +843,45 @@ async def run_agent(chat_id: int, user_text: str, history: Optional[List[Dict]] 
     return final_text or "처리 완료."
 
 
+RECURRING_PROMPT_MAX = 2000
+# Anything that looks like a raw tool invocation in the saved prompt is rejected.
+# Saved prompts should describe intent in natural language, not call tools directly.
+_RECURRING_PROMPT_BLOCKLIST = re.compile(
+    r"^\s*(tool_|SYNC_HANDLERS|ASYNC_HANDLERS|run_agent\b|chat_completion\b)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _sanitize_recurring_prompt(prompt: str) -> Optional[str]:
+    """Return cleaned prompt or None if it looks like injection / too long."""
+    if not prompt:
+        return None
+    if len(prompt) > RECURRING_PROMPT_MAX:
+        return None
+    if _RECURRING_PROMPT_BLOCKLIST.search(prompt):
+        return None
+    return prompt.strip()
+
+
 async def run_recurring_task(task_id: int) -> None:
     """Wired into scheduler: load the saved prompt, run agent, send result to chat."""
     row = db.get_recurring_task(task_id)
     if row is None or not row["enabled"]:
         return
     chat_id = row["chat_id"]
+    safe_prompt = _sanitize_recurring_prompt(row["prompt"])
+    if safe_prompt is None:
+        logger.warning("recurring task %s prompt rejected (sanitize)", task_id)
+        bot = _app.bot if _app else None
+        if bot:
+            await bot.send_message(
+                chat_id=chat_id,
+                text=f"⚠️ 정기작업 #{task_id} 프롬프트가 안전 검사에서 차단됨. /tasks 에서 확인 후 재등록 부탁.",
+            )
+        return
     logger.info("running recurring task_id=%s chat=%s", task_id, chat_id)
     try:
-        reply = await run_agent(chat_id, row["prompt"], history=[])
+        reply = await run_agent(chat_id, safe_prompt, history=[])
     except Exception as exc:
         logger.exception("recurring task %s agent failed", task_id)
         reply = f"⚠️ 정기 작업 실패: {exc}"
@@ -652,7 +929,7 @@ WEEKLY_REVIEW_PROMPT = (
     "아래는 현재 open 상태인 모든 goals (sub_tasks 포함). 각 goal에 대해:\n"
     "  1) 일정대로 굴러가는지 (마감 D-n 보고)\n"
     "  2) 이번 주 안에 하면 좋은 액션 1~2개를 sub_task로 추가하거나 add_event\n"
-    "  3) watch_query가 있으면 web_search 또는 fetch_url로 최근 정보(가격/혜택/이벤트)를 한 번 확인해 알림\n"
+    "  3) watch_query가 있고 'watch_due=true'로 표시된 골만 web_search/fetch_url로 최근 정보(가격/혜택/이벤트) 확인. 그 외 watch는 이번 주 건너뜀.\n"
     "  4) 너무 늦거나 흐려진 goal은 사용자에게 status 변경(paused/dropped) 제안\n"
     "필요한 도구는 자유롭게 사용. 마지막 답은 사용자에게 보낼 깔끔한 한국어 요약.\n\n"
     "현재 goals:\n{goals_block}"
@@ -665,9 +942,20 @@ async def run_weekly_goal_review(chat_id: int) -> None:
     bot = _app.bot if _app else None
     if not rows:
         return
-    goals_block = "\n\n".join(_format_goal_summary(r) for r in rows)
+    formatted_blocks = []
+    watch_due_ids: List[int] = []
+    for r in rows:
+        s = _format_goal_summary(r)
+        if r["watch_query"] and db.goal_watch_due(r):
+            watch_due_ids.append(r["id"])
+            s += "  ↳ watch_due=true"
+        elif r["watch_query"]:
+            s += "  ↳ watch_due=false (이번 주 건너뜀)"
+        formatted_blocks.append(s)
+    goals_block = "\n\n".join(formatted_blocks)
     user_msg = WEEKLY_REVIEW_PROMPT.format(goals_block=goals_block)
-    logger.info("weekly review for chat=%s with %d goals", chat_id, len(rows))
+    logger.info("weekly review for chat=%s with %d goals (watch_due=%d)",
+                chat_id, len(rows), len(watch_due_ids))
     try:
         reply = await run_agent(chat_id, user_msg, history=[], max_hops=10)
     except Exception as exc:
@@ -675,6 +963,8 @@ async def run_weekly_goal_review(chat_id: int) -> None:
         reply = f"⚠️ 주간 골 리뷰 중 오류: {exc}"
     for r in rows:
         db.mark_goal_reviewed(r["id"])
+    for gid in watch_due_ids:
+        db.mark_goal_watch_run(gid)
     if bot:
         header = "📋 이번 주 골 리뷰\n\n"
         text = header + reply
@@ -725,31 +1015,40 @@ async def cmd_today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     now = datetime.now(TZ)
     end = now.replace(hour=23, minute=59, second=59)
-    rows = db.list_events(chat_id, now.astimezone(timezone.utc), end.astimezone(timezone.utc))
-    if not rows:
+    items = await _merge_schedule(chat_id, now.astimezone(timezone.utc),
+                                  end.astimezone(timezone.utc))
+    if not items:
         await update.message.reply_text("오늘 남은 일정 없음 ✨")
         return
-    await update.message.reply_text("오늘 일정:\n" + "\n".join(_format_event_row(r) for r in rows))
+    legend = "(📍 local · 🟦 gcal · ✅ both)"
+    body = "\n".join(_format_merged_event(it) for it in items)
+    await update.message.reply_text(f"오늘 일정 {legend}:\n{body}")
 
 
 async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     now = datetime.now(TZ)
     end = now + timedelta(days=7)
-    rows = db.list_events(chat_id, now.astimezone(timezone.utc), end.astimezone(timezone.utc))
-    if not rows:
+    items = await _merge_schedule(chat_id, now.astimezone(timezone.utc),
+                                  end.astimezone(timezone.utc))
+    if not items:
         await update.message.reply_text("앞으로 7일 일정 없음 ✨")
         return
-    await update.message.reply_text("이번 주 일정:\n" + "\n".join(_format_event_row(r) for r in rows))
+    legend = "(📍 local · 🟦 gcal · ✅ both)"
+    body = "\n".join(_format_merged_event(it) for it in items)
+    await update.message.reply_text(f"이번 주 일정 {legend}:\n{body}")
 
 
 async def cmd_agenda(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
-    rows = db.list_events(chat_id, datetime.now(timezone.utc))
-    if not rows:
+    now = datetime.now(timezone.utc)
+    items = await _merge_schedule(chat_id, now, now + timedelta(days=60))
+    if not items:
         await update.message.reply_text("등록된 일정 없음 ✨")
         return
-    await update.message.reply_text("전체 일정:\n" + "\n".join(_format_event_row(r) for r in rows))
+    legend = "(📍 local · 🟦 gcal · ✅ both)"
+    body = "\n".join(_format_merged_event(it) for it in items)
+    await update.message.reply_text(f"앞으로 60일 일정 {legend}:\n{body}")
 
 
 async def cmd_facts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -995,7 +1294,12 @@ async def _process_user_text(
     """Shared agent dispatch used by text, voice, and photo handlers."""
     chat_id = update.effective_chat.id
     db.log_chat(chat_id, "user", f"{log_prefix}{user_text}")
+    # Opportunistic cleanup of idle chats (no extra cost — only sweeps every msg).
+    _sweep_idle_chats()
     history = _history(chat_id)
+    # Compact long history before the next call (saves cost + improves recall).
+    await _compact_history_if_needed(chat_id)
+    history = _history(chat_id)  # refresh in case compaction replaced contents
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
 
     try:

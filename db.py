@@ -7,7 +7,7 @@ import re
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Iterator, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
@@ -142,11 +142,32 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
 
 _lock = threading.Lock()
 
+# Idempotent ALTER TABLE migrations — each is `(table, column, definition)`.
+# Applied at init_db. SQLite doesn't have ADD COLUMN IF NOT EXISTS so we read
+# pragma_table_info first.
+_MIGRATIONS: List[Tuple[str, str, str]] = [
+    ("events", "gcal_event_id", "TEXT"),
+    ("events", "gcal_sync_state", "TEXT"),
+    # 'missed' marks reminders whose scheduled fire was past at bot startup
+    # (bot was offline). Surfaced via /diag and folded into daily imminent push.
+    ("events", "missed", "INTEGER NOT NULL DEFAULT 0"),
+    ("goals", "watch_frequency_days", "INTEGER NOT NULL DEFAULT 7"),
+    ("goals", "last_watch_run_utc", "TEXT"),
+]
+
 
 def init_db() -> None:
     os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
     with _conn() as c:
         c.executescript(SCHEMA)
+        _run_migrations(c)
+
+
+def _run_migrations(c: sqlite3.Connection) -> None:
+    for table, col, defn in _MIGRATIONS:
+        cols = {r["name"] for r in c.execute(f"PRAGMA table_info({table})")}
+        if col not in cols:
+            c.execute(f"ALTER TABLE {table} ADD COLUMN {col} {defn}")
 
 
 @contextmanager
@@ -167,14 +188,63 @@ def add_event(
     when_utc: datetime,
     notes: Optional[str] = None,
     remind_lead_minutes: Optional[int] = None,
+    gcal_event_id: Optional[str] = None,
+    gcal_sync_state: Optional[str] = None,
 ) -> int:
     when_iso = when_utc.astimezone(timezone.utc).isoformat()
     with _conn() as c:
         cur = c.execute(
-            "INSERT INTO events (chat_id, title, when_utc, notes, remind_lead_minutes) VALUES (?,?,?,?,?)",
-            (chat_id, title, when_iso, notes, remind_lead_minutes),
+            "INSERT INTO events (chat_id, title, when_utc, notes, remind_lead_minutes, "
+            "gcal_event_id, gcal_sync_state) VALUES (?,?,?,?,?,?,?)",
+            (chat_id, title, when_iso, notes, remind_lead_minutes,
+             gcal_event_id, gcal_sync_state),
         )
         return cur.lastrowid
+
+
+def set_event_gcal(event_id: int, gcal_event_id: Optional[str], gcal_sync_state: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "UPDATE events SET gcal_event_id=?, gcal_sync_state=? WHERE id=?",
+            (gcal_event_id, gcal_sync_state, event_id),
+        )
+
+
+def find_event_by_gcal_id(chat_id: int, gcal_event_id: str) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM events WHERE chat_id=? AND gcal_event_id=?",
+            (chat_id, gcal_event_id),
+        ).fetchone()
+
+
+def list_pending_gcal_sync() -> List[sqlite3.Row]:
+    """Events whose local insert succeeded but GCal create failed; for retry cron."""
+    with _conn() as c:
+        return list(c.execute(
+            "SELECT * FROM events WHERE gcal_sync_state='pending' AND when_utc > strftime('%Y-%m-%dT%H:%M:%fZ','now')"
+        ))
+
+
+def mark_missed_if_past(event_id: int) -> bool:
+    """If a reminder time is past AND not reminded AND not missed, flag it."""
+    with _conn() as c:
+        row = c.execute("SELECT * FROM events WHERE id=?", (event_id,)).fetchone()
+        if row is None or row["reminded"] or row["missed"]:
+            return False
+        c.execute("UPDATE events SET missed=1 WHERE id=?", (event_id,))
+        return True
+
+
+def missed_reminders(chat_id: int, hours: int = 48) -> List[sqlite3.Row]:
+    """Reminders marked missed in the last N hours (for daily imminent push + /diag)."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    with _conn() as c:
+        return list(c.execute(
+            "SELECT * FROM events WHERE chat_id=? AND missed=1 AND created_at>=? "
+            "ORDER BY when_utc DESC",
+            (chat_id, cutoff),
+        ))
 
 
 def list_events(
@@ -327,6 +397,15 @@ def mark_recurring_run(task_id: int) -> None:
         c.execute("UPDATE recurring_tasks SET last_run_utc=? WHERE id=?", (now, task_id))
 
 
+def set_recurring_enabled(task_id: int, chat_id: int, enabled: bool) -> bool:
+    with _conn() as c:
+        cur = c.execute(
+            "UPDATE recurring_tasks SET enabled=? WHERE id=? AND chat_id=?",
+            (1 if enabled else 0, task_id, chat_id),
+        )
+        return cur.rowcount > 0
+
+
 # ---------------- usage / cost ----------------
 
 
@@ -404,6 +483,17 @@ def get_deleted_audit(token: str) -> Optional[sqlite3.Row]:
 def mark_audit_restored(audit_id: int) -> None:
     with _conn() as c:
         c.execute("UPDATE deleted_audit SET restored=1 WHERE id=?", (audit_id,))
+
+
+def cleanup_deleted_audit(max_age_days: int = 30) -> int:
+    """Sweep restored or stale rows. Returns deleted count."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
+    with _conn() as c:
+        cur = c.execute(
+            "DELETE FROM deleted_audit WHERE restored=1 OR deleted_at < ?",
+            (cutoff,),
+        )
+        return cur.rowcount
 
 
 # ---------------- goals ----------------
@@ -533,6 +623,28 @@ def mark_goal_reviewed(goal_id: int) -> None:
     now = datetime.now(timezone.utc).isoformat()
     with _conn() as c:
         c.execute("UPDATE goals SET last_reviewed_utc=? WHERE id=?", (now, goal_id))
+
+
+def mark_goal_watch_run(goal_id: int) -> None:
+    now = datetime.now(timezone.utc).isoformat()
+    with _conn() as c:
+        c.execute("UPDATE goals SET last_watch_run_utc=? WHERE id=?", (now, goal_id))
+
+
+def goal_watch_due(row) -> bool:
+    """True if this goal has a watch_query AND last_watch_run_utc is older than
+    watch_frequency_days, OR has never been watched."""
+    if not row["watch_query"]:
+        return False
+    freq = row["watch_frequency_days"] or 7
+    last = row["last_watch_run_utc"]
+    if not last:
+        return True
+    try:
+        last_dt = datetime.fromisoformat(last)
+    except ValueError:
+        return True
+    return (datetime.now(timezone.utc) - last_dt) >= timedelta(days=freq)
 
 
 def goals_due_within(chat_id: int, days: int) -> List[sqlite3.Row]:

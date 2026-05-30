@@ -183,6 +183,30 @@ TOOLS: List[Dict] = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "enable_recurring_task",
+            "description": "Re-enable a previously disabled recurring task without recreating it.",
+            "parameters": {
+                "type": "object",
+                "properties": {"task_id": {"type": "integer"}},
+                "required": ["task_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "disable_recurring_task",
+            "description": "Pause a recurring task (keeps the row, stops firing) without deleting it.",
+            "parameters": {
+                "type": "object",
+                "properties": {"task_id": {"type": "integer"}},
+                "required": ["task_id"],
+            },
+        },
+    },
     # ---- external lookups ----
     {
         "type": "function",
@@ -462,7 +486,8 @@ TOOLS: List[Dict] = [
             "description": (
                 "Create an event on the user's Google Calendar. Use whenever the user "
                 "wants something on their actual Google Calendar (not just bot's local store). "
-                "If you also use add_event for a local reminder, that's fine — both can coexist."
+                "If you also called add_event for the same event, pass that local event's id "
+                "as link_local_event_id so the two records stay linked and undo works correctly."
             ),
             "parameters": {
                 "type": "object",
@@ -472,6 +497,7 @@ TOOLS: List[Dict] = [
                     "end_iso": {"type": "string", "description": "Optional. Defaults to start + 1h."},
                     "description": {"type": "string"},
                     "location": {"type": "string"},
+                    "link_local_event_id": {"type": "integer", "description": "Optional. The local event_id from a prior add_event call so the two records are linked."},
                 },
                 "required": ["summary", "start_iso"],
             },

@@ -52,6 +52,22 @@ def init(
         ensure_proactive_for(chat_id)
         proactive_users += 1
 
+    # House-keeping crons (idempotent — replace_existing).
+    _scheduler.add_job(
+        _run_audit_cleanup,
+        CronTrigger(day_of_week="sun", hour=3, minute=30, timezone=TZ),
+        id="audit-cleanup-weekly",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    _scheduler.add_job(
+        _run_gcal_pending_retry,
+        CronTrigger(hour=3, minute=15, timezone=TZ),
+        id="gcal-pending-retry",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+
     logger.info(
         "scheduler started; re-armed %d reminders, %d recurring tasks, %d goal-tracking chats",
         rearmed_reminders,
@@ -254,3 +270,45 @@ async def _run_daily_imminent(chat_id: int) -> None:
         await _daily_imminent_runner(chat_id)
     except Exception:
         logger.exception("daily imminent check failed for chat %s", chat_id)
+
+
+# ---------------- house-keeping crons ----------------
+
+
+async def _run_audit_cleanup() -> None:
+    """Weekly: delete restored or stale deleted_audit rows + log how many."""
+    try:
+        n = db.cleanup_deleted_audit(max_age_days=30)
+        logger.info("deleted_audit cleanup: %d rows removed", n)
+    except Exception:
+        logger.exception("audit cleanup failed")
+
+
+async def _run_gcal_pending_retry() -> None:
+    """Nightly: retry GCal create for events whose dual-write previously failed."""
+    try:
+        pending = db.list_pending_gcal_sync()
+    except Exception:
+        logger.exception("pending gcal list failed")
+        return
+    if not pending:
+        return
+    try:
+        import gcal  # local to avoid circular at module load
+    except Exception:
+        logger.exception("gcal import failed in pending retry")
+        return
+    for row in pending:
+        chat_id = row["chat_id"]
+        try:
+            when_local = datetime.fromisoformat(row["when_utc"]).astimezone(TZ).isoformat()
+            ev = await gcal.create_event(
+                chat_id,
+                summary=row["title"],
+                start_iso=when_local,
+                description=row["notes"] or None,
+            )
+            db.set_event_gcal(row["id"], ev.get("id"), "synced")
+            logger.info("gcal retry success for event %s", row["id"])
+        except Exception:
+            logger.exception("gcal retry failed for event %s; leaving pending", row["id"])
