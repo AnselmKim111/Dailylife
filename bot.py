@@ -12,7 +12,7 @@ from zoneinfo import ZoneInfo
 
 import secrets
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ChatAction
 from telegram.ext import (
     Application,
@@ -2252,6 +2252,38 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await _process_user_text(update, context, user_text)
 
 
+BOT_COMMANDS: List[BotCommand] = [
+    # Daily flow — most common
+    BotCommand("today", "오늘 일정 (로컬+구글 캘린더)"),
+    BotCommand("week", "이번 주 일정"),
+    BotCommand("agenda", "앞으로 60일 일정"),
+    BotCommand("briefing", "아침 브리핑 (지금 / on / off / HH:MM)"),
+    BotCommand("reflect", "저녁 회고 (지금 / on / off / HH:MM)"),
+    # Memory
+    BotCommand("notes", "최근 메모 모음"),
+    BotCommand("facts", "기억하고 있는 personal facts"),
+    BotCommand("people", "등록된 사람 + 마지막 연락"),
+    # Goals + recurring
+    BotCommand("goals", "진행 중인 장기 골"),
+    BotCommand("review", "주간 골 리뷰 지금 돌리기"),
+    BotCommand("tasks", "정기 작업 (매일 cron) 목록"),
+    # Spending + habits
+    BotCommand("spending", "이번 달 지출 요약"),
+    BotCommand("habits", "최근 습관 통계"),
+    # Google
+    BotCommand("connect_gcal", "Google 캘린더 + Gmail 연동"),
+    BotCommand("gcal_status", "Google 연동 상태"),
+    BotCommand("disconnect_gcal", "Google 연동 해제"),
+    # Setup & ops
+    BotCommand("setup", "가이드 온보딩"),
+    BotCommand("cost", "OpenRouter 사용량 요약"),
+    BotCommand("diag", "봇 상태 진단"),
+    BotCommand("export", "내 데이터 마크다운으로 보기"),
+    BotCommand("reset", "이번 대화 메모리 초기화"),
+    BotCommand("help", "사용법"),
+]
+
+
 async def post_init(app: Application) -> None:
     global _app
     _app = app
@@ -2264,6 +2296,13 @@ async def post_init(app: Application) -> None:
         morning_briefing_runner=run_morning_briefing,
         evening_reflection_runner=run_evening_reflection,
     )
+    # Register the slash-command menu so Telegram clients show autocomplete.
+    # Failure is non-fatal (the bot still works without the menu).
+    try:
+        await app.bot.set_my_commands(BOT_COMMANDS)
+        logger.info("set_my_commands: registered %d commands", len(BOT_COMMANDS))
+    except Exception:
+        logger.exception("set_my_commands failed (non-fatal)")
     # Start the aiohttp OAuth/health server alongside polling. Failure here is
     # non-fatal — bot keeps polling, only the Google Calendar OAuth flow breaks.
     try:
