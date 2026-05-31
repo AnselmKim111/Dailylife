@@ -138,6 +138,20 @@ def init(
         replace_existing=True,
         misfire_grace_time=3600,
     )
+    _scheduler.add_job(
+        _run_v5_error_cleanup,
+        CronTrigger(day_of_week="sun", hour=4, minute=30, timezone=TZ),
+        id="v5-error-cleanup-weekly",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    _scheduler.add_job(
+        _run_stale_nudge_marker,
+        CronTrigger(hour="*/6", timezone=TZ),
+        id="v5-stale-nudge-marker",
+        replace_existing=True,
+        misfire_grace_time=1800,
+    )
 
     logger.info(
         "scheduler started; re-armed %d reminders, %d recurring tasks, %d goal-tracking chats",
@@ -775,6 +789,25 @@ def trigger_agent_digest_now(chat_id: int) -> None:
 
 
 # v4 weekly housekeeping (called once at init below)
+
+
+async def _run_v5_error_cleanup() -> None:
+    try:
+        n = db.cleanup_old_errors(days=30)
+        if n:
+            logger.info("error_log cleanup: dropped %d rows", n)
+    except Exception:
+        logger.exception("error_log cleanup failed")
+
+
+async def _run_stale_nudge_marker() -> None:
+    """Every 6h, flip pending nudge_outcomes older than 24h to 'no_response'."""
+    try:
+        n = db.mark_stale_nudges_no_response(hours=24)
+        if n:
+            logger.info("nudge_outcomes: marked %d stale → no_response", n)
+    except Exception:
+        logger.exception("nudge stale marker failed")
 
 
 async def _run_v4_storage_cleanup() -> None:

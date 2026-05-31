@@ -1021,8 +1021,23 @@ async def chat_completion(
     chat_id: Optional[int] = None,
     kind: str = "chat",
     max_tokens: Optional[int] = None,
+    model: Optional[str] = None,
 ) -> Dict:
-    payload: Dict = {"model": OPENROUTER_MODEL, "messages": messages}
+    # v5: route by kind unless explicit `model=` was passed.
+    if model is None:
+        import model_router
+        fact_override = None
+        if chat_id is not None:
+            try:
+                import db as _db
+                for r in _db.list_facts(chat_id):
+                    if r["key"] == f"model_override_{kind}":
+                        fact_override = r["value"]
+                        break
+            except Exception:
+                fact_override = None
+        model = model_router.pick_model(kind, fact_override=fact_override)
+    payload: Dict = {"model": model, "messages": messages}
     if tools:
         payload["tools"] = tools
         if tool_choice:
@@ -1054,7 +1069,7 @@ async def chat_completion(
         import db as _db   # local import to avoid circular
         _db.log_usage(
             chat_id=chat_id,
-            model=data.get("model") or OPENROUTER_MODEL,
+            model=data.get("model") or model or OPENROUTER_MODEL,
             prompt_tokens=int(u.get("prompt_tokens") or 0),
             completion_tokens=int(u.get("completion_tokens") or 0),
             cost_usd=float(cost or 0),

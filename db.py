@@ -244,6 +244,70 @@ CREATE TABLE IF NOT EXISTS habit_streaks (
     updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     PRIMARY KEY (chat_id, habit_key)
 );
+
+-- v5 tables --
+
+CREATE TABLE IF NOT EXISTS missions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    goal_text TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',  -- running|paused|done|failed|cancelled
+    current_hop INTEGER NOT NULL DEFAULT 0,
+    max_hops INTEGER NOT NULL DEFAULT 80,
+    cost_usd_running REAL NOT NULL DEFAULT 0,
+    history_json TEXT NOT NULL DEFAULT '[]',  -- the agent message history for resumable runs
+    result_md TEXT,                            -- final markdown when status=done
+    last_checkpoint_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_missions_chat_status ON missions(chat_id, status);
+
+CREATE TABLE IF NOT EXISTS nudge_outcomes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    nudge_kind TEXT NOT NULL,        -- 'midday_checkin'|'briefing'|'mail_card'|'goal_milestone'|...
+    nudge_id TEXT,                    -- optional row id from the source (e.g. event id)
+    sent_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    reaction TEXT,                    -- engaged|dismissed|toggled_off|no_response|undo
+    reaction_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_nudge_outcomes_chat ON nudge_outcomes(chat_id, sent_at DESC);
+
+CREATE TABLE IF NOT EXISTS system_prompt_overrides (
+    chat_id INTEGER PRIMARY KEY,
+    override_md TEXT NOT NULL,
+    generated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE TABLE IF NOT EXISTS relations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    from_kind TEXT NOT NULL,
+    from_id INTEGER NOT NULL,
+    to_kind TEXT NOT NULL,
+    to_id INTEGER NOT NULL,
+    relation_kind TEXT NOT NULL,
+    source TEXT NOT NULL DEFAULT 'manual',  -- manual|auto_extract|llm_inferred
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(chat_id, from_kind, from_id, to_kind, to_id, relation_kind)
+);
+CREATE INDEX IF NOT EXISTS idx_relations_from ON relations(chat_id, from_kind, from_id);
+CREATE INDEX IF NOT EXISTS idx_relations_to ON relations(chat_id, to_kind, to_id);
+
+CREATE TABLE IF NOT EXISTS error_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts_utc TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    level TEXT NOT NULL,
+    source TEXT NOT NULL,         -- logger name
+    message TEXT NOT NULL,
+    traceback TEXT,
+    chat_id INTEGER,
+    context_json TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_error_log_ts ON error_log(ts_utc DESC);
+CREATE INDEX IF NOT EXISTS idx_error_log_source ON error_log(source, ts_utc DESC);
 """
 
 _lock = threading.Lock()
@@ -1542,6 +1606,240 @@ def all_habit_keys(chat_id: int) -> List[str]:
         rows = list(c.execute(
             "SELECT DISTINCT habit_key FROM habits WHERE chat_id=?", (chat_id,)))
     return [r["habit_key"] for r in rows]
+
+
+# ---------------- v5: missions ----------------
+
+
+def add_mission(chat_id: int, title: str, goal_text: str, max_hops: int = 80) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO missions (chat_id, title, goal_text, max_hops) VALUES (?,?,?,?)",
+            (chat_id, title, goal_text, max_hops))
+        return cur.lastrowid
+
+
+def get_mission(mission_id: int) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute("SELECT * FROM missions WHERE id=?", (mission_id,)).fetchone()
+
+
+def list_running_missions() -> List[sqlite3.Row]:
+    with _conn() as c:
+        return list(c.execute(
+            "SELECT * FROM missions WHERE status='running' ORDER BY updated_at ASC"))
+
+
+def list_missions(chat_id: int, status: Optional[str] = None) -> List[sqlite3.Row]:
+    with _conn() as c:
+        if status:
+            return list(c.execute(
+                "SELECT * FROM missions WHERE chat_id=? AND status=? "
+                "ORDER BY created_at DESC", (chat_id, status)))
+        return list(c.execute(
+            "SELECT * FROM missions WHERE chat_id=? ORDER BY created_at DESC",
+            (chat_id,)))
+
+
+def update_mission(mission_id: int, **fields) -> bool:
+    if not fields:
+        return False
+    fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+    cols = ", ".join(f"{k}=?" for k in fields)
+    params = list(fields.values()) + [mission_id]
+    with _conn() as c:
+        cur = c.execute(f"UPDATE missions SET {cols} WHERE id=?", params)
+        return cur.rowcount > 0
+
+
+def cancel_mission(chat_id: int, mission_id: int) -> bool:
+    with _conn() as c:
+        cur = c.execute(
+            "UPDATE missions SET status='cancelled', "
+            "updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+            "WHERE id=? AND chat_id=? AND status='running'",
+            (mission_id, chat_id))
+        return cur.rowcount > 0
+
+
+# ---------------- v5: nudge_outcomes ----------------
+
+
+def record_nudge(chat_id: int, nudge_kind: str, nudge_id: Optional[str] = None) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO nudge_outcomes (chat_id, nudge_kind, nudge_id) VALUES (?,?,?)",
+            (chat_id, nudge_kind, nudge_id))
+        return cur.lastrowid
+
+
+def react_to_recent_nudge(
+    chat_id: int, nudge_kind: Optional[str], reaction: str,
+    *, within_hours: int = 24,
+) -> int:
+    """Update the most recent pending nudge (reaction NULL) of this kind to `reaction`.
+    Returns number of rows updated (0 or 1)."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=within_hours)).isoformat()
+    q = ("UPDATE nudge_outcomes SET reaction=?, "
+         "reaction_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+         "WHERE id=(SELECT id FROM nudge_outcomes "
+         "          WHERE chat_id=? AND reaction IS NULL AND sent_at>=? "
+         + ("AND nudge_kind=? " if nudge_kind else "")
+         + "ORDER BY sent_at DESC LIMIT 1)")
+    params: List = [reaction, chat_id, cutoff]
+    if nudge_kind:
+        params.append(nudge_kind)
+    with _conn() as c:
+        cur = c.execute(q, params)
+        return cur.rowcount
+
+
+def mark_stale_nudges_no_response(hours: int = 24) -> int:
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    with _conn() as c:
+        cur = c.execute(
+            "UPDATE nudge_outcomes SET reaction='no_response', "
+            "reaction_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+            "WHERE reaction IS NULL AND sent_at<?", (cutoff,))
+        return cur.rowcount
+
+
+def nudge_stats_by_kind(chat_id: int, days: int = 28) -> List[Dict]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with _conn() as c:
+        rows = list(c.execute(
+            "SELECT nudge_kind, "
+            "  COUNT(*) AS sent, "
+            "  SUM(CASE WHEN reaction='engaged' THEN 1 ELSE 0 END) AS engaged, "
+            "  SUM(CASE WHEN reaction='dismissed' THEN 1 ELSE 0 END) AS dismissed, "
+            "  SUM(CASE WHEN reaction='no_response' THEN 1 ELSE 0 END) AS no_response, "
+            "  SUM(CASE WHEN reaction='toggled_off' THEN 1 ELSE 0 END) AS toggled_off "
+            "FROM nudge_outcomes WHERE chat_id=? AND sent_at>=? "
+            "GROUP BY nudge_kind ORDER BY sent DESC",
+            (chat_id, cutoff)))
+    return [dict(r) for r in rows]
+
+
+# ---------------- v5: system_prompt_overrides ----------------
+
+
+def get_prompt_override(chat_id: int) -> Optional[str]:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT override_md FROM system_prompt_overrides WHERE chat_id=?",
+            (chat_id,)).fetchone()
+        return row["override_md"] if row else None
+
+
+def set_prompt_override(chat_id: int, override_md: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO system_prompt_overrides (chat_id, override_md) VALUES (?,?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET override_md=excluded.override_md, "
+            "generated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            (chat_id, override_md))
+
+
+def clear_prompt_override(chat_id: int) -> bool:
+    with _conn() as c:
+        cur = c.execute("DELETE FROM system_prompt_overrides WHERE chat_id=?",
+                         (chat_id,))
+        return cur.rowcount > 0
+
+
+# ---------------- v5: relations (knowledge graph) ----------------
+
+
+def add_relation(
+    chat_id: int, from_kind: str, from_id: int, to_kind: str, to_id: int,
+    relation_kind: str, source: str = "manual",
+) -> Optional[int]:
+    with _conn() as c:
+        try:
+            cur = c.execute(
+                "INSERT INTO relations (chat_id, from_kind, from_id, to_kind, to_id, "
+                "relation_kind, source) VALUES (?,?,?,?,?,?,?)",
+                (chat_id, from_kind, from_id, to_kind, to_id, relation_kind, source))
+            return cur.lastrowid
+        except sqlite3.IntegrityError:
+            return None  # already exists
+
+
+def neighbors(chat_id: int, kind: str, entity_id: int) -> List[sqlite3.Row]:
+    """All outgoing + incoming edges for a node."""
+    with _conn() as c:
+        return list(c.execute(
+            "SELECT * FROM relations WHERE chat_id=? AND "
+            "((from_kind=? AND from_id=?) OR (to_kind=? AND to_id=?))",
+            (chat_id, kind, entity_id, kind, entity_id)))
+
+
+def graph_bfs(
+    chat_id: int, start_kind: str, start_id: int,
+    max_depth: int = 2, relation_filter: Optional[List[str]] = None,
+) -> Dict:
+    """Breadth-first traversal returning {nodes, edges}. Nodes are
+    (kind, id) tuples; edges are full relation rows."""
+    seen = {(start_kind, start_id)}
+    frontier = [(start_kind, start_id)]
+    edges = []
+    for _depth in range(max_depth):
+        next_frontier = []
+        for kind, eid in frontier:
+            for e in neighbors(chat_id, kind, eid):
+                if relation_filter and e["relation_kind"] not in relation_filter:
+                    continue
+                edges.append(dict(e))
+                pair = (e["to_kind"], e["to_id"]) if (e["from_kind"], e["from_id"]) == (kind, eid) \
+                       else (e["from_kind"], e["from_id"])
+                if pair not in seen:
+                    seen.add(pair)
+                    next_frontier.append(pair)
+        frontier = next_frontier
+    return {
+        "nodes": [{"kind": k, "id": i} for k, i in seen],
+        "edges": edges,
+    }
+
+
+# ---------------- v5: error_log ----------------
+
+
+def log_error(
+    level: str, source: str, message: str, traceback: Optional[str] = None,
+    chat_id: Optional[int] = None, context: Optional[Dict] = None,
+) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO error_log (level, source, message, traceback, chat_id, context_json) "
+            "VALUES (?,?,?,?,?,?)",
+            (level, source, message[:2000], (traceback or "")[:6000],
+             chat_id, _json.dumps(context or {}, ensure_ascii=False)))
+        return cur.lastrowid
+
+
+def recent_errors(hours: int = 24, limit: int = 50) -> List[sqlite3.Row]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    with _conn() as c:
+        return list(c.execute(
+            "SELECT * FROM error_log WHERE ts_utc>=? ORDER BY ts_utc DESC LIMIT ?",
+            (cutoff, limit)))
+
+
+def error_counts_by_source(hours: int = 24) -> List[Dict]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    with _conn() as c:
+        rows = list(c.execute(
+            "SELECT source, COUNT(*) AS n FROM error_log "
+            "WHERE ts_utc>=? GROUP BY source ORDER BY n DESC LIMIT 10", (cutoff,)))
+    return [dict(r) for r in rows]
+
+
+def cleanup_old_errors(days: int = 30) -> int:
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with _conn() as c:
+        cur = c.execute("DELETE FROM error_log WHERE ts_utc<?", (cutoff,))
+        return cur.rowcount
 
 
 def find_people_in_text(chat_id: int, text: str) -> List[sqlite3.Row]:

@@ -40,6 +40,32 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
+
+
+class _DBErrorHandler(logging.Handler):
+    """v5: persist ERROR-level (and above) log records to error_log table for
+    queryable observability via /metrics. Best-effort — never raise to caller."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if record.levelno < logging.ERROR:
+            return
+        try:
+            import db as _db
+            tb = None
+            if record.exc_info:
+                import traceback as _tb
+                tb = "".join(_tb.format_exception(*record.exc_info))
+            _db.log_error(
+                level=record.levelname,
+                source=record.name,
+                message=record.getMessage(),
+                traceback=tb,
+            )
+        except Exception:
+            pass  # never let logging crash the bot
+
+
+logging.getLogger().addHandler(_DBErrorHandler())
 logger = logging.getLogger("dailylife")
 
 TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -3336,6 +3362,73 @@ async def cmd_say(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"⚠ 음성 전송 실패: {e}")
 
 
+async def cmd_metrics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/metrics` — observability pulse: 24h errors, cron health, cost trend."""
+    chat_id = update.effective_chat.id
+    errs = db.recent_errors(hours=24, limit=200)
+    by_src = db.error_counts_by_source(hours=24)
+    cost = db.usage_summary(chat_id)
+    by_model = cost.get("by_model_month", [])
+    # Cron snapshot via scheduler introspection
+    jobs = scheduler._scheduler.get_jobs() if scheduler._scheduler else []
+    pending_gcal = len([r for r in db.list_pending_gcal_sync() if r["chat_id"] == chat_id])
+    nudge_stats = db.nudge_stats_by_kind(chat_id, days=7)
+    miss_running = len([m for m in db.list_missions(chat_id, status="running")])
+
+    lines = ["📈 시스템 헬스 (24h)"]
+    lines.append(f"  • 에러 {len(errs)}건 — 상위:")
+    for s in by_src[:5]:
+        lines.append(f"      - {s['source']}: {s['n']}")
+    if not by_src:
+        lines.append("      (없음)")
+    lines.append(f"  • 활성 cron job {len(jobs)}개")
+    lines.append(f"  • GCal pending sync {pending_gcal}건")
+    lines.append(f"  • 진행 중 mission {miss_running}건")
+    lines.append("")
+    lines.append("💰 OpenRouter 비용")
+    lines.append(f"  • 오늘 ${cost['today']['cost']:.4f} / 이번달 ${cost['month']['cost']:.4f}")
+    if by_model:
+        lines.append("  • 모델별 (30일):")
+        for r in by_model[:5]:
+            lines.append(f"      - {r['model']}: {r['n']}콜 ${r['cost']:.4f}")
+    lines.append("")
+    lines.append("📣 nudge 반응 (7일)")
+    if nudge_stats:
+        for s in nudge_stats[:8]:
+            engaged = s.get("engaged") or 0
+            total = s.get("sent") or 0
+            rate = (engaged * 100 // total) if total else 0
+            lines.append(f"  • {s['nudge_kind']}: {total} sent, {engaged} engaged ({rate}%)")
+    else:
+        lines.append("  (아직 기록 없음)")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/models` — current routing table + override syntax."""
+    chat_id = update.effective_chat.id
+    import model_router
+    table = model_router.routing_table()
+    overrides = [(f["key"], f["value"]) for f in db.list_facts(chat_id)
+                 if f["key"].startswith("model_override_")]
+    lines = ["🧠 모델 라우팅"]
+    # group by tier
+    tiers: Dict[str, List[str]] = {}
+    for kind, model in table.items():
+        tiers.setdefault(model, []).append(kind)
+    for model, kinds in sorted(tiers.items()):
+        lines.append(f"  • {model}")
+        lines.append(f"      {', '.join(sorted(kinds))}")
+    if overrides:
+        lines.append("")
+        lines.append("👤 내 override:")
+        for k, v in overrides:
+            lines.append(f"  • {k[len('model_override_'):]} → {v}")
+    lines.append("")
+    lines.append("override: `remember_fact model_override_chat anthropic/claude-opus-4.8`")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     pending_gcal = [r for r in db.list_pending_gcal_sync() if r["chat_id"] == chat_id]
@@ -3989,6 +4082,8 @@ BOT_COMMANDS: List[BotCommand] = [
     BotCommand("setup", "가이드 온보딩"),
     BotCommand("cost", "OpenRouter 사용량 요약"),
     BotCommand("nudges", "능동 알림 토글 + 상태"),
+    BotCommand("models", "현재 LLM 라우팅 + 커스텀 override"),
+    BotCommand("metrics", "시스템 헬스 (에러 / 비용 / nudge 반응)"),
     BotCommand("rules", "자동 액션 규칙 (메일 자동, RSVP 자동)"),
     BotCommand("persona", "내가 누구인지 봇이 그린 인물 요약"),
     BotCommand("recall", "특정 사람/키워드 cross-table 회수"),
@@ -4071,6 +4166,8 @@ def main() -> None:
     app.add_handler(CommandHandler("spending", cmd_spending))
     app.add_handler(CommandHandler("habits", cmd_habits))
     app.add_handler(CommandHandler("nudges", cmd_nudges))
+    app.add_handler(CommandHandler("models", cmd_models))
+    app.add_handler(CommandHandler("metrics", cmd_metrics))
     app.add_handler(CommandHandler("rules", cmd_rules))
     app.add_handler(CommandHandler("persona", cmd_persona))
     app.add_handler(CommandHandler("recall", cmd_recall))
