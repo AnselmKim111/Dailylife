@@ -1491,6 +1491,9 @@ SYNC_HANDLERS = {
     "cross_recall": tool_cross_recall,
     "detect_routines": tool_detect_routines,
     "get_habit_streaks": tool_get_habit_streaks,
+    # v5 tool handlers (start_mission/cancel_mission/list_missions) are
+    # registered later via SYNC_HANDLERS.update(...) once their function
+    # definitions exist, to avoid forward-reference NameErrors at import.
 }
 
 ASYNC_HANDLERS = {
@@ -3362,6 +3365,285 @@ async def cmd_say(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"⚠ 음성 전송 실패: {e}")
 
 
+# ---------------- v5: MISSION MODE ----------------
+
+
+MISSION_SYSTEM_PROMPT = (
+    "[MISSION MODE] 당신은 자율 multi-hop 에이전트. 한 mission 안에서 여러 "
+    "tick에 걸쳐 작업을 이어감. 매 tick마다 1-3개 tool call로 단계를 전진시키고, "
+    "최종 답이 준비됐을 때만 tool call 없이 짧은 마크다운 결과를 반환. "
+    "외부 액션 (메일/RSVP)은 사용자가 미리 등록한 auto_rules 통과한 것만 자동 실행. "
+    "그 외는 초안 제안 후 종료. cost가 한정돼 있으니 가능한 적은 hop으로 끝내."
+)
+
+MISSION_FINAL_MARKER_TURNS = (5, 30, 90)  # minutes — checkpoint cadence buckets
+
+
+def _mission_max_hops_per_tick(chat_id: int) -> int:
+    try:
+        v = int(_fact_value_local(chat_id, "mission_max_hops_per_tick") or "3")
+    except ValueError:
+        v = 3
+    return max(1, min(v, 5))
+
+
+def _agent_daily_cost_limit(chat_id: int) -> float:
+    try:
+        return float(_fact_value_local(chat_id, "agent_daily_cost_limit_usd") or "1.0")
+    except ValueError:
+        return 1.0
+
+
+async def run_mission_tick(mission_id: int) -> None:
+    """One pump cycle for a single mission. Advances 1-3 hops, persists state.
+
+    Termination conditions (in priority):
+      1. status changed to cancelled/done externally → exit silently
+      2. cost guard exceeded → status=paused + alert
+      3. LLM returned text answer with no tool calls → status=done + final msg
+      4. current_hop >= max_hops → status=done with whatever we have"""
+    m = db.get_mission(mission_id)
+    if not m or m["status"] != "running":
+        return
+    chat_id = m["chat_id"]
+    # Cost guard — Wave 1 risk mitigation
+    if m["cost_usd_running"] >= _agent_daily_cost_limit(chat_id):
+        db.update_mission(mission_id, status="paused",
+                           result_md=(m["result_md"] or "")
+                           + f"\n\n⏸ 비용 한도 (${m['cost_usd_running']:.4f}) 도달 — 사용자 확인 필요")
+        if _app and _app.bot:
+            await _app.bot.send_message(
+                chat_id=chat_id,
+                text=(f"⏸ Mission #{mission_id} 일시정지 — "
+                      f"비용 한도 ${m['cost_usd_running']:.4f} 도달.\n"
+                      f"재개하려면 facts에서 agent_daily_cost_limit_usd 올려줘."),
+            )
+        return
+
+    history = json.loads(m["history_json"] or "[]")
+    if not history:
+        # First tick — seed with the system + user goal.
+        history.append({"role": "user", "content": MISSION_SYSTEM_PROMPT + "\n\n목표:\n" + m["goal_text"]})
+
+    per_tick = _mission_max_hops_per_tick(chat_id)
+    started_at = datetime.now(timezone.utc)
+    cost_before = m["cost_usd_running"]
+    final_text: Optional[str] = None
+    hops_this_tick = 0
+    for _ in range(per_tick):
+        if m["current_hop"] + hops_this_tick >= m["max_hops"]:
+            final_text = "(max_hops 도달 — mission 종료)"
+            break
+        messages = [_system_message(chat_id), *history]
+        try:
+            data = await chat_completion(
+                messages, tools=TOOLS, chat_id=chat_id, kind="mission",
+            )
+        except Exception as e:
+            logger.exception("mission %s LLM call failed", mission_id)
+            db.update_mission(mission_id, status="failed",
+                               result_md=(m["result_md"] or "") + f"\n\n❌ LLM 오류: {e}")
+            if _app and _app.bot:
+                await _app.bot.send_message(
+                    chat_id=chat_id,
+                    text=f"❌ Mission #{mission_id} 실패 — LLM 오류: {e}")
+            return
+        # Track cost delta best-effort from usage table
+        try:
+            new_cost = _last_usage_cost(chat_id) + cost_before
+        except Exception:
+            new_cost = cost_before
+        msg = data["choices"][0]["message"]
+        history.append({
+            "role": "assistant",
+            "content": msg.get("content") or "",
+            "tool_calls": msg.get("tool_calls") or None,
+        })
+        tool_calls = parse_tool_calls(msg)
+        hops_this_tick += 1
+        if not tool_calls:
+            final_text = (msg.get("content") or "").strip()
+            break
+        for tc in tool_calls:
+            name = tc["name"]
+            try:
+                if name in SYNC_HANDLERS:
+                    result = SYNC_HANDLERS[name](chat_id, tc["arguments"])
+                elif name in ASYNC_HANDLERS:
+                    result = await ASYNC_HANDLERS[name](chat_id, tc["arguments"])
+                else:
+                    result = {"ok": False, "error": f"unknown tool {name}"}
+            except Exception as exc:
+                logger.exception("mission %s tool %s failed", mission_id, name)
+                result = {"ok": False, "error": str(exc)}
+            history.append({
+                "role": "tool",
+                "tool_call_id": tc["id"],
+                "name": name,
+                "content": json.dumps(result, ensure_ascii=False)[:8000],
+            })
+
+    # Persist state after the tick
+    db.update_mission(
+        mission_id,
+        history_json=json.dumps(history, ensure_ascii=False),
+        current_hop=m["current_hop"] + hops_this_tick,
+        cost_usd_running=cost_before + max(0, _last_usage_cost(chat_id, since=started_at)),
+        last_checkpoint_at=datetime.now(timezone.utc).isoformat(),
+    )
+
+    if final_text is not None:
+        result_md = (m["result_md"] or "") + "\n\n" + final_text
+        db.update_mission(mission_id, status="done", result_md=result_md.strip())
+        await _send_mission_result(mission_id, result_md.strip())
+        return
+
+    # Mid-mission checkpoint: send a short progress message every ~90min.
+    elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(m["created_at"])).total_seconds() / 60
+    last_cp_min = 0
+    if m["last_checkpoint_at"]:
+        last_cp_min = (datetime.now(timezone.utc) - datetime.fromisoformat(m["last_checkpoint_at"])).total_seconds() / 60
+    # Only send checkpoint if (a) we've been running >30min and (b) it's been
+    # >60min since the last persisted checkpoint update. The last_checkpoint_at
+    # field is updated every tick, so use elapsed buckets instead.
+    if elapsed > 30 and (m["current_hop"] + hops_this_tick) in (5, 12, 25, 50):
+        recent = history[-1] if history else {}
+        snippet = (recent.get("content") or "")[:160] if isinstance(recent, dict) else ""
+        if _app and _app.bot:
+            await _app.bot.send_message(
+                chat_id=chat_id,
+                text=(f"🛠 Mission #{mission_id} 진행 중 — "
+                      f"{m['current_hop'] + hops_this_tick}/{m['max_hops']} hop, "
+                      f"${cost_before + max(0, _last_usage_cost(chat_id, since=started_at)):.4f}\n"
+                      f"  ↳ {snippet}"))
+
+
+def _last_usage_cost(chat_id: int, since: Optional[datetime] = None) -> float:
+    """Sum of cost_usd from usage table for this chat since `since` (or last 5min)."""
+    since = since or (datetime.now(timezone.utc) - timedelta(minutes=5))
+    with db._conn() as c:
+        r = c.execute(
+            "SELECT COALESCE(SUM(cost_usd),0) AS s FROM usage "
+            "WHERE chat_id=? AND created_at>=?",
+            (chat_id, since.isoformat())).fetchone()
+        return float(r["s"] or 0.0)
+
+
+async def _send_mission_result(mission_id: int, result_md: str) -> None:
+    if _app is None or _app.bot is None:
+        return
+    m = db.get_mission(mission_id)
+    if not m:
+        return
+    text = f"✅ Mission #{mission_id} 완성 — {m['title']}\n\n{result_md[:3500]}"
+    try:
+        await _app.bot.send_message(chat_id=m["chat_id"], text=text)
+    except Exception:
+        logger.exception("mission result send failed for %s", mission_id)
+
+
+# Tool handlers
+
+
+def tool_start_mission(chat_id: int, args: Dict) -> Dict:
+    title = (args.get("title") or "").strip()
+    goal = (args.get("goal_text") or args.get("goal") or "").strip()
+    if not title or not goal:
+        return {"ok": False, "error": "title + goal_text required"}
+    max_hops = int(args.get("max_hops") or 80)
+    mid = db.add_mission(chat_id, title, goal, max_hops=max(5, min(max_hops, 200)))
+    # Kick off first tick right away.
+    scheduler.trigger_mission_tick_now(mid)
+    return {"ok": True, "mission_id": mid}
+
+
+def tool_cancel_mission(chat_id: int, args: Dict) -> Dict:
+    mid = int(args.get("mission_id") or 0)
+    if not mid:
+        return {"ok": False, "error": "mission_id required"}
+    return {"ok": db.cancel_mission(chat_id, mid)}
+
+
+def tool_list_missions(chat_id: int, args: Dict) -> Dict:
+    status = args.get("status")
+    rows = db.list_missions(chat_id, status=status)
+    return {"ok": True, "missions": [
+        {"id": r["id"], "title": r["title"], "status": r["status"],
+         "current_hop": r["current_hop"], "max_hops": r["max_hops"],
+         "cost_usd": round(r["cost_usd_running"], 4)}
+        for r in rows[:20]]}
+
+
+# Register v5 mission tools now that their handlers exist.
+SYNC_HANDLERS.update({
+    "start_mission": tool_start_mission,
+    "cancel_mission": tool_cancel_mission,
+    "list_missions": tool_list_missions,
+})
+
+
+# Slash commands
+
+
+async def cmd_mission(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/mission <목표>` 시작 · `/mission cancel <id>` 취소 · `/mission <id>` 결과."""
+    chat_id = update.effective_chat.id
+    args = list(context.args or [])
+    if not args:
+        await update.message.reply_text(
+            "사용:\n"
+            "  /mission <자연어 목표>  — 자율 프로젝트 시작\n"
+            "  /mission cancel <id>    — 취소\n"
+            "  /mission <id>           — 결과 보기"
+        )
+        return
+    if args[0].lower() == "cancel" and len(args) >= 2:
+        try:
+            mid = int(args[1])
+        except ValueError:
+            await update.message.reply_text("mission_id는 숫자.")
+            return
+        ok = db.cancel_mission(chat_id, mid)
+        await update.message.reply_text(f"⏹ Mission #{mid} 취소" if ok else "취소 실패 (없거나 이미 종료)")
+        return
+    # /mission <id> = show result
+    if len(args) == 1 and args[0].isdigit():
+        m = db.get_mission(int(args[0]))
+        if not m or m["chat_id"] != chat_id:
+            await update.message.reply_text("없는 mission")
+            return
+        text = (f"Mission #{m['id']} [{m['status']}] — {m['title']}\n"
+                f"  • hops {m['current_hop']}/{m['max_hops']} · cost ${m['cost_usd_running']:.4f}\n\n"
+                f"{(m['result_md'] or '(아직 결과 없음)')[:3500]}")
+        await update.message.reply_text(text)
+        return
+    # Start new mission
+    goal = " ".join(args).strip()
+    title = goal[:40] + ("…" if len(goal) > 40 else "")
+    mid = db.add_mission(chat_id, title, goal, max_hops=80)
+    scheduler.trigger_mission_tick_now(mid)
+    await update.message.reply_text(
+        f"🚀 Mission #{mid} 시작 — '{title}'\n"
+        "매 5분마다 1-3 hop 전진. 완성되면 알려줄게. /missions 로 진행 보기."
+    )
+
+
+async def cmd_missions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/missions` 모든 mission 목록 (최근 20)."""
+    chat_id = update.effective_chat.id
+    rows = db.list_missions(chat_id)
+    if not rows:
+        await update.message.reply_text("아직 mission 없음. /mission <목표> 로 시작.")
+        return
+    lines = ["🚀 Missions"]
+    for r in rows[:20]:
+        emoji = {"running": "▶️", "done": "✅", "failed": "❌",
+                 "cancelled": "⏹", "paused": "⏸"}.get(r["status"], "·")
+        lines.append(f"  {emoji} #{r['id']} [{r['status']}] {r['title'][:50]} "
+                     f"— {r['current_hop']}/{r['max_hops']} hop · ${r['cost_usd_running']:.4f}")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_metrics(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """`/metrics` — observability pulse: 24h errors, cron health, cost trend."""
     chat_id = update.effective_chat.id
@@ -4089,6 +4371,8 @@ BOT_COMMANDS: List[BotCommand] = [
     BotCommand("recall", "특정 사람/키워드 cross-table 회수"),
     BotCommand("scorecard", "주간 스코어카드 (골/습관/지출/무드)"),
     BotCommand("agent", "다단계 자율 에이전트 실행"),
+    BotCommand("mission", "밤사이 자율 프로젝트 시작"),
+    BotCommand("missions", "진행 중 mission 목록"),
     BotCommand("say", "TTS로 음성 답장"),
     BotCommand("diag", "봇 상태 진단"),
     BotCommand("export", "내 데이터 마크다운으로 보기"),
@@ -4122,6 +4406,7 @@ async def post_init(app: Application) -> None:
         active_learning_runner=run_active_learning,
         budget_check_runner=run_budget_check,
         late_check_runner=run_late_check,
+        mission_tick_runner=run_mission_tick,
     )
     # Register the slash-command menu so Telegram clients show autocomplete.
     # Failure is non-fatal (the bot still works without the menu).
@@ -4173,6 +4458,8 @@ def main() -> None:
     app.add_handler(CommandHandler("recall", cmd_recall))
     app.add_handler(CommandHandler("scorecard", cmd_scorecard))
     app.add_handler(CommandHandler("agent", cmd_agent))
+    app.add_handler(CommandHandler("mission", cmd_mission))
+    app.add_handler(CommandHandler("missions", cmd_missions))
     app.add_handler(CommandHandler("say", cmd_say))
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("export", cmd_export))

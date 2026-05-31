@@ -1011,6 +1011,54 @@ TOOLS: List[Dict] = [
             "parameters": {"type": "object", "properties": {}},
         },
     },
+    # ---- v5: mission mode (autonomous overnight projects) ----
+    {
+        "type": "function",
+        "function": {
+            "name": "start_mission",
+            "description": (
+                "Spawn a background autonomous mission that runs in 5-min ticks "
+                "across hours/days. Use ONLY for tasks the user wants worked on "
+                "asynchronously ('다음달 부산 코스 만들어 — 천천히 봐도 돼'). "
+                "Don't use for instant questions. The agent loop persists state "
+                "and resumes per tick until done or max_hops."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Short label (≤40 chars)."},
+                    "goal_text": {"type": "string", "description": "Full goal description in Korean."},
+                    "max_hops": {"type": "integer", "description": "Total hop budget (default 80, max 200)."},
+                },
+                "required": ["title", "goal_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_mission",
+            "description": "Stop a running mission.",
+            "parameters": {
+                "type": "object",
+                "properties": {"mission_id": {"type": "integer"}},
+                "required": ["mission_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_missions",
+            "description": "List recent missions for the user (optional status filter).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["running", "done", "failed", "cancelled", "paused"]},
+                },
+            },
+        },
+    },
 ]
 
 

@@ -39,6 +39,7 @@ _weekly_scorecard_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _active_learning_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _budget_check_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _late_check_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = event_id
+_mission_tick_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = mission_id
 
 
 def init(
@@ -62,6 +63,7 @@ def init(
     active_learning_runner: Optional[Callable[[int], Awaitable[None]]] = None,
     budget_check_runner: Optional[Callable[[int], Awaitable[None]]] = None,
     late_check_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    mission_tick_runner: Optional[Callable[[int], Awaitable[None]]] = None,
 ) -> None:
     global _scheduler, _bot, _recurring_runner, _weekly_review_runner, _daily_imminent_runner
     global _morning_briefing_runner, _evening_reflection_runner
@@ -69,7 +71,7 @@ def init(
     global _midday_checkin_runner, _leave_by_recompute_runner, _leave_by_runner
     global _persona_rebuild_runner, _gcal_invite_watch_runner, _agent_digest_runner
     global _streak_compute_runner, _weekly_scorecard_runner, _active_learning_runner
-    global _budget_check_runner, _late_check_runner
+    global _budget_check_runner, _late_check_runner, _mission_tick_runner
     _bot = bot
     _recurring_runner = recurring_runner
     _weekly_review_runner = weekly_review_runner
@@ -90,6 +92,7 @@ def init(
     _active_learning_runner = active_learning_runner
     _budget_check_runner = budget_check_runner
     _late_check_runner = late_check_runner
+    _mission_tick_runner = mission_tick_runner
     _scheduler = AsyncIOScheduler(timezone=TZ)
     _scheduler.start()
 
@@ -151,6 +154,13 @@ def init(
         id="v5-stale-nudge-marker",
         replace_existing=True,
         misfire_grace_time=1800,
+    )
+    _scheduler.add_job(
+        _run_mission_pump,
+        CronTrigger(minute="*/5", timezone=TZ),
+        id="v5-mission-pump",
+        replace_existing=True,
+        misfire_grace_time=600,
     )
 
     logger.info(
@@ -798,6 +808,43 @@ async def _run_v5_error_cleanup() -> None:
             logger.info("error_log cleanup: dropped %d rows", n)
     except Exception:
         logger.exception("error_log cleanup failed")
+
+
+async def _run_mission_pump() -> None:
+    """Every 5min: find all running missions, fire tick runner for each."""
+    if _mission_tick_runner is None:
+        return
+    try:
+        rows = db.list_running_missions()
+    except Exception:
+        logger.exception("mission pump: list_running_missions failed")
+        return
+    for m in rows:
+        try:
+            await _mission_tick_runner(m["id"])
+        except Exception:
+            logger.exception("mission tick failed for mission %s", m["id"])
+
+
+def trigger_mission_tick_now(mission_id: int) -> None:
+    if _scheduler is None:
+        return
+    _scheduler.add_job(
+        lambda: _safe_run(_mission_tick_runner, mission_id),
+        "date",
+        run_date=datetime.now(timezone.utc) + timedelta(seconds=2),
+        id=f"mission-tick-{mission_id}-once-{int(datetime.now(timezone.utc).timestamp())}",
+        misfire_grace_time=120,
+    )
+
+
+async def _safe_run(runner, *args):
+    if runner is None:
+        return
+    try:
+        await runner(*args)
+    except Exception:
+        logger.exception("safe_run failed for %s", runner)
 
 
 async def _run_stale_nudge_marker() -> None:
