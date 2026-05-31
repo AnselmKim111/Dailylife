@@ -271,6 +271,16 @@ def _system_message(chat_id: int, recent_user_text: str = "") -> Dict:
             f"{persona['generated_at'][:10]}):\n{persona['content_md']}\n\n"
             + base
         )
+    # v5: self-improving overrides (tone, no-fly topics, etc.) — bot writes
+    # these to itself based on engagement signal.
+    override = db.get_prompt_override(chat_id)
+    if override:
+        base = (
+            f"Bot self-tuning overrides (from observed engagement, "
+            "treat as supplementary not contradictory):\n"
+            f"{override}\n\n"
+            + base
+        )
     if recent_user_text:
         people_ctx = _people_context_for_text(chat_id, recent_user_text)
         if people_ctx:
@@ -1522,15 +1532,18 @@ ASYNC_HANDLERS = {
 
 
 async def run_agent(chat_id: int, user_text: str, history: Optional[List[Dict]] = None,
-                    max_hops: int = 6) -> str:
-    """Run the agent loop with tool-use until it returns a text answer."""
+                    max_hops: int = 6, kind: str = "chat") -> str:
+    """Run the agent loop with tool-use until it returns a text answer.
+
+    `kind` is forwarded to chat_completion so model_router can pick the right
+    tier (chat→sonnet, agent→opus, ask→opus, etc.)."""
     history = history if history is not None else []
     history.append({"role": "user", "content": user_text})
 
     final_text = ""
     for hop in range(max_hops):
         messages = [_system_message(chat_id, recent_user_text=user_text), *history]
-        data = await chat_completion(messages, tools=TOOLS, chat_id=chat_id, kind="chat")
+        data = await chat_completion(messages, tools=TOOLS, chat_id=chat_id, kind=kind)
         msg = data["choices"][0]["message"]
         history.append(
             {
@@ -1799,6 +1812,7 @@ async def run_morning_briefing(chat_id: int) -> None:
     for i in range(0, len(text), 4000):
         await _app.bot.send_message(chat_id=chat_id, text=text[i:i + 4000])
     db.mark_briefing_sent(chat_id, today_local.isoformat())
+    db.record_nudge(chat_id, "morning_briefing")
 
 
 def _toggle_off_local(chat_id: int, key: str) -> bool:
@@ -1828,6 +1842,7 @@ async def run_evening_reflection(chat_id: int) -> None:
     opener = random.choice(REFLECTION_OPENERS)
     await _app.bot.send_message(chat_id=chat_id, text=opener)
     db.mark_reflection_prompted(chat_id, today_local.isoformat())
+    db.record_nudge(chat_id, "evening_reflection")
 
 
 async def run_daily_imminent_check(chat_id: int) -> None:
@@ -2230,6 +2245,7 @@ async def run_late_check(event_id: int) -> None:
     text = f"🚗 {row['title']} — 늦어지는 것 같아. 알릴까?"
     try:
         await _app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+        db.record_nudge(chat_id, "late_check", str(event_id))
     except Exception:
         logger.exception("late check send failed for event %s", event_id)
 
@@ -2389,6 +2405,7 @@ async def run_midday_checkin(chat_id: int) -> None:
     try:
         await _app.bot.send_message(chat_id=chat_id, text=text)
         db.mark_midday_checkin_sent(chat_id, today_local.isoformat())
+        db.record_nudge(chat_id, "midday_checkin")
     except Exception:
         logger.exception("midday checkin send failed")
 
@@ -3160,6 +3177,20 @@ async def cmd_nudges(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 db.remember_fact(chat_id, fact_key, "false")
             else:
                 db.forget_fact(chat_id, fact_key)
+            # v5: mark recent nudges of this kind as 'toggled_off' for self-improve.
+            nudge_kind_guess = {
+                "gmail_event_scan_enabled": "gmail_event_scan",
+                "leave_by_enabled": "late_check",
+                "weather_preview_enabled": "evening_preview",
+                "goal_milestone_enabled": "goal_milestone",
+                "birthday_alert_separate_enabled": "birthday_solo",
+                "midday_checkin_enabled": "midday_checkin",
+                "briefing_enabled": "morning_briefing",
+                "reflection_enabled": "evening_reflection",
+            }.get(fact_key)
+            if nudge_kind_guess:
+                db.react_to_recent_nudge(chat_id, nudge_kind_guess,
+                                          "toggled_off", within_hours=72)
             await update.message.reply_text(f"🔕 {label} OFF.")
         else:
             if default_on:
@@ -3338,7 +3369,7 @@ async def cmd_agent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             chat_id,
             f"[AGENT MODE] {goal}\n\n자율로 도구를 조합해 단계적으로 해결해. "
             "외부 액션(메일 전송·RSVP)은 auto_rule 통과한 것만 자동. 나머지는 초안 제안.",
-            history=[], max_hops=20,
+            history=[], max_hops=20, kind="agent",
         )
         for i in range(0, len(reply), 4000):
             await update.message.reply_text(reply[i:i + 4000])
@@ -3582,6 +3613,85 @@ SYNC_HANDLERS.update({
 })
 
 
+# ---------------- v5: knowledge graph tools ----------------
+
+
+def tool_graph_query(chat_id: int, args: Dict) -> Dict:
+    kind = args.get("start_kind")
+    sid = args.get("start_id")
+    if not kind or sid is None:
+        return {"ok": False, "error": "start_kind + start_id required"}
+    depth = max(1, min(int(args.get("max_depth") or 2), 4))
+    rel_filter = args.get("relation_filter") or None
+    g = db.graph_bfs(chat_id, kind, int(sid), max_depth=depth, relation_filter=rel_filter)
+    # Hydrate nodes with their titles where possible (small N, ok)
+    hydrated = []
+    for n in g["nodes"]:
+        label = None
+        try:
+            if n["kind"] == "person":
+                row = db.get_person(int(n["id"]))
+                label = row["name"] if row else None
+            elif n["kind"] == "event":
+                row = db.get_event(int(n["id"]))
+                label = row["title"] if row else None
+            elif n["kind"] == "goal":
+                row = db.get_goal(int(n["id"])) if hasattr(db, "get_goal") else None
+                label = row["title"] if row else None
+        except Exception:
+            label = None
+        hydrated.append({**n, "label": label})
+    return {"ok": True, "nodes": hydrated, "edges": g["edges"]}
+
+
+def tool_add_relation(chat_id: int, args: Dict) -> Dict:
+    rid = db.add_relation(
+        chat_id,
+        args["from_kind"], int(args["from_id"]),
+        args["to_kind"], int(args["to_id"]),
+        args["relation_kind"], source="manual",
+    )
+    return {"ok": rid is not None, "relation_id": rid}
+
+
+SYNC_HANDLERS.update({
+    "graph_query": tool_graph_query,
+    "add_relation": tool_add_relation,
+})
+
+
+# /ask command — multi-hop reasoning using graph + cross_recall
+
+ASK_SYSTEM = (
+    "사용자가 사람·이벤트·골·노트·지출에 걸친 multi-hop 질문을 함. "
+    "graph_query로 핵심 엔티티에서 BFS 탐색 + cross_recall로 silo별 합본. "
+    "마지막에 한국어로 1-2문단 자연 요약. tool call은 최대 3개."
+)
+
+
+async def cmd_ask(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    if not context.args:
+        await update.message.reply_text(
+            "사용: /ask 경서랑 1년 안에 갔다온 여행 다 알려줘"
+        )
+        return
+    q = " ".join(context.args).strip()
+    db.log_chat(chat_id, "user", f"[/ask] {q}")
+    await update.message.reply_text("🔎 그래프 traversal 중…")
+    try:
+        reply = await run_agent(
+            chat_id,
+            f"{ASK_SYSTEM}\n\n질문: {q}",
+            history=[], max_hops=6, kind="ask",
+        )
+        for i in range(0, len(reply), 4000):
+            await update.message.reply_text(reply[i:i + 4000])
+    except Exception as e:
+        logger.exception("/ask failed")
+        await update.message.reply_text(f"⚠ {e}")
+
+
 # Slash commands
 
 
@@ -3641,6 +3751,206 @@ async def cmd_missions(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                  "cancelled": "⏹", "paused": "⏸"}.get(r["status"], "·")
         lines.append(f"  {emoji} #{r['id']} [{r['status']}] {r['title'][:50]} "
                      f"— {r['current_hop']}/{r['max_hops']} hop · ${r['cost_usd_running']:.4f}")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ---------------- v5: relation auto-extract ----------------
+
+
+RELATION_EXTRACT_PROMPT = (
+    "다음 이벤트/노트 기록에서 관계 (edges)를 추출해. "
+    'JSON 배열만: [{{"from_kind": "event"|"note", "from_id": <id>, '
+    '"to_kind": "person"|"event"|"goal", "to_id": <id>, "relation_kind": '
+    '"attended"|"mentions"|"sponsored"|"location_of"|"paid_for"|"about"}}]. '
+    "확실하지 않으면 비워. 한 호출당 최대 8개. JSON만, 다른 텍스트 금지.\n\n"
+    "기존 사람 후보:\n{people}\n\n"
+    "어제 추가된 항목:\n{items}"
+)
+
+
+async def run_relation_extract(chat_id: int) -> None:
+    """Daily 04:00 — find yesterday's new events/notes, ask LLM to identify
+    relations to existing people / other events, INSERT into relations table."""
+    if _toggle_off_local(chat_id, "graph_extract_enabled"):
+        return
+    yesterday_iso = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    # Yesterday's events
+    with db._conn() as c:
+        events = list(c.execute(
+            "SELECT id, title, notes, location FROM events "
+            "WHERE chat_id=? AND created_at>=? LIMIT 20",
+            (chat_id, yesterday_iso)))
+        notes = list(c.execute(
+            "SELECT id, content FROM notes "
+            "WHERE chat_id=? AND created_at>=? LIMIT 20",
+            (chat_id, yesterday_iso)))
+    if not events and not notes:
+        return
+    people = [(p["id"], p["name"]) for p in db.list_people(chat_id)]
+    items_md_parts = []
+    for e in events:
+        items_md_parts.append(
+            f"event #{e['id']}: title={e['title']!r}, notes={(e['notes'] or '')[:80]!r}, "
+            f"location={e['location']!r}")
+    for n in notes:
+        items_md_parts.append(f"note #{n['id']}: {(n['content'] or '')[:120]!r}")
+    items_md = "\n".join(items_md_parts)
+    people_md = "\n".join(f"person #{pid}: {name}" for pid, name in people) or "(없음)"
+    prompt = RELATION_EXTRACT_PROMPT.format(people=people_md, items=items_md)
+    try:
+        data = await chat_completion(
+            [{"role": "user", "content": prompt}],
+            tools=None, chat_id=chat_id, kind="relation_extract", max_tokens=600,
+        )
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+    except Exception:
+        logger.exception("relation extract LLM failed")
+        return
+    import re as _re
+    m = _re.search(r"\[[\s\S]*\]", content)
+    if not m:
+        return
+    try:
+        parsed = json.loads(m.group(0))
+    except Exception:
+        return
+    if not isinstance(parsed, list):
+        return
+    inserted = 0
+    for rel in parsed[:12]:
+        try:
+            rid = db.add_relation(
+                chat_id,
+                rel["from_kind"], int(rel["from_id"]),
+                rel["to_kind"], int(rel["to_id"]),
+                rel["relation_kind"],
+                source="auto_extract",
+            )
+            if rid:
+                inserted += 1
+        except Exception:
+            continue
+    if inserted:
+        logger.info("relation_extract chat=%s inserted=%d", chat_id, inserted)
+
+
+# ---------------- v5: self-improving reinforcement ----------------
+
+
+SELF_IMPROVE_PROMPT = (
+    "다음은 봇 nudge 반응 통계 + 사용자 persona snapshot이야. "
+    "사용자가 *반복적으로* 무시 (≥70% no_response/dismissed) 또는 *명시적으로 끔* "
+    "(toggled_off) 하는 nudge가 있으면 자동으로 OFF로 전환할 추천 + 봇 자체 톤/말투 "
+    "개선 한 줄을 JSON으로 답해. 추가 변경 사항이 없다면 빈 객체 {{}} 반환.\n\n"
+    'JSON: {{"disable_nudges": ["<fact_key>", ...], "tone_override": "<≤300자 한국어 메모>"}}\n\n'
+    "nudge stats (지난 4주):\n{stats}\n\n"
+    "persona snapshot:\n{persona}\n\n"
+    "현재 봇 override:\n{current_override}"
+)
+
+
+# nudge_kind → fact key used by /nudges to disable it
+_NUDGE_FACT_MAP = {
+    "midday_checkin": "midday_checkin_enabled",
+    "evening_preview": "weather_preview_enabled",
+    "morning_briefing": "briefing_enabled",
+    "evening_reflection": "reflection_enabled",
+    "gmail_event_scan": "gmail_event_scan_enabled",
+    "goal_milestone": "goal_milestone_enabled",
+    "birthday_solo": "birthday_alert_separate_enabled",
+    "late_check": "leave_by_enabled",
+}
+
+
+async def run_self_improve(chat_id: int) -> None:
+    """Sun 10:00 — meta-LLM looks at nudge engagement + persona, optionally
+    auto-toggles noisy nudges OFF and writes a tone override."""
+    if _toggle_off_local(chat_id, "self_improve_enabled"):
+        return
+    stats = db.nudge_stats_by_kind(chat_id, days=28)
+    if not stats:
+        return  # nothing to learn from
+    persona = db.get_latest_persona(chat_id)
+    cur_override = db.get_prompt_override(chat_id) or "(없음)"
+    prompt = SELF_IMPROVE_PROMPT.format(
+        stats=json.dumps(stats, ensure_ascii=False),
+        persona=(persona["content_md"][:1500] if persona else "(없음)"),
+        current_override=cur_override,
+    )
+    try:
+        data = await chat_completion(
+            [{"role": "user", "content": prompt}],
+            tools=None, chat_id=chat_id, kind="self_improve", max_tokens=500,
+        )
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+    except Exception:
+        logger.exception("self_improve LLM failed")
+        return
+    import re as _re
+    m = _re.search(r"\{[\s\S]*\}", content)
+    if not m:
+        return
+    try:
+        parsed = json.loads(m.group(0))
+    except Exception:
+        return
+    changes: List[str] = []
+    for fact_key in (parsed.get("disable_nudges") or []):
+        if fact_key in {v for v in _NUDGE_FACT_MAP.values()}:
+            db.remember_fact(chat_id, fact_key, "false")
+            # Re-arm scheduler to drop the disabled cron
+            scheduler.disable_daily_rhythm_for(chat_id)
+            scheduler.ensure_daily_rhythm_for(chat_id)
+            changes.append(f"🔕 {fact_key} → OFF")
+    tone = (parsed.get("tone_override") or "").strip()
+    if tone:
+        db.set_prompt_override(chat_id, tone[:600])
+        changes.append(f"🎨 톤 override 갱신: {tone[:80]}...")
+    if changes and _app and _app.bot:
+        try:
+            await _app.bot.send_message(
+                chat_id=chat_id,
+                text=("🤖 이번 주 자기 조정:\n  " + "\n  ".join(changes)
+                      + "\n\n실수면 /improvements undo 로 되돌리기."),
+            )
+            db.log_agent_action(
+                chat_id, "self_improve",
+                summary=f"자기 조정 {len(changes)}건",
+                payload={"changes": changes, "raw": content[:300]},
+                reversible={"kind": "prompt_override_revert",
+                             "args": {"previous": cur_override}},
+            )
+        except Exception:
+            logger.exception("self_improve notify failed")
+
+
+async def cmd_improvements(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/improvements` 최근 자기 조정 기록 · `/improvements undo` 모든 override 제거."""
+    chat_id = update.effective_chat.id
+    arg = (context.args[0] if context.args else "").strip().lower()
+    if arg == "undo":
+        if db.clear_prompt_override(chat_id):
+            await update.message.reply_text("🔄 self-improve override 제거됨.")
+        else:
+            await update.message.reply_text("override 없음.")
+        return
+    # Show recent self_improve agent_actions
+    with db._conn() as c:
+        rows = list(c.execute(
+            "SELECT * FROM agent_actions WHERE chat_id=? AND action_kind='self_improve' "
+            "ORDER BY executed_at DESC LIMIT 10", (chat_id,)))
+    current = db.get_prompt_override(chat_id)
+    lines = ["🤖 자기 조정 이력"]
+    if not rows:
+        lines.append("  (아직 없음 — Sun 10:00에 자동 실행)")
+    for r in rows:
+        lines.append(f"  • {r['executed_at'][:10]} — {r['summary']}")
+    if current:
+        lines.append("")
+        lines.append("📝 현재 톤 override:")
+        lines.append("  " + current[:300])
+    lines.append("")
+    lines.append("취소: /improvements undo")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -4366,11 +4676,13 @@ BOT_COMMANDS: List[BotCommand] = [
     BotCommand("nudges", "능동 알림 토글 + 상태"),
     BotCommand("models", "현재 LLM 라우팅 + 커스텀 override"),
     BotCommand("metrics", "시스템 헬스 (에러 / 비용 / nudge 반응)"),
+    BotCommand("improvements", "봇이 자기를 어떻게 조정했는지 (Sun 10:00)"),
     BotCommand("rules", "자동 액션 규칙 (메일 자동, RSVP 자동)"),
     BotCommand("persona", "내가 누구인지 봇이 그린 인물 요약"),
     BotCommand("recall", "특정 사람/키워드 cross-table 회수"),
     BotCommand("scorecard", "주간 스코어카드 (골/습관/지출/무드)"),
     BotCommand("agent", "다단계 자율 에이전트 실행"),
+    BotCommand("ask", "엔티티 관계 multi-hop 질문 (그래프 회수)"),
     BotCommand("mission", "밤사이 자율 프로젝트 시작"),
     BotCommand("missions", "진행 중 mission 목록"),
     BotCommand("say", "TTS로 음성 답장"),
@@ -4407,6 +4719,8 @@ async def post_init(app: Application) -> None:
         budget_check_runner=run_budget_check,
         late_check_runner=run_late_check,
         mission_tick_runner=run_mission_tick,
+        relation_extract_runner=run_relation_extract,
+        self_improve_runner=run_self_improve,
     )
     # Register the slash-command menu so Telegram clients show autocomplete.
     # Failure is non-fatal (the bot still works without the menu).
@@ -4453,11 +4767,13 @@ def main() -> None:
     app.add_handler(CommandHandler("nudges", cmd_nudges))
     app.add_handler(CommandHandler("models", cmd_models))
     app.add_handler(CommandHandler("metrics", cmd_metrics))
+    app.add_handler(CommandHandler("improvements", cmd_improvements))
     app.add_handler(CommandHandler("rules", cmd_rules))
     app.add_handler(CommandHandler("persona", cmd_persona))
     app.add_handler(CommandHandler("recall", cmd_recall))
     app.add_handler(CommandHandler("scorecard", cmd_scorecard))
     app.add_handler(CommandHandler("agent", cmd_agent))
+    app.add_handler(CommandHandler("ask", cmd_ask))
     app.add_handler(CommandHandler("mission", cmd_mission))
     app.add_handler(CommandHandler("missions", cmd_missions))
     app.add_handler(CommandHandler("say", cmd_say))

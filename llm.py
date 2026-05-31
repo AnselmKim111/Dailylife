@@ -1059,6 +1059,47 @@ TOOLS: List[Dict] = [
             },
         },
     },
+    # ---- v5: knowledge graph + reasoning ----
+    {
+        "type": "function",
+        "function": {
+            "name": "graph_query",
+            "description": (
+                "Multi-hop graph traversal across people/events/goals/notes/expenses. "
+                "Returns the subgraph (nodes + edges) within max_depth hops of the start "
+                "entity. Use BEFORE cross_recall for entity-relationship questions "
+                "('경서랑 결혼 후 1년 안에 갔다온 여행', '내가 작년에 만난 사람들')."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start_kind": {"type": "string", "enum": ["person", "event", "goal", "note", "expense", "mission"]},
+                    "start_id": {"type": "integer"},
+                    "max_depth": {"type": "integer", "description": "Default 2."},
+                    "relation_filter": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["start_kind", "start_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "add_relation",
+            "description": "Manually add a graph edge between two entities.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "from_kind": {"type": "string"},
+                    "from_id": {"type": "integer"},
+                    "to_kind": {"type": "string"},
+                    "to_id": {"type": "integer"},
+                    "relation_kind": {"type": "string"},
+                },
+                "required": ["from_kind", "from_id", "to_kind", "to_id", "relation_kind"],
+            },
+        },
+    },
 ]
 
 

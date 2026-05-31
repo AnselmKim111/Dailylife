@@ -40,6 +40,8 @@ _active_learning_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _budget_check_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _late_check_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = event_id
 _mission_tick_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = mission_id
+_relation_extract_runner: Optional[Callable[[int], Awaitable[None]]] = None
+_self_improve_runner: Optional[Callable[[int], Awaitable[None]]] = None
 
 
 def init(
@@ -64,6 +66,8 @@ def init(
     budget_check_runner: Optional[Callable[[int], Awaitable[None]]] = None,
     late_check_runner: Optional[Callable[[int], Awaitable[None]]] = None,
     mission_tick_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    relation_extract_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    self_improve_runner: Optional[Callable[[int], Awaitable[None]]] = None,
 ) -> None:
     global _scheduler, _bot, _recurring_runner, _weekly_review_runner, _daily_imminent_runner
     global _morning_briefing_runner, _evening_reflection_runner
@@ -72,6 +76,7 @@ def init(
     global _persona_rebuild_runner, _gcal_invite_watch_runner, _agent_digest_runner
     global _streak_compute_runner, _weekly_scorecard_runner, _active_learning_runner
     global _budget_check_runner, _late_check_runner, _mission_tick_runner
+    global _relation_extract_runner, _self_improve_runner
     _bot = bot
     _recurring_runner = recurring_runner
     _weekly_review_runner = weekly_review_runner
@@ -93,6 +98,8 @@ def init(
     _budget_check_runner = budget_check_runner
     _late_check_runner = late_check_runner
     _mission_tick_runner = mission_tick_runner
+    _relation_extract_runner = relation_extract_runner
+    _self_improve_runner = self_improve_runner
     _scheduler = AsyncIOScheduler(timezone=TZ)
     _scheduler.start()
 
@@ -496,6 +503,24 @@ def ensure_daily_rhythm_for(chat_id: int) -> None:
             replace_existing=True,
             misfire_grace_time=3600,
         )
+    if _relation_extract_runner and not _toggle_off(chat_id, "graph_extract_enabled"):
+        _scheduler.add_job(
+            _run_relation_extract,
+            CronTrigger(hour=4, minute=0, timezone=TZ),
+            args=[chat_id],
+            id=f"relation-extract-{chat_id}",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+    if _self_improve_runner and not _toggle_off(chat_id, "self_improve_enabled"):
+        _scheduler.add_job(
+            _run_self_improve,
+            CronTrigger(day_of_week="sun", hour=10, minute=0, timezone=TZ),
+            args=[chat_id],
+            id=f"self-improve-{chat_id}",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
     logger.info("daily rhythm armed for chat %s", chat_id)
 
 
@@ -808,6 +833,24 @@ async def _run_v5_error_cleanup() -> None:
             logger.info("error_log cleanup: dropped %d rows", n)
     except Exception:
         logger.exception("error_log cleanup failed")
+
+
+async def _run_relation_extract(chat_id: int) -> None:
+    if _relation_extract_runner is None or _toggle_off(chat_id, "graph_extract_enabled"):
+        return
+    try:
+        await _relation_extract_runner(chat_id)
+    except Exception:
+        logger.exception("relation extract failed for chat %s", chat_id)
+
+
+async def _run_self_improve(chat_id: int) -> None:
+    if _self_improve_runner is None or _toggle_off(chat_id, "self_improve_enabled"):
+        return
+    try:
+        await _self_improve_runner(chat_id)
+    except Exception:
+        logger.exception("self-improve failed for chat %s", chat_id)
 
 
 async def _run_mission_pump() -> None:
