@@ -3378,6 +3378,182 @@ async def cmd_agent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text(f"⚠ {e}")
 
 
+# ---------------- v5: bank SMS bridge ----------------
+
+
+BANK_SMS_PROMPT = (
+    "한국 카드/은행 SMS 한 줄에서 거래 정보를 JSON으로 뽑아. "
+    'JSON: {{"amount_won": <int>, "merchant": "<상호명>", '
+    '"category": "<식비/교통/쇼핑/카페/기타>"}}. '
+    "거래가 아니거나 (잔액 알림, 광고) 파싱 불가면 빈 객체 {{}} 반환. JSON만.\n\n"
+    "SMS: {sms}"
+)
+
+
+async def _parse_bank_sms(sms: str) -> Optional[Dict]:
+    try:
+        data = await chat_completion(
+            [{"role": "user", "content": BANK_SMS_PROMPT.format(sms=sms[:400])}],
+            tools=None, chat_id=0, kind="bank_sms_parse", max_tokens=160,
+        )
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+    except Exception:
+        logger.exception("bank_sms parse failed")
+        return None
+    import re as _re
+    m = _re.search(r"\{[\s\S]*\}", content)
+    if not m:
+        return None
+    try:
+        parsed = json.loads(m.group(0))
+    except Exception:
+        return None
+    if not parsed or not parsed.get("amount_won"):
+        return None
+    return parsed
+
+
+async def cmd_bank_sms(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/bank_sms <텍스트>` 카드 SMS 자동 가계부."""
+    chat_id = update.effective_chat.id
+    sms = " ".join(context.args or []).strip()
+    if not sms:
+        await update.message.reply_text(
+            "사용: /bank_sms KB체크 9,500원 스타벅스 09:32\n"
+            "(Apple Shortcut / Tasker로 SMS 받으면 자동 forward 가능)"
+        )
+        return
+    parsed = await _parse_bank_sms(sms)
+    if not parsed:
+        await update.message.reply_text("⚠ 거래 정보 추출 실패. (광고/잔액 알림일 수도)")
+        return
+    amount = int(parsed["amount_won"])
+    merchant = (parsed.get("merchant") or "").strip()
+    category = (parsed.get("category") or "기타").strip()
+    auto_add = _toggle_on_local(chat_id, "bank_sms_auto_add")
+    if auto_add:
+        eid = db.log_expense(chat_id, amount_won=amount, merchant=merchant,
+                              category=category, notes=f"[bank_sms] {sms[:120]}")
+        tok = secrets.token_urlsafe(8)
+        db.push_deleted_audit(chat_id, "expense",
+                               {"id": eid, "amount_won": amount,
+                                "merchant": merchant, "category": category},
+                               tok)
+        _pending_undos[tok] = ("expense", chat_id)
+        db.log_agent_action(chat_id, "bank_sms_auto_add",
+                             summary=f"SMS 자동 ₩{amount:,} {merchant}",
+                             payload={"sms": sms[:200], "expense_id": eid})
+        kb = _undo_keyboard(tok, "취소")
+        await update.message.reply_text(
+            f"💳 자동 기록: ₩{amount:,} · {merchant} · {category}",
+            reply_markup=kb,
+        )
+    else:
+        # Confirmation card
+        token = secrets.token_urlsafe(8)
+        _pending_mail_cards[token] = {  # reuse the in-memory dict
+            "chat_id": chat_id, "kind": "bank_sms_confirm",
+            "amount": amount, "merchant": merchant, "category": category,
+            "sms": sms,
+        }
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"✅ ₩{amount:,} {merchant}",
+                                  callback_data=f"act:bank_add:{token}"),
+            InlineKeyboardButton("❌ 아님",
+                                  callback_data=f"act:bank_skip:{token}"),
+        ]])
+        await update.message.reply_text(
+            f"💳 SMS 분석:\n  • ₩{amount:,}\n  • {merchant}\n  • {category}",
+            reply_markup=kb,
+        )
+
+
+# ---------------- v5: image generation ----------------
+
+
+async def tool_generate_image(chat_id: int, args: Dict) -> Dict:
+    prompt = (args.get("prompt") or "").strip()
+    if not prompt:
+        return {"ok": False, "error": "prompt required"}
+    # daily cap
+    try:
+        cap = int(_fact_value_local(chat_id, "image_daily_cap") or "3")
+    except ValueError:
+        cap = 3
+    with db._conn() as c:
+        today_iso = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+        used = c.execute(
+            "SELECT COUNT(*) AS n FROM agent_actions WHERE chat_id=? "
+            "AND action_kind='image_gen' AND executed_at>=?",
+            (chat_id, today_iso)).fetchone()["n"]
+    if used >= cap:
+        return {"ok": False, "error": f"daily image cap reached ({used}/{cap})"}
+    try:
+        png = await transcribe.generate_image(prompt)
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    if _app and _app.bot:
+        try:
+            await _app.bot.send_photo(chat_id=chat_id, photo=png, caption=prompt[:200])
+        except Exception:
+            logger.exception("image send failed")
+    db.log_agent_action(chat_id, "image_gen",
+                         summary=f"이미지 생성: {prompt[:50]}",
+                         payload={"prompt": prompt, "bytes": len(png)})
+    return {"ok": True, "bytes": len(png), "remaining_today": max(0, cap - used - 1)}
+
+
+ASYNC_HANDLERS["generate_image"] = tool_generate_image
+
+
+async def cmd_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/image <prompt>` 즉시 이미지 생성 + 발송."""
+    chat_id = update.effective_chat.id
+    prompt = " ".join(context.args or []).strip()
+    if not prompt:
+        await update.message.reply_text("사용: /image 분홍 노을 발리 결혼식")
+        return
+    await update.message.reply_text("🎨 그리는 중…")
+    res = await tool_generate_image(chat_id, {"prompt": prompt})
+    if not res["ok"]:
+        await update.message.reply_text(f"⚠ {res.get('error')}")
+    # success case already sent the photo via send_photo
+
+
+# ---------------- v5: voice reply auto chain ----------------
+
+
+def _is_voice_reply_active(chat_id: int) -> bool:
+    """ON if fact voice_reply_auto=true OR a /voice session is active."""
+    if _toggle_on_local(chat_id, "voice_reply_auto"):
+        return True
+    until_iso = _fact_value_local(chat_id, "voice_reply_session_until_utc")
+    if not until_iso:
+        return False
+    try:
+        until = datetime.fromisoformat(until_iso)
+        return datetime.now(timezone.utc) < until
+    except Exception:
+        return False
+
+
+async def cmd_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/voice [N분]` 다음 N분간 모든 응답을 음성으로 (기본 30분)."""
+    chat_id = update.effective_chat.id
+    arg = (context.args[0] if context.args else "30").strip().lower()
+    if arg in {"off", "0"}:
+        db.forget_fact(chat_id, "voice_reply_session_until_utc")
+        await update.message.reply_text("🔇 음성 답장 모드 OFF.")
+        return
+    try:
+        minutes = max(1, min(int(arg), 240))
+    except ValueError:
+        minutes = 30
+    until = (datetime.now(timezone.utc) + timedelta(minutes=minutes)).isoformat()
+    db.remember_fact(chat_id, "voice_reply_session_until_utc", until)
+    await update.message.reply_text(f"🔊 음성 답장 {minutes}분간 ON.")
+
+
 async def cmd_say(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """`/say <텍스트>` TTS로 음성 답장."""
     chat_id = update.effective_chat.id
@@ -4320,6 +4496,30 @@ async def on_callback_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     await cq.answer("이 액션은 취소 미지원", show_alert=False)
             except Exception as e:
                 await cq.answer(f"⚠ {e}", show_alert=True)
+        elif kind in ("bank_add", "bank_skip"):
+            cand = _pending_mail_cards.pop(rest, None)
+            if not cand or cand.get("chat_id") != chat_id or cand.get("kind") != "bank_sms_confirm":
+                await cq.answer("만료된 카드")
+                return
+            try:
+                await cq.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            if kind == "bank_skip":
+                await cq.answer("건너뜀")
+                return
+            # bank_add
+            eid = db.log_expense(chat_id, amount_won=cand["amount"],
+                                  merchant=cand["merchant"], category=cand["category"],
+                                  notes=f"[bank_sms] {cand['sms'][:120]}")
+            db.log_agent_action(chat_id, "bank_sms_add",
+                                 summary=f"SMS 기록 ₩{cand['amount']:,} {cand['merchant']}",
+                                 payload={"sms": cand["sms"][:200], "expense_id": eid})
+            await cq.answer("💳 기록됨")
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text=f"💳 expense #{eid} 저장 — ₩{cand['amount']:,} {cand['merchant']}",
+            )
         elif kind in ("late_msg", "late_mail", "late_dismiss"):
             cand = _pending_late_cards.pop(rest, None)
             if not cand or cand["chat_id"] != chat_id:
@@ -4490,6 +4690,14 @@ async def _process_user_text(
             await update.message.reply_text(chunk, reply_markup=_undo_keyboard(token, label))
         else:
             await update.message.reply_text(chunk)
+    # v5: voice-reply chain — if voice mode is active AND reply is short, also
+    # send TTS audio so the conversation feels truly bidir.
+    if _is_voice_reply_active(chat_id) and reply.strip() and len(reply) <= 500:
+        try:
+            audio = await transcribe.synthesize_voice(reply)
+            await context.bot.send_voice(chat_id=chat_id, voice=audio)
+        except Exception:
+            logger.exception("voice reply TTS failed (non-fatal)")
 
 
 async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4685,6 +4893,9 @@ BOT_COMMANDS: List[BotCommand] = [
     BotCommand("ask", "엔티티 관계 multi-hop 질문 (그래프 회수)"),
     BotCommand("mission", "밤사이 자율 프로젝트 시작"),
     BotCommand("missions", "진행 중 mission 목록"),
+    BotCommand("bank_sms", "카드 SMS 자동 가계부"),
+    BotCommand("image", "AI 이미지 생성"),
+    BotCommand("voice", "다음 N분 음성 답장 모드"),
     BotCommand("say", "TTS로 음성 답장"),
     BotCommand("diag", "봇 상태 진단"),
     BotCommand("export", "내 데이터 마크다운으로 보기"),
@@ -4776,6 +4987,9 @@ def main() -> None:
     app.add_handler(CommandHandler("ask", cmd_ask))
     app.add_handler(CommandHandler("mission", cmd_mission))
     app.add_handler(CommandHandler("missions", cmd_missions))
+    app.add_handler(CommandHandler("bank_sms", cmd_bank_sms))
+    app.add_handler(CommandHandler("image", cmd_image))
+    app.add_handler(CommandHandler("voice", cmd_voice))
     app.add_handler(CommandHandler("say", cmd_say))
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("export", cmd_export))

@@ -1100,6 +1100,27 @@ TOOLS: List[Dict] = [
             },
         },
     },
+    # ---- v5: visual output ----
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_image",
+            "description": (
+                "Generate one PNG via OpenAI gpt-image-1 and send it as a Telegram "
+                "photo to the user. Daily cap enforced by fact image_daily_cap "
+                "(default 3). Use only when an image genuinely adds value "
+                "(anniversary card, mood collage, illustration on request) — "
+                "don't decorate routine answers."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "Detailed image prompt in Korean or English."},
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
 ]
 
 

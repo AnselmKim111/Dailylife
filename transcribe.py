@@ -175,6 +175,47 @@ async def classify_content(text: str, hint: Optional[str] = None) -> dict:
 
 
 OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech"
+OPENAI_IMAGE_URL = "https://api.openai.com/v1/images/generations"
+
+
+async def generate_image(
+    prompt: str,
+    size: str = "1024x1024",
+    model: str = "gpt-image-1",
+) -> bytes:
+    """Generate one PNG via OpenAI Images API. Returns raw PNG bytes.
+
+    gpt-image-1 returns base64-encoded b64_json by default.
+    Cost: ~$0.04 per 1024x1024 (varies). Daily cap enforced by caller."""
+    if not OPENAI_API_KEY:
+        raise TranscribeUnavailable("OPENAI_API_KEY not configured")
+    payload = {
+        "model": model,
+        "prompt": prompt[:1000],
+        "size": size,
+        "n": 1,
+    }
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=120.0) as c:
+        r = await c.post(OPENAI_IMAGE_URL, json=payload, headers=headers)
+        if r.status_code >= 400:
+            logger.error("image gen %s: %s", r.status_code, r.text[:300])
+            r.raise_for_status()
+        data = r.json()
+    item = (data.get("data") or [{}])[0]
+    b64 = item.get("b64_json")
+    if b64:
+        return base64.b64decode(b64)
+    url = item.get("url")
+    if url:
+        async with httpx.AsyncClient(timeout=60.0) as c:
+            r2 = await c.get(url)
+            r2.raise_for_status()
+            return r2.content
+    raise RuntimeError("no image data returned")
 
 
 async def synthesize_voice(
