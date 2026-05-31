@@ -577,6 +577,63 @@ TOOLS: List[Dict] = [
     {
         "type": "function",
         "function": {
+            "name": "solar_term_check",
+            "description": (
+                "Check if a date is a Korean 24절기 (입춘/하지/추분/입동 etc.) "
+                "and return the next upcoming term."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date_local": {"type": "string", "description": "YYYY-MM-DD (KST)."},
+                },
+                "required": ["date_local"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "analyze_document",
+            "description": (
+                "Deep-read a document (contract / 계약서 / 약관 / 이력서 / 보고서) that "
+                "the user already uploaded — bot pulls the extracted text from the most "
+                "recent chat turn. Returns risk flags, key clauses, suggested questions "
+                "to ask the counterparty. Use only when explicitly asked to 'read carefully' "
+                "or 'check for risks' — don't auto-fire on every upload."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "document_text": {"type": "string", "description": "Full extracted text (paste from chat history)."},
+                    "doc_kind": {"type": "string", "description": "Optional hint: contract|insurance|résumé|policy|other."},
+                },
+                "required": ["document_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lunar_to_solar",
+            "description": (
+                "Convert a lunar (음력) date to this year's solar date. Useful for "
+                "computing when an elder's 음력 생신 falls this year."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "month": {"type": "integer"},
+                    "day": {"type": "integer"},
+                    "solar_year": {"type": "integer", "description": "Year to resolve to (defaults to current)."},
+                },
+                "required": ["month", "day"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "track_parcel",
             "description": "Best-effort 택배 추적. Returns raw page text the model can interpret.",
             "parameters": {
@@ -718,9 +775,10 @@ TOOLS: List[Dict] = [
                         "items": {
                             "type": "object",
                             "properties": {
-                                "label": {"type": "string", "description": "e.g. '생일', '기념일', '입대일'."},
-                                "date_local": {"type": "string", "description": "YYYY-MM-DD (KST)."},
+                                "label": {"type": "string", "description": "e.g. '생일', '기념일', '입대일', '음력 생신'."},
+                                "date_local": {"type": "string", "description": "YYYY-MM-DD. If is_lunar=true, this is the LUNAR date (year ignored, only month+day used)."},
                                 "recurring_yearly": {"type": "boolean"},
+                                "is_lunar": {"type": "boolean", "description": "True for 음력 dates (양가 어른 생신 etc.); bot auto-converts to this year's solar date."},
                             },
                             "required": ["label", "date_local"],
                         },

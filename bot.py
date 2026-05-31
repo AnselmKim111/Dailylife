@@ -8,7 +8,7 @@ import logging
 import os
 import re
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import secrets
@@ -29,6 +29,7 @@ import external
 import gcal
 import gmail as gmail_mod
 import korean_calendar
+import lunar
 import oauth_server
 import routines
 import scheduler
@@ -92,13 +93,18 @@ SYSTEM_PROMPT_TEMPLATE = (
     "- A named person introduced or referenced by the user (약혼녀 경서, 동기 관현, 동료 김철수 등): "
     "if new, call add_person; if known, use the 'Mentioned people in this turn' context block "
     "the system injects, and call recall_person / log_contact_with as needed. "
-    "Birthdays/anniversaries → important_dates with recurring_yearly=true.\n"
+    "Birthdays/anniversaries → important_dates with recurring_yearly=true. "
+    "양가 어른 생신 등 음력 날짜는 is_lunar=true로 저장하면 매년 양력 자동 변환.\n"
     "- Document/image attachments arrive as text starting with '[pdf 첨부 · …]' or "
     "'[image 첨부 · …]' or '[사진 첨부 · …]'. The header includes classified=<kind> hint: "
     "use it as a strong prior. receipt → log_expense, business_card → add_person, "
     "event/poster → add_event (+ gcal_create_event), document_text → save_note. "
     "Always extract the concrete details (date, place, name, amount) and call the right save tool — "
     "don't just acknowledge the upload.\n"
+    "- Forwarded messages arrive with '[forwarded from <sender>]' header — treat as "
+    "third-party content to summarize/extract/file (save_note + people if a new name appears), "
+    "not as the user's own speech. If a long contract/약관/이력서 PDF text is in there and the "
+    "user asks to 'read carefully' or 'check risks', call analyze_document.\n"
     "- Spending mention with a price ('스벅 6500원') → log_expense. Habit mention "
     "('운동 1시간', '책 30분') → log_habit. Both have inline-undo if mis-categorized.\n"
     "- Pre-emptive nudges (메일→일정 자동 카드, 출발 알림(leave-by), 골 D-30/14/3/1, 점심 안부 체크인) "
@@ -213,6 +219,60 @@ def _facts_block(chat_id: int) -> str:
     return "\n".join(f"  - {r['key']}: {r['value']}" for r in rows)
 
 
+def _solar_date_for(date_entry: Dict, this_year: int) -> Optional[Tuple[int, int, int]]:
+    """Resolve an important_date entry to (Y,M,D) in the solar calendar for
+    a given solar `this_year`. Honors `is_lunar=True` → convert via lunar.py."""
+    raw = (date_entry.get("date_local") or "").strip()
+    if not raw:
+        return None
+    try:
+        y, m, d = (int(x) for x in raw.split("-"))
+    except Exception:
+        return None
+    if date_entry.get("is_lunar"):
+        sd = lunar.lunar_to_solar_recurring(m, d, this_year)
+        if sd is None:
+            return None
+        return (sd.year, sd.month, sd.day)
+    return (y, m, d)
+
+
+def _date_matches_today(date_entry: Dict, today: "datetime.date") -> bool:
+    """True if the entry's recurring (or one-shot) date lands on `today`."""
+    resolved = _solar_date_for(date_entry, today.year)
+    if not resolved:
+        return False
+    _, m, d = resolved
+    if date_entry.get("recurring_yearly") or date_entry.get("is_lunar"):
+        return (today.month, today.day) == (m, d)
+    # one-shot: full date must match
+    return (resolved[0], m, d) == (today.year, today.month, today.day)
+
+
+def _days_until_recurring(date_entry: Dict, today: "datetime.date") -> Optional[int]:
+    """For a recurring/lunar entry, days until the next occurrence (≥0).
+    For a one-shot date, days until that exact date (can be negative)."""
+    import datetime as _dt
+    resolved = _solar_date_for(date_entry, today.year)
+    if not resolved:
+        return None
+    sd = _dt.date(*resolved)
+    if date_entry.get("recurring_yearly") or date_entry.get("is_lunar"):
+        if sd < today:
+            # roll to next year
+            next_year = today.year + 1
+            r2 = _solar_date_for(date_entry, next_year)
+            if not r2:
+                return None
+            sd = _dt.date(*r2)
+        return (sd - today).days
+    return (sd - today).days
+
+
+def _facts_block_deprecated_placeholder(_):  # safety: nothing
+    pass
+
+
 def _people_context_for_text(chat_id: int, text: str) -> str:
     """Build a one-block summary of every known person mentioned in `text`.
     Empty string if nothing matched. Also marks contact (last_contact_utc)."""
@@ -233,20 +293,13 @@ def _people_context_for_text(chat_id: int, text: str) -> str:
             except Exception:
                 pass
         dates = json.loads(p["important_dates_json"] or "[]")
+        today = datetime.now(TZ).date()
         for d in dates:
             try:
-                dt = datetime.fromisoformat(d["date_local"]).date()
-                today = datetime.now(TZ).date()
-                # For recurring yearly, compute this-year occurrence
-                if d.get("recurring_yearly"):
-                    this_year = dt.replace(year=today.year)
-                    if this_year < today:
-                        this_year = dt.replace(year=today.year + 1)
-                    days_left = (this_year - today).days
-                    bits.append(f"{d['label']} D-{days_left}")
-                else:
-                    days_left = (dt - today).days
-                    bits.append(f"{d['label']} D-{days_left}")
+                days_left = _days_until_recurring(d, today)
+                if days_left is None:
+                    continue
+                bits.append(f"{d['label']} D-{days_left}")
             except Exception:
                 pass
         lines.append("  - " + " · ".join(bits))
@@ -869,6 +922,56 @@ def tool_summarize_habits(chat_id: int, args: Dict) -> Dict:
 
 
 # ---------------- Korean-life helpers + wedding timeline ----------------
+
+
+DOC_ANALYZE_PROMPT = (
+    "다음 문서를 *비서 입장*에서 사용자가 놓칠 만한 위험·중요 조항·서명 전 물어봐야 할 "
+    "질문을 한국어로 분석해. 출력 마크다운 3 섹션:\n"
+    "## 🔴 위험 / 주의\n"
+    "## 🔑 핵심 조항\n"
+    "## ❓ 사용자가 상대에게 물어볼 질문\n\n"
+    "문서 종류 힌트: {hint}\n\n문서:\n{text}"
+)
+
+
+async def tool_analyze_document(chat_id: int, args: Dict) -> Dict:
+    text = (args.get("document_text") or "").strip()
+    if not text:
+        return {"ok": False, "error": "document_text required"}
+    hint = (args.get("doc_kind") or "unknown").strip()
+    prompt = DOC_ANALYZE_PROMPT.format(text=text[:8000], hint=hint)
+    try:
+        data = await chat_completion(
+            [{"role": "user", "content": prompt}],
+            tools=None, chat_id=chat_id, kind="ask", max_tokens=1500,
+        )
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "analysis_md": content, "doc_kind": hint}
+
+
+def tool_solar_term_check(chat_id: int, args: Dict) -> Dict:
+    d = (args.get("date_local") or "").strip()
+    if not d:
+        return {"ok": False, "error": "date_local required"}
+    return {
+        "ok": True, "date": d,
+        "today_term": lunar.solar_term_on(d),
+        "next_term": lunar.next_solar_term(d),
+    }
+
+
+def tool_lunar_to_solar(chat_id: int, args: Dict) -> Dict:
+    m = int(args.get("month") or 0)
+    d = int(args.get("day") or 0)
+    y = int(args.get("solar_year") or datetime.now(TZ).year)
+    if not m or not d:
+        return {"ok": False, "error": "month + day required"}
+    sd = lunar.lunar_to_solar_recurring(m, d, y)
+    if not sd:
+        return {"ok": False, "error": f"lunar {m}/{d} can't be resolved for {y}"}
+    return {"ok": True, "solar_date": sd.isoformat(), "lunar": {"month": m, "day": d}}
 
 
 def tool_korean_holiday_check(chat_id: int, args: Dict) -> Dict:
@@ -1494,6 +1597,8 @@ SYNC_HANDLERS = {
     "log_habit": tool_log_habit,
     "summarize_habits": tool_summarize_habits,
     "korean_holiday_check": tool_korean_holiday_check,
+    "solar_term_check": tool_solar_term_check,
+    "lunar_to_solar": tool_lunar_to_solar,
     "add_wedding_timeline": tool_add_wedding_timeline,
     "add_auto_rule": tool_add_auto_rule,
     "list_auto_rules": tool_list_auto_rules,
@@ -1761,13 +1866,12 @@ async def run_morning_briefing(chat_id: int) -> None:
 
     people_today = []
     person_ids_today: List[int] = []
-    today_md = today_local.strftime("%m-%d")
     for r in db.list_people(chat_id):
         for d in json.loads(r["important_dates_json"] or "[]"):
             try:
-                dt = datetime.fromisoformat(d["date_local"]).date()
-                if dt.strftime("%m-%d") == today_md:
-                    people_today.append(f"  - {r['name']}: {d['label']}")
+                if _date_matches_today(d, today_local):
+                    lunar_tag = " (음력)" if d.get("is_lunar") else ""
+                    people_today.append(f"  - {r['name']}: {d['label']}{lunar_tag}")
                     if r["id"] not in person_ids_today:
                         person_ids_today.append(r["id"])
             except Exception:
@@ -2313,16 +2417,28 @@ async def run_evening_preview(chat_id: int) -> None:
         except Exception:
             logger.exception("evening_preview: weather lookup failed")
 
+    # v6: also surface 24절기 (입추, 동지 etc.) if tomorrow is one.
+    solar_term = lunar.solar_term_on(tomorrow_local.isoformat())
+    # Heat / cold extremes from weather_info: 30+℃ → polite warning, ≤-5℃ → 한파
+    heat = bool(weather_info and (weather_info.get("tmax") or 0) >= 30)
+    cold = bool(weather_info and weather_info.get("tmin") is not None and weather_info["tmin"] <= -5)
+
     # Silence rule — skip if no signal.
     has_event = bool(items)
     is_holiday = holiday["is_holiday"]
     has_rain = bool(weather_info and (weather_info["rain_pct"] or 0) >= 30)
-    if not (has_event or is_holiday or has_rain):
+    if not (has_event or is_holiday or has_rain or solar_term or heat or cold):
         return
 
     parts = ["🌙 내일 미리보기"]
     if is_holiday:
         parts.append(f"  • 공휴일: {holiday['name']}")
+    if solar_term:
+        parts.append(f"  • 절기: {solar_term['name']}")
+    if heat:
+        parts.append("  • ⚠️ 폭염 — 물 자주 챙겨")
+    if cold:
+        parts.append("  • ⚠️ 한파 — 두꺼운 옷")
     if items:
         first = items[0]
         when = first["when_utc"].astimezone(TZ).strftime("%H:%M")
@@ -2352,18 +2468,14 @@ async def run_birthday_solo(chat_id: int) -> None:
     if not _toggle_on_local(chat_id, "birthday_alert_separate_enabled"):
         return
     today_local = datetime.now(TZ).date()
-    today_md = today_local.strftime("%m-%d")
     for p in db.list_people(chat_id):
         for d in json.loads(p["important_dates_json"] or "[]"):
-            try:
-                dt = datetime.fromisoformat(d["date_local"]).date()
-            except Exception:
-                continue
-            if dt.strftime("%m-%d") != today_md:
+            if not _date_matches_today(d, today_local):
                 continue
             role_bit = f" ({p['role']})" if p["role"] else ""
             label = d.get("label") or "기념일"
-            text = f"🎂 오늘 {p['name']}{role_bit} {label} — 한마디 어때?"
+            lunar_tag = " (음력)" if d.get("is_lunar") else ""
+            text = f"🎂 오늘 {p['name']}{role_bit} {label}{lunar_tag} — 한마디 어때?"
             kb = InlineKeyboardMarkup([[
                 InlineKeyboardButton("📩 메시지 초안", callback_data=f"act:bday_draft:{p['id']}"),
             ]])
@@ -3504,6 +3616,7 @@ async def tool_generate_image(chat_id: int, args: Dict) -> Dict:
 
 
 ASYNC_HANDLERS["generate_image"] = tool_generate_image
+ASYNC_HANDLERS["analyze_document"] = tool_analyze_document
 
 
 async def cmd_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4197,6 +4310,76 @@ async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text("\n".join(lines))
 
 
+async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/dashboard` — single-view: today, imminent goals, active missions,
+    recent self-improve, this-week cost, top nudge engagement."""
+    chat_id = update.effective_chat.id
+    today_local = datetime.now(TZ).date()
+    now_local = datetime.now(TZ)
+    end_today = now_local.replace(hour=23, minute=59, second=59)
+    items = await _merge_schedule(chat_id, now_local.astimezone(timezone.utc),
+                                    end_today.astimezone(timezone.utc))
+    goals_imminent = db.goals_due_within(chat_id, days=14)
+    missions = db.list_missions(chat_id, status="running")
+    cost = db.usage_summary(chat_id)
+    persona = db.get_latest_persona(chat_id)
+    override = db.get_prompt_override(chat_id)
+    nudges = db.nudge_stats_by_kind(chat_id, days=7)
+    streaks = db.list_habit_streaks(chat_id)
+
+    # People birthdays today (lunar-aware)
+    bdays = []
+    for p in db.list_people(chat_id):
+        for d in json.loads(p["important_dates_json"] or "[]"):
+            if _date_matches_today(d, today_local):
+                lt = " (음력)" if d.get("is_lunar") else ""
+                bdays.append(f"{p['name']}: {d['label']}{lt}")
+
+    solar_term = lunar.solar_term_on(today_local.isoformat())
+    next_term = lunar.next_solar_term(today_local.isoformat())
+
+    lines = [f"📋 Dashboard · {today_local.strftime('%Y-%m-%d (%a)')}"]
+    if solar_term:
+        lines.append(f"🌿 오늘 절기: {solar_term['name']}")
+    elif next_term:
+        lines.append(f"🌿 다음 절기: {next_term['name']} D-{next_term['days_until']}")
+    if bdays:
+        lines.append("🎂 오늘: " + ", ".join(bdays))
+    lines.append("")
+    lines.append(f"📅 오늘 일정 ({len(items)}건)")
+    for it in items[:5]:
+        when = it["when_utc"].astimezone(TZ).strftime("%H:%M")
+        lines.append(f"  • {when} {it['title']}")
+    if not items:
+        lines.append("  (없음)")
+    lines.append("")
+    lines.append(f"🎯 임박한 골 D-14 ({len(goals_imminent)}건)")
+    for g in goals_imminent[:5]:
+        d = _days_until(g["target_date_local"])
+        lines.append(f"  • D-{d} {g['title']}")
+    if not goals_imminent:
+        lines.append("  (없음)")
+    lines.append("")
+    if missions:
+        lines.append(f"🚀 진행 중 mission ({len(missions)}건)")
+        for m in missions[:3]:
+            lines.append(f"  • #{m['id']} {m['title']} — {m['current_hop']}/{m['max_hops']} hop · ${m['cost_usd_running']:.4f}")
+        lines.append("")
+    if streaks:
+        top = streaks[:3]
+        lines.append("💪 스트릭 top 3")
+        for s in top:
+            emoji = "🔥" if s["current_streak"] >= 7 else "✅" if s["current_streak"] >= 3 else "·"
+            lines.append(f"  {emoji} {s['habit_key']}: {s['current_streak']}일")
+        lines.append("")
+    lines.append(f"💰 이번 달 ${cost['month']['cost']:.4f} · 오늘 ${cost['today']['cost']:.4f}")
+    if persona:
+        lines.append(f"🧬 persona v{persona['version']} ({persona['generated_at'][:10]})")
+    if override:
+        lines.append(f"🤖 self-tune: {override[:60]}...")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     pending_gcal = [r for r in db.list_pending_gcal_sync() if r["chat_id"] == chat_id]
@@ -4852,8 +5035,22 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not update.message or not update.message.text:
         return
     user_text = update.message.text
-    logger.info("msg from %s: %r", update.effective_chat.id, user_text[:200])
-    await _process_user_text(update, context, user_text)
+    # v6: Forward detection — if the user forwarded a message from elsewhere
+    # (a friend's KakaoTalk-style note, a channel announcement, an email
+    # snippet), prepend a header so the agent treats it as third-party content
+    # to summarize/extract/file rather than as a direct conversation turn.
+    msg = update.message
+    prefix = ""
+    if getattr(msg, "forward_origin", None) or getattr(msg, "forward_from", None) \
+            or getattr(msg, "forward_from_chat", None) or getattr(msg, "forward_sender_name", None):
+        sender = (getattr(msg, "forward_sender_name", None)
+                  or (getattr(msg, "forward_from", None) and msg.forward_from.full_name)
+                  or (getattr(msg, "forward_from_chat", None) and msg.forward_from_chat.title)
+                  or "(이름 없음)")
+        prefix = f"[forwarded from {sender}]\n"
+    logger.info("msg from %s%s: %r", update.effective_chat.id,
+                 " (forward)" if prefix else "", user_text[:200])
+    await _process_user_text(update, context, prefix + user_text)
 
 
 BOT_COMMANDS: List[BotCommand] = [
@@ -4884,6 +5081,7 @@ BOT_COMMANDS: List[BotCommand] = [
     BotCommand("nudges", "능동 알림 토글 + 상태"),
     BotCommand("models", "현재 LLM 라우팅 + 커스텀 override"),
     BotCommand("metrics", "시스템 헬스 (에러 / 비용 / nudge 반응)"),
+    BotCommand("dashboard", "오늘 + 골 + mission + persona 한 통"),
     BotCommand("improvements", "봇이 자기를 어떻게 조정했는지 (Sun 10:00)"),
     BotCommand("rules", "자동 액션 규칙 (메일 자동, RSVP 자동)"),
     BotCommand("persona", "내가 누구인지 봇이 그린 인물 요약"),
@@ -4978,6 +5176,7 @@ def main() -> None:
     app.add_handler(CommandHandler("nudges", cmd_nudges))
     app.add_handler(CommandHandler("models", cmd_models))
     app.add_handler(CommandHandler("metrics", cmd_metrics))
+    app.add_handler(CommandHandler("dashboard", cmd_dashboard))
     app.add_handler(CommandHandler("improvements", cmd_improvements))
     app.add_handler(CommandHandler("rules", cmd_rules))
     app.add_handler(CommandHandler("persona", cmd_persona))
