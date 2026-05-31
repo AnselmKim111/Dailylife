@@ -594,6 +594,35 @@ TOOLS: List[Dict] = [
     {
         "type": "function",
         "function": {
+            "name": "find_duplicates",
+            "description": (
+                "Return potential duplicate people (same name) and duplicate facts (same key) "
+                "in the user's memory. Use before suggesting consolidation."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "merge_people",
+            "description": (
+                "Merge multiple person rows into one. Moves important_dates + aliases + "
+                "last_contact into keep_id, rewires all relations, then deletes drop_ids."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "keep_id": {"type": "integer"},
+                    "drop_ids": {"type": "array", "items": {"type": "integer"}},
+                },
+                "required": ["keep_id", "drop_ids"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "analyze_document",
             "description": (
                 "Deep-read a document (contract / 계약서 / 약관 / 이력서 / 보고서) that "

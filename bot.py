@@ -924,6 +924,99 @@ def tool_summarize_habits(chat_id: int, args: Dict) -> Dict:
 # ---------------- Korean-life helpers + wedding timeline ----------------
 
 
+def tool_find_duplicates(chat_id: int, args: Dict) -> Dict:
+    return {
+        "ok": True,
+        "duplicate_people": db.find_duplicate_people(chat_id),
+        "duplicate_facts": db.find_duplicate_facts(chat_id),
+    }
+
+
+def tool_merge_people(chat_id: int, args: Dict) -> Dict:
+    keep = int(args.get("keep_id") or 0)
+    drops = [int(x) for x in (args.get("drop_ids") or [])]
+    if not keep or not drops:
+        return {"ok": False, "error": "keep_id + non-empty drop_ids required"}
+    res = db.merge_people(chat_id, keep, drops)
+    return {"ok": "error" not in res, **res}
+
+
+# (SYNC_HANDLERS.update for find_duplicates/merge_people lives later, after the
+# SYNC_HANDLERS dict is defined.)
+
+
+async def cmd_macro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/macro` 목록 · `/macro save <name> <recipe>` 저장 · `/macro <name>` 실행 ·
+    `/macro delete <name>` 삭제."""
+    chat_id = update.effective_chat.id
+    args = list(context.args or [])
+    if not args:
+        rows = db.list_macros(chat_id)
+        if not rows:
+            await update.message.reply_text(
+                "🎬 매크로 없음.\n"
+                "저장: /macro save 출근체크 오늘 일정 + 날씨 + 미세먼지 요약해줘\n"
+                "실행: /macro 출근체크"
+            )
+            return
+        lines = ["🎬 저장된 매크로"]
+        for r in rows:
+            lines.append(f"  • {r['name']} — {r['prompt'][:60]}...")
+        await update.message.reply_text("\n".join(lines))
+        return
+    op = args[0].lower()
+    if op == "save" and len(args) >= 3:
+        name = args[1]
+        prompt = " ".join(args[2:])
+        mid = db.add_macro(chat_id, name, prompt)
+        if mid:
+            await update.message.reply_text(f"💾 매크로 '{name}' 저장")
+        else:
+            await update.message.reply_text(f"⚠ '{name}' 이미 있음 — 먼저 delete")
+        return
+    if op == "delete" and len(args) >= 2:
+        ok = db.delete_macro(chat_id, args[1])
+        await update.message.reply_text("🗑 삭제됨" if ok else "없음")
+        return
+    # /macro <name> — execute
+    name = args[0]
+    row = db.get_macro(chat_id, name)
+    if not row:
+        await update.message.reply_text(f"⚠ 매크로 '{name}' 없음")
+        return
+    await update.message.reply_text(f"▶️ 매크로 '{name}' 실행 중…")
+    try:
+        reply = await run_agent(chat_id, row["prompt"], history=[], max_hops=8, kind="chat")
+        for i in range(0, len(reply), 4000):
+            await update.message.reply_text(reply[i:i + 4000])
+    except Exception as e:
+        await update.message.reply_text(f"⚠ {e}")
+
+
+async def cmd_cleanup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/cleanup` 메모리 정리: 중복 사람·facts 보고 + 고아 relations 자동 삭제."""
+    chat_id = update.effective_chat.id
+    dup_people = db.find_duplicate_people(chat_id)
+    dup_facts = db.find_duplicate_facts(chat_id)
+    orphan = db.cleanup_orphan_relations(chat_id)
+    lines = ["🧹 메모리 정리"]
+    if dup_people:
+        lines.append(f"  • 중복 사람 {len(dup_people)}건:")
+        for d in dup_people[:5]:
+            lines.append(f"      - '{d['name']}' ids={d['ids']}")
+        lines.append("      LLM 한테 'merge_people 호출해줘' 시키면 합쳐줘")
+    else:
+        lines.append("  • 중복 사람: 없음")
+    if dup_facts:
+        lines.append(f"  • 중복 facts {len(dup_facts)}건:")
+        for d in dup_facts[:5]:
+            lines.append(f"      - '{d['key']}' ids={d['ids']}")
+    else:
+        lines.append("  • 중복 facts: 없음")
+    lines.append(f"  • 고아 relations 삭제: {orphan}건")
+    await update.message.reply_text("\n".join(lines))
+
+
 DOC_ANALYZE_PROMPT = (
     "다음 문서를 *비서 입장*에서 사용자가 놓칠 만한 위험·중요 조항·서명 전 물어봐야 할 "
     "질문을 한국어로 분석해. 출력 마크다운 3 섹션:\n"
@@ -2369,6 +2462,62 @@ async def run_leave_by_recompute(chat_id: int) -> None:
 # ----- Evening preview (tomorrow's first event + weather + holiday, terse) -----
 
 
+PREDICTIVE_PROMPT = (
+    "사용자의 내일 일정 + persona + 최근 행동 패턴을 보고 "
+    "*잊을 만한 한 두 가지*를 짧게 예측해. 한국어, 한 줄당 ≤40자, 최대 3개. "
+    "확실하지 않으면 빈 배열. JSON 배열만 출력: [\"등산화 챙겨\", \"축의금 5만\"].\n\n"
+    "내일 일정:\n{events}\n\n"
+    "persona snapshot:\n{persona}\n\n"
+    "최근 30일 지출 카테고리:\n{spend}\n\n"
+    "감지된 루틴:\n{routines}"
+)
+
+
+async def _predict_tomorrow_blindspots(chat_id: int, items: list) -> list:
+    """Best-effort: ask the LLM what the user is likely to forget about tomorrow.
+    Returns up to 3 short Korean strings. Silent on any failure."""
+    if not items:
+        return []
+    persona = db.get_latest_persona(chat_id)
+    persona_md = (persona["content_md"][:800] if persona else "(없음)")
+    spend = db.summarize_expenses(chat_id, days=30)
+    spend_summary = ", ".join(f"{c[0]}: ₩{c[1]:,}" for c in spend.get("by_category", [])[:5]) or "(없음)"
+    try:
+        rts = routines.detect_all(chat_id)
+        routines_md = json.dumps(rts, ensure_ascii=False)[:800]
+    except Exception:
+        routines_md = "(없음)"
+    events_md = "\n".join(
+        f"- {it['when_utc'].astimezone(TZ).strftime('%H:%M')} {it['title']}"
+        + (f" @{it['location']}" if it.get("location") else "")
+        for it in items[:6])
+    prompt = PREDICTIVE_PROMPT.format(
+        events=events_md, persona=persona_md,
+        spend=spend_summary, routines=routines_md,
+    )
+    try:
+        data = await chat_completion(
+            [{"role": "user", "content": prompt}],
+            tools=None, chat_id=chat_id, kind="mood_classify",  # haiku tier (cheap)
+            max_tokens=200,
+        )
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+    except Exception:
+        logger.exception("predictive nudge LLM failed")
+        return []
+    import re as _re
+    m = _re.search(r"\[[\s\S]*\]", content)
+    if not m:
+        return []
+    try:
+        parsed = json.loads(m.group(0))
+    except Exception:
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [str(x).strip()[:50] for x in parsed if str(x).strip()][:3]
+
+
 async def run_evening_preview(chat_id: int) -> None:
     """22:00 KST — single-line preview of tomorrow. Silent unless tomorrow has
     an event, is a Korean holiday, or weather flags rain/snow > 30%."""
@@ -2453,6 +2602,17 @@ async def run_evening_preview(chat_id: int) -> None:
         if has_rain:
             bits.append(f"비/눈 {weather_info['rain_pct']}% — 우산 챙겨")
         parts.append("  • " + ", ".join(bits))
+    # v7: predictive nudge — what might the user forget?
+    if items and not _toggle_off_local(chat_id, "predictive_nudge_enabled"):
+        try:
+            blind = await _predict_tomorrow_blindspots(chat_id, items)
+            if blind:
+                parts.append("")
+                parts.append("🔮 잊을 만한 거:")
+                for b in blind:
+                    parts.append(f"  • {b}")
+        except Exception:
+            logger.exception("predictive nudge attach failed (non-fatal)")
     try:
         await _app.bot.send_message(chat_id=chat_id, text="\n".join(parts))
     except Exception:
@@ -3693,7 +3853,10 @@ MISSION_SYSTEM_PROMPT = (
     "tick에 걸쳐 작업을 이어감. 매 tick마다 1-3개 tool call로 단계를 전진시키고, "
     "최종 답이 준비됐을 때만 tool call 없이 짧은 마크다운 결과를 반환. "
     "외부 액션 (메일/RSVP)은 사용자가 미리 등록한 auto_rules 통과한 것만 자동 실행. "
-    "그 외는 초안 제안 후 종료. cost가 한정돼 있으니 가능한 적은 hop으로 끝내."
+    "그 외는 초안 제안 후 종료. cost가 한정돼 있으니 가능한 적은 hop으로 끝내.\n\n"
+    "🔗 최종 결과 마크다운에는 모든 사실 주장 (가격·시간·운영시간·평점 등) 옆에 "
+    "URL 출처를 '[출처](url)' 형식으로 inline 표시. fetch_url/web_search 결과의 "
+    "원본 URL을 그대로 인용. 추측은 '?' 표시 후 검증 권유."
 )
 
 MISSION_FINAL_MARKER_TURNS = (5, 30, 90)  # minutes — checkpoint cadence buckets
@@ -3946,6 +4109,8 @@ def tool_add_relation(chat_id: int, args: Dict) -> Dict:
 SYNC_HANDLERS.update({
     "graph_query": tool_graph_query,
     "add_relation": tool_add_relation,
+    "find_duplicates": tool_find_duplicates,
+    "merge_people": tool_merge_people,
 })
 
 
@@ -5082,6 +5247,8 @@ BOT_COMMANDS: List[BotCommand] = [
     BotCommand("models", "현재 LLM 라우팅 + 커스텀 override"),
     BotCommand("metrics", "시스템 헬스 (에러 / 비용 / nudge 반응)"),
     BotCommand("dashboard", "오늘 + 골 + mission + persona 한 통"),
+    BotCommand("cleanup", "메모리 중복 정리 (사람 / facts / relations)"),
+    BotCommand("macro", "재사용 가능 명령 매크로 (save/delete/실행)"),
     BotCommand("improvements", "봇이 자기를 어떻게 조정했는지 (Sun 10:00)"),
     BotCommand("rules", "자동 액션 규칙 (메일 자동, RSVP 자동)"),
     BotCommand("persona", "내가 누구인지 봇이 그린 인물 요약"),
@@ -5177,6 +5344,8 @@ def main() -> None:
     app.add_handler(CommandHandler("models", cmd_models))
     app.add_handler(CommandHandler("metrics", cmd_metrics))
     app.add_handler(CommandHandler("dashboard", cmd_dashboard))
+    app.add_handler(CommandHandler("cleanup", cmd_cleanup))
+    app.add_handler(CommandHandler("macro", cmd_macro))
     app.add_handler(CommandHandler("improvements", cmd_improvements))
     app.add_handler(CommandHandler("rules", cmd_rules))
     app.add_handler(CommandHandler("persona", cmd_persona))

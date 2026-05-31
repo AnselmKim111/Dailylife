@@ -296,6 +296,16 @@ CREATE TABLE IF NOT EXISTS relations (
 CREATE INDEX IF NOT EXISTS idx_relations_from ON relations(chat_id, from_kind, from_id);
 CREATE INDEX IF NOT EXISTS idx_relations_to ON relations(chat_id, to_kind, to_id);
 
+CREATE TABLE IF NOT EXISTS macros (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    prompt TEXT NOT NULL,           -- the natural-language recipe
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(chat_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_macros_chat ON macros(chat_id);
+
 CREATE TABLE IF NOT EXISTS error_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts_utc TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -1833,6 +1843,143 @@ def error_counts_by_source(hours: int = 24) -> List[Dict]:
             "SELECT source, COUNT(*) AS n FROM error_log "
             "WHERE ts_utc>=? GROUP BY source ORDER BY n DESC LIMIT 10", (cutoff,)))
     return [dict(r) for r in rows]
+
+
+def add_macro(chat_id: int, name: str, prompt: str) -> Optional[int]:
+    with _conn() as c:
+        try:
+            cur = c.execute(
+                "INSERT INTO macros (chat_id, name, prompt) VALUES (?,?,?)",
+                (chat_id, name.strip(), prompt.strip()))
+            return cur.lastrowid
+        except sqlite3.IntegrityError:
+            return None  # duplicate name for this chat
+
+
+def get_macro(chat_id: int, name: str) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM macros WHERE chat_id=? AND name=?",
+            (chat_id, name.strip())).fetchone()
+
+
+def list_macros(chat_id: int) -> List[sqlite3.Row]:
+    with _conn() as c:
+        return list(c.execute(
+            "SELECT * FROM macros WHERE chat_id=? ORDER BY name", (chat_id,)))
+
+
+def delete_macro(chat_id: int, name: str) -> bool:
+    with _conn() as c:
+        cur = c.execute(
+            "DELETE FROM macros WHERE chat_id=? AND name=?",
+            (chat_id, name.strip()))
+        return cur.rowcount > 0
+
+
+def find_duplicate_people(chat_id: int) -> List[Dict]:
+    """Return candidate duplicate pairs based on name OR overlapping aliases."""
+    people = list_people(chat_id)
+    dups = []
+    by_name: Dict[str, List[Dict]] = {}
+    for p in people:
+        nm = (p["name"] or "").strip()
+        if not nm:
+            continue
+        by_name.setdefault(nm, []).append(dict(p))
+    for nm, rows in by_name.items():
+        if len(rows) > 1:
+            dups.append({"name": nm, "ids": [r["id"] for r in rows]})
+    return dups
+
+
+def merge_people(chat_id: int, keep_id: int, drop_ids: List[int]) -> Dict:
+    """Move important_dates, aliases, last_contact_utc from drop_ids into
+    keep_id, then delete the dropped rows. Also rewrites relations table."""
+    if not drop_ids:
+        return {"moved_dates": 0, "moved_aliases": 0, "rewired_relations": 0}
+    moved_dates = moved_aliases = rewired = 0
+    with _conn() as c:
+        keep = c.execute(
+            "SELECT * FROM people WHERE id=? AND chat_id=?",
+            (keep_id, chat_id)).fetchone()
+        if not keep:
+            return {"error": "keep_id not found"}
+        keep_dates = _json.loads(keep["important_dates_json"] or "[]")
+        keep_aliases = set(_json.loads(keep["aliases_json"] or "[]"))
+        last_contact = keep["last_contact_utc"]
+        for did in drop_ids:
+            d = c.execute(
+                "SELECT * FROM people WHERE id=? AND chat_id=?",
+                (did, chat_id)).fetchone()
+            if not d:
+                continue
+            for ed in _json.loads(d["important_dates_json"] or "[]"):
+                if ed not in keep_dates:
+                    keep_dates.append(ed); moved_dates += 1
+            for a in _json.loads(d["aliases_json"] or "[]"):
+                if a not in keep_aliases:
+                    keep_aliases.add(a); moved_aliases += 1
+            if d["last_contact_utc"] and (not last_contact or d["last_contact_utc"] > last_contact):
+                last_contact = d["last_contact_utc"]
+            # Rewrite relations
+            cur = c.execute(
+                "UPDATE relations SET from_id=? WHERE chat_id=? AND from_kind='person' AND from_id=?",
+                (keep_id, chat_id, did))
+            rewired += cur.rowcount
+            cur = c.execute(
+                "UPDATE relations SET to_id=? WHERE chat_id=? AND to_kind='person' AND to_id=?",
+                (keep_id, chat_id, did))
+            rewired += cur.rowcount
+            c.execute("DELETE FROM people WHERE id=? AND chat_id=?", (did, chat_id))
+        c.execute(
+            "UPDATE people SET important_dates_json=?, aliases_json=?, last_contact_utc=? "
+            "WHERE id=? AND chat_id=?",
+            (_json.dumps(keep_dates, ensure_ascii=False),
+             _json.dumps(sorted(keep_aliases), ensure_ascii=False),
+             last_contact, keep_id, chat_id))
+    return {"moved_dates": moved_dates, "moved_aliases": moved_aliases,
+            "rewired_relations": rewired, "dropped": len(drop_ids)}
+
+
+def find_duplicate_facts(chat_id: int) -> List[Dict]:
+    """Return facts with identical (case-folded) key. The most-recent wins
+    when consolidated."""
+    rows = list_facts(chat_id)
+    by_key: Dict[str, List[Dict]] = {}
+    for r in rows:
+        k = (r["key"] or "").strip().lower()
+        if not k:
+            continue
+        by_key.setdefault(k, []).append(dict(r))
+    return [{"key": k, "ids": sorted([r["id"] for r in v])}
+             for k, v in by_key.items() if len(v) > 1]
+
+
+def cleanup_orphan_relations(chat_id: int) -> int:
+    """Drop relations whose from_id or to_id no longer exists in the source table."""
+    dropped = 0
+    with _conn() as c:
+        # for each (kind, id) referenced, check existence
+        rows = list(c.execute(
+            "SELECT id, from_kind, from_id, to_kind, to_id FROM relations WHERE chat_id=?",
+            (chat_id,)))
+        for r in rows:
+            for kind, eid in (("from", r["from_id"]), ("to", r["to_id"])):
+                tk = r[f"{kind}_kind"]
+                table = {"person": "people", "event": "events", "goal": "goals",
+                          "note": "notes", "expense": "expenses",
+                          "mission": "missions"}.get(tk)
+                if not table:
+                    continue
+                exists = c.execute(
+                    f"SELECT 1 FROM {table} WHERE id=? AND chat_id=?",
+                    (eid, chat_id)).fetchone()
+                if not exists:
+                    c.execute("DELETE FROM relations WHERE id=?", (r["id"],))
+                    dropped += 1
+                    break
+    return dropped
 
 
 def cleanup_old_errors(days: int = 30) -> int:
