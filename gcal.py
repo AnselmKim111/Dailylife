@@ -33,7 +33,11 @@ REDIRECT_PATH = "/oauth/google/callback"
 # Multi-scope: Calendar (read+write) + Gmail (read-only). Space-separated as
 # Google requires. Existing tokens stay valid for whatever scope they were
 # issued under; a fresh /connect_gcal re-consents for the new scope set.
-SCOPE = "https://www.googleapis.com/auth/calendar https://www.googleapis.com/auth/gmail.readonly"
+SCOPE = (
+    "https://www.googleapis.com/auth/calendar "
+    "https://www.googleapis.com/auth/gmail.readonly "
+    "https://www.googleapis.com/auth/gmail.send"
+)
 AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 TOKEN_URL = "https://oauth2.googleapis.com/token"
 CAL_API_BASE = "https://www.googleapis.com/calendar/v3"
@@ -277,3 +281,75 @@ async def update_event(
 async def delete_event(chat_id: int, event_id: str, calendar_id: str = "primary") -> bool:
     await _api(chat_id, "DELETE", f"/calendars/{calendar_id}/events/{event_id}")
     return True
+
+
+async def respond_to_invite(
+    chat_id: int,
+    event_id: str,
+    response: str,
+    calendar_id: str = "primary",
+) -> Dict[str, Any]:
+    """Set the user's responseStatus on a calendar invite.
+
+    Google Calendar exposes attendees as an array on the event body; to RSVP
+    we need to fetch the event, find our own entry by email, patch its
+    responseStatus, then PATCH the whole event back. Returns the updated row."""
+    if response not in {"accepted", "declined", "tentative"}:
+        raise ValueError(f"unsupported response: {response}")
+    ev = await _api(chat_id, "GET", f"/calendars/{calendar_id}/events/{event_id}")
+    attendees = ev.get("attendees") or []
+    # Identify self — Google flags it with `self: True`.
+    self_idx = next((i for i, a in enumerate(attendees) if a.get("self")), None)
+    if self_idx is None:
+        # Best-effort: also look up the primary calendar's email.
+        try:
+            cal = await _api(chat_id, "GET", f"/calendars/{calendar_id}")
+            my_email = (cal.get("id") or "").lower()
+        except Exception:
+            my_email = ""
+        self_idx = next(
+            (i for i, a in enumerate(attendees)
+             if (a.get("email") or "").lower() == my_email),
+            None,
+        )
+    if self_idx is None:
+        raise ValueError("you are not an attendee on this event")
+    attendees[self_idx]["responseStatus"] = response
+    body = {"attendees": attendees}
+    return await _api(
+        chat_id, "PATCH", f"/calendars/{calendar_id}/events/{event_id}",
+        json_body=body,
+    )
+
+
+async def list_pending_invites(
+    chat_id: int,
+    days_ahead: int = 14,
+    calendar_id: str = "primary",
+) -> list:
+    """Return future events where the user is an attendee with
+    responseStatus='needsAction'. Used by the invite-watch cron."""
+    params = {
+        "singleEvents": "true",
+        "orderBy": "startTime",
+        "maxResults": 50,
+        "timeMin": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "timeMax": (datetime.now(timezone.utc) + timedelta(days=days_ahead)).isoformat().replace("+00:00", "Z"),
+    }
+    data = await _api(chat_id, "GET", f"/calendars/{calendar_id}/events", params=params)
+    pending = []
+    for e in data.get("items", []):
+        attendees = e.get("attendees") or []
+        me = next((a for a in attendees if a.get("self")), None)
+        if not me or me.get("responseStatus") != "needsAction":
+            continue
+        organizer = (e.get("organizer") or {}).get("email")
+        pending.append({
+            "id": e.get("id"),
+            "summary": e.get("summary"),
+            "start": (e.get("start") or {}).get("dateTime") or (e.get("start") or {}).get("date"),
+            "location": e.get("location"),
+            "organizer_email": organizer,
+            "attendees": [(a.get("email") or "") for a in attendees],
+        })
+    return pending

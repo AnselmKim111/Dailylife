@@ -200,6 +200,50 @@ CREATE TABLE IF NOT EXISTS goal_milestones_sent (
     sent_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
     PRIMARY KEY (goal_id, milestone)
 );
+
+CREATE TABLE IF NOT EXISTS auto_rules (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    rule_kind TEXT NOT NULL,           -- 'gmail_auto_add_event' | 'gcal_auto_rsvp'
+    condition_json TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_auto_rules_chat ON auto_rules(chat_id, enabled);
+
+CREATE TABLE IF NOT EXISTS agent_actions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    action_kind TEXT NOT NULL,         -- 'gmail_send'|'gcal_rsvp'|'event_auto_add'|...
+    summary TEXT NOT NULL,             -- single-line human-readable
+    payload_json TEXT NOT NULL,        -- full execution detail
+    reversible_json TEXT,              -- {kind, args} or NULL if non-undoable
+    status TEXT NOT NULL DEFAULT 'executed',  -- executed|reversed|digested
+    digested_at TEXT,
+    executed_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_agent_actions_chat ON agent_actions(chat_id, executed_at DESC);
+
+CREATE TABLE IF NOT EXISTS persona_doc (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    version INTEGER NOT NULL,
+    content_md TEXT NOT NULL,
+    sources_json TEXT NOT NULL DEFAULT '{}',
+    generated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(chat_id, version)
+);
+CREATE INDEX IF NOT EXISTS idx_persona_chat ON persona_doc(chat_id, version DESC);
+
+CREATE TABLE IF NOT EXISTS habit_streaks (
+    chat_id INTEGER NOT NULL,
+    habit_key TEXT NOT NULL,
+    current_streak INTEGER NOT NULL DEFAULT 0,
+    best_streak INTEGER NOT NULL DEFAULT 0,
+    last_log_date TEXT,                -- YYYY-MM-DD KST
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    PRIMARY KEY (chat_id, habit_key)
+);
 """
 
 _lock = threading.Lock()
@@ -223,6 +267,10 @@ _MIGRATIONS: List[Tuple[str, str, str]] = [
     # Populated by morning briefing; consumed by 09:00 birthday-solo cron.
     ("daily_state", "birthdays_today_json", "TEXT"),
     ("daily_state", "midday_checkin_sent", "INTEGER NOT NULL DEFAULT 0"),
+    # v4 additions
+    ("daily_state", "mood_sentiment", "TEXT"),  # 'positive'|'neutral'|'negative'
+    ("daily_state", "learning_question_asked", "INTEGER NOT NULL DEFAULT 0"),
+    ("daily_state", "learning_question_key", "TEXT"),  # what fact/person we asked about
 ]
 
 
@@ -1278,6 +1326,222 @@ def mark_midday_checkin_sent(chat_id: int, date_local: str) -> None:
             "ON CONFLICT(chat_id, date_local) DO UPDATE SET midday_checkin_sent=1",
             (chat_id, date_local),
         )
+
+
+def set_mood_sentiment(chat_id: int, date_local: str, sentiment: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO daily_state (chat_id, date_local, mood_sentiment) VALUES (?,?,?) "
+            "ON CONFLICT(chat_id, date_local) DO UPDATE SET mood_sentiment=excluded.mood_sentiment",
+            (chat_id, date_local, sentiment),
+        )
+
+
+def mark_learning_question_asked(chat_id: int, date_local: str, key: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO daily_state (chat_id, date_local, learning_question_asked, learning_question_key) "
+            "VALUES (?,?,1,?) ON CONFLICT(chat_id, date_local) DO UPDATE SET "
+            "learning_question_asked=1, learning_question_key=excluded.learning_question_key",
+            (chat_id, date_local, key),
+        )
+
+
+def recent_mood_stats(chat_id: int, days: int = 30) -> Dict:
+    cutoff = (datetime.now(timezone.utc).date() - timedelta(days=days)).isoformat()
+    with _conn() as c:
+        rows = list(c.execute(
+            "SELECT mood_sentiment, COUNT(*) AS n FROM daily_state "
+            "WHERE chat_id=? AND date_local>=? AND mood_sentiment IS NOT NULL "
+            "GROUP BY mood_sentiment",
+            (chat_id, cutoff),
+        ))
+    return {r["mood_sentiment"]: r["n"] for r in rows}
+
+
+# ---------------- auto_rules (sent-consent rule engine) ----------------
+
+
+def add_auto_rule(chat_id: int, rule_kind: str, condition: Dict) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO auto_rules (chat_id, rule_kind, condition_json) VALUES (?,?,?)",
+            (chat_id, rule_kind, _json.dumps(condition, ensure_ascii=False)),
+        )
+        return cur.lastrowid
+
+
+def list_auto_rules(chat_id: int, only_enabled: bool = True) -> List[sqlite3.Row]:
+    with _conn() as c:
+        if only_enabled:
+            return list(c.execute(
+                "SELECT * FROM auto_rules WHERE chat_id=? AND enabled=1 ORDER BY id",
+                (chat_id,)))
+        return list(c.execute(
+            "SELECT * FROM auto_rules WHERE chat_id=? ORDER BY id", (chat_id,)))
+
+
+def disable_auto_rule(chat_id: int, rule_id: int) -> bool:
+    with _conn() as c:
+        cur = c.execute(
+            "UPDATE auto_rules SET enabled=0 WHERE chat_id=? AND id=?",
+            (chat_id, rule_id))
+        return cur.rowcount > 0
+
+
+def delete_auto_rule(chat_id: int, rule_id: int) -> bool:
+    with _conn() as c:
+        cur = c.execute(
+            "DELETE FROM auto_rules WHERE chat_id=? AND id=?", (chat_id, rule_id))
+        return cur.rowcount > 0
+
+
+# ---------------- agent_actions (audit log for autonomous actions) ----------------
+
+
+def log_agent_action(
+    chat_id: int,
+    action_kind: str,
+    summary: str,
+    payload: Dict,
+    reversible: Optional[Dict] = None,
+) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO agent_actions (chat_id, action_kind, summary, payload_json, reversible_json) "
+            "VALUES (?,?,?,?,?)",
+            (chat_id, action_kind, summary,
+             _json.dumps(payload, ensure_ascii=False),
+             _json.dumps(reversible, ensure_ascii=False) if reversible else None),
+        )
+        return cur.lastrowid
+
+
+def list_undigested_actions(chat_id: int) -> List[sqlite3.Row]:
+    with _conn() as c:
+        return list(c.execute(
+            "SELECT * FROM agent_actions WHERE chat_id=? AND status='executed' "
+            "AND digested_at IS NULL ORDER BY executed_at ASC",
+            (chat_id,)))
+
+
+def mark_actions_digested(chat_id: int, ids: List[int]) -> None:
+    if not ids:
+        return
+    placeholders = ",".join("?" * len(ids))
+    with _conn() as c:
+        c.execute(
+            f"UPDATE agent_actions SET digested_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+            f"WHERE chat_id=? AND id IN ({placeholders})",
+            (chat_id, *ids))
+
+
+def get_agent_action(chat_id: int, action_id: int) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM agent_actions WHERE chat_id=? AND id=?",
+            (chat_id, action_id)).fetchone()
+
+
+def mark_action_reversed(chat_id: int, action_id: int) -> None:
+    with _conn() as c:
+        c.execute(
+            "UPDATE agent_actions SET status='reversed' WHERE chat_id=? AND id=?",
+            (chat_id, action_id))
+
+
+# ---------------- persona_doc ----------------
+
+
+def get_latest_persona(chat_id: int) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM persona_doc WHERE chat_id=? ORDER BY version DESC LIMIT 1",
+            (chat_id,)).fetchone()
+
+
+def save_persona(chat_id: int, content_md: str, sources: Dict) -> int:
+    cur_version = 0
+    latest = get_latest_persona(chat_id)
+    if latest:
+        cur_version = latest["version"]
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO persona_doc (chat_id, version, content_md, sources_json) "
+            "VALUES (?,?,?,?)",
+            (chat_id, cur_version + 1, content_md,
+             _json.dumps(sources, ensure_ascii=False)))
+        return cur.lastrowid
+
+
+def cleanup_old_personas(keep_recent: int = 8) -> int:
+    """Drop persona_doc rows older than `keep_recent` versions per chat."""
+    with _conn() as c:
+        deleted = 0
+        for r in c.execute("SELECT DISTINCT chat_id FROM persona_doc"):
+            cid = r["chat_id"]
+            rows = list(c.execute(
+                "SELECT id FROM persona_doc WHERE chat_id=? ORDER BY version DESC",
+                (cid,)))
+            stale = [row["id"] for row in rows[keep_recent:]]
+            if stale:
+                placeholders = ",".join("?" * len(stale))
+                c.execute(f"DELETE FROM persona_doc WHERE id IN ({placeholders})", stale)
+                deleted += len(stale)
+        return deleted
+
+
+# ---------------- habit_streaks ----------------
+
+
+def upsert_habit_streak(
+    chat_id: int, habit_key: str,
+    current_streak: int, last_log_date: str,
+) -> None:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT best_streak FROM habit_streaks WHERE chat_id=? AND habit_key=?",
+            (chat_id, habit_key)).fetchone()
+        best = max(current_streak, row["best_streak"] if row else 0)
+        c.execute(
+            "INSERT INTO habit_streaks (chat_id, habit_key, current_streak, best_streak, last_log_date, updated_at) "
+            "VALUES (?,?,?,?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now')) "
+            "ON CONFLICT(chat_id, habit_key) DO UPDATE SET "
+            "current_streak=excluded.current_streak, best_streak=excluded.best_streak, "
+            "last_log_date=excluded.last_log_date, updated_at=excluded.updated_at",
+            (chat_id, habit_key, current_streak, best, last_log_date))
+
+
+def get_habit_streak(chat_id: int, habit_key: str) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM habit_streaks WHERE chat_id=? AND habit_key=?",
+            (chat_id, habit_key)).fetchone()
+
+
+def list_habit_streaks(chat_id: int) -> List[sqlite3.Row]:
+    with _conn() as c:
+        return list(c.execute(
+            "SELECT * FROM habit_streaks WHERE chat_id=? ORDER BY current_streak DESC",
+            (chat_id,)))
+
+
+def habit_logs_by_date(chat_id: int, habit_key: str, days: int = 60) -> List[str]:
+    """Return distinct date_local (YYYY-MM-DD) strings where this habit was logged."""
+    cutoff = (datetime.now(_USER_TZ) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")
+    with _conn() as c:
+        rows = list(c.execute(
+            "SELECT DISTINCT substr(when_local, 1, 10) AS d FROM habits "
+            "WHERE chat_id=? AND habit_key=? AND when_local>=? ORDER BY d",
+            (chat_id, habit_key, cutoff)))
+    return [r["d"] for r in rows]
+
+
+def all_habit_keys(chat_id: int) -> List[str]:
+    with _conn() as c:
+        rows = list(c.execute(
+            "SELECT DISTINCT habit_key FROM habits WHERE chat_id=?", (chat_id,)))
+    return [r["habit_key"] for r in rows]
 
 
 def find_people_in_text(chat_id: int, text: str) -> List[sqlite3.Row]:

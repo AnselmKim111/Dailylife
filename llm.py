@@ -846,6 +846,171 @@ TOOLS: List[Dict] = [
             },
         },
     },
+    # ---- v4: outbound Gmail + GCal RSVP ----
+    {
+        "type": "function",
+        "function": {
+            "name": "gmail_send_email",
+            "description": (
+                "Send a new email on the user's behalf. Use only when the user "
+                "explicitly asks to send a mail, or the request can clearly only be "
+                "fulfilled by sending one (e.g. '내가 좀 늦는다고 메일 보내줘'). "
+                "Always include a short body — no empty messages. Default subject if user didn't give one."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string", "description": "Recipient email."},
+                    "subject": {"type": "string"},
+                    "body_text": {"type": "string"},
+                },
+                "required": ["to", "subject", "body_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "gmail_save_draft",
+            "description": (
+                "Save an email as a Gmail draft (does NOT send). Use when the user "
+                "wants to review before sending, or when an auto-rule wants to "
+                "stage a reply for human approval."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to": {"type": "string"},
+                    "subject": {"type": "string"},
+                    "body_text": {"type": "string"},
+                },
+                "required": ["to", "subject", "body_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "gmail_reply_to",
+            "description": (
+                "Reply to a specific Gmail message (threaded). `in_reply_to_msg_id` "
+                "is the Gmail message id you saw in a recent search/get result."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "in_reply_to_msg_id": {"type": "string"},
+                    "body_text": {"type": "string"},
+                    "to": {"type": "string", "description": "Optional override. Defaults to source's From: header."},
+                    "subject": {"type": "string", "description": "Optional. Defaults to 'Re: <source subject>'."},
+                },
+                "required": ["in_reply_to_msg_id", "body_text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "gcal_rsvp",
+            "description": (
+                "RSVP to a Google Calendar invite — accepted/declined/tentative. "
+                "Use when the user asks to accept/decline a meeting they were invited to, "
+                "or when an auto-rule fires."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "event_id": {"type": "string"},
+                    "response": {"type": "string", "enum": ["accepted", "declined", "tentative"]},
+                },
+                "required": ["event_id", "response"],
+            },
+        },
+    },
+    # ---- v4: rule engine ----
+    {
+        "type": "function",
+        "function": {
+            "name": "add_auto_rule",
+            "description": (
+                "Register a sent-consent rule for an autonomous action. "
+                "rule_kind ∈ {'gmail_auto_add_event', 'gcal_auto_rsvp'}. "
+                "Condition examples: "
+                "{'sender_pattern': '@hyundaicard.com', 'min_confidence': 0.9} for gmail, "
+                "{'from_people_names': ['경서','관현'], 'response': 'accepted'} for rsvp."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "rule_kind": {"type": "string"},
+                    "condition": {"type": "object"},
+                },
+                "required": ["rule_kind", "condition"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_auto_rules",
+            "description": "List active rules so the user can review them.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "disable_auto_rule",
+            "description": "Disable a single rule by id.",
+            "parameters": {
+                "type": "object",
+                "properties": {"rule_id": {"type": "integer"}},
+                "required": ["rule_id"],
+            },
+        },
+    },
+    # ---- v4: cross-table recall ----
+    {
+        "type": "function",
+        "function": {
+            "name": "cross_recall",
+            "description": (
+                "Pull every record across people + events + goals + notes + expenses "
+                "+ chat_log that mentions a given entity (name or keyword). Use "
+                "FIRST when the user asks 'X 관련된 거 다 보여줘' or 'tell me everything "
+                "about X' — better than firing individual list/search tools."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "entity": {"type": "string"},
+                    "days": {"type": "integer", "description": "Lookback days for events/expenses/log. Default 180."},
+                },
+                "required": ["entity"],
+            },
+        },
+    },
+    # ---- v4: routines + streaks ----
+    {
+        "type": "function",
+        "function": {
+            "name": "detect_routines",
+            "description": (
+                "Run pattern mining on the user's events/expenses/habits and return "
+                "weekly routines, recurring spending, and habit gaps. The user can then "
+                "confirm to promote any of them to a recurring task or expense alert."
+            ),
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "get_habit_streaks",
+            "description": "Return current and best streak for every habit the user logs.",
+            "parameters": {"type": "object", "properties": {}},
+        },
+    },
 ]
 
 

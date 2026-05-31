@@ -30,6 +30,7 @@ import gcal
 import gmail as gmail_mod
 import korean_calendar
 import oauth_server
+import routines
 import scheduler
 import transcribe
 import weather as weather_mod
@@ -76,7 +77,16 @@ SYSTEM_PROMPT_TEMPLATE = (
     "('운동 1시간', '책 30분') → log_habit. Both have inline-undo if mis-categorized.\n"
     "- Pre-emptive nudges (메일→일정 자동 카드, 출발 알림(leave-by), 골 D-30/14/3/1, 점심 안부 체크인) "
     "are armed by per-chat crons. If the user says '시끄러워' / '꺼' / '알림 줄여' point them to "
-    "/nudges for toggles instead of arguing.\n\n"
+    "/nudges for toggles instead of arguing.\n"
+    "- Cross-entity recall (X 관련된 거 다, X에 대해 정리) → cross_recall FIRST instead of "
+    "firing list_events/search_memory separately.\n"
+    "- Outbound actions on the user's behalf are enabled: gmail_send_email / gmail_reply_to / "
+    "gcal_rsvp work. Only fire them when the user explicitly asks ('메일 보내줘', "
+    "'회의 수락해줘') OR an auto_rule matched (which the runner enforces, you don't gate). "
+    "Otherwise PROPOSE the draft and ask.\n"
+    "- Coaching tone: when habits broken or goals slipping, warm rather than scolding "
+    "('괜찮아, 내일 다시 시작'). Single exception — goal at D-7 with 0% progress: "
+    "be honest, suggest pause vs push.\n\n"
     "Known facts about this user:\n{facts_block}"
 )
 
@@ -227,6 +237,14 @@ def _system_message(chat_id: int, recent_user_text: str = "") -> Dict:
     base = SYSTEM_PROMPT_TEMPLATE.format(
         tz=USER_TZ, now=now_local, facts_block=_facts_block(chat_id)
     )
+    # v4: inject the latest persona doc as the most up-to-date model of the user.
+    persona = db.get_latest_persona(chat_id)
+    if persona:
+        base = (
+            f"About this user (persona v{persona['version']}, refreshed "
+            f"{persona['generated_at'][:10]}):\n{persona['content_md']}\n\n"
+            + base
+        )
     if recent_user_text:
         people_ctx = _people_context_for_text(chat_id, recent_user_text)
         if people_ctx:
@@ -595,19 +613,89 @@ def tool_add_goal(chat_id: int, args: Dict) -> Dict:
     title = (args.get("title") or "").strip()
     if not title:
         return {"ok": False, "error": "title required"}
+    target = args.get("target_date_local")
+    sub_tasks = args.get("sub_tasks") or []
     gid = db.add_goal(
         chat_id,
         title,
         why=args.get("why"),
-        target_date_local=args.get("target_date_local"),
+        target_date_local=target,
         horizon=args.get("horizon", "long"),
-        sub_tasks=args.get("sub_tasks") or [],
+        sub_tasks=sub_tasks,
         watch_query=args.get("watch_query"),
     )
-    # First time a goal is added on this chat, ensure the proactive + daily-rhythm crons are armed.
     scheduler.ensure_proactive_for(chat_id)
     scheduler.ensure_daily_rhythm_for(chat_id)
-    return {"ok": True, "goal_id": gid}
+    # v4: long-horizon goals with no sub_tasks → auto-decompose in background.
+    auto_queued = False
+    if (target and not sub_tasks
+            and not _toggle_off_local(chat_id, "auto_decompose_enabled")):
+        try:
+            target_date = datetime.fromisoformat(target).date()
+            days_ahead = (target_date - datetime.now(TZ).date()).days
+            if days_ahead > 28:
+                asyncio.create_task(_try_auto_decompose_goal(chat_id, gid, title,
+                                                              args.get("why"), days_ahead))
+                auto_queued = True
+        except Exception:
+            logger.exception("auto_decompose enqueue failed for goal %s", gid)
+    return {"ok": True, "goal_id": gid, "auto_decompose_queued": auto_queued}
+
+
+async def _try_auto_decompose_goal(
+    chat_id: int, goal_id: int, title: str,
+    why: Optional[str], days_ahead: int,
+) -> None:
+    """Background micro-LLM: propose 4-6 weekly micro-actions, append as sub_tasks."""
+    prompt = (
+        "사용자의 장기 골을 주간 단위 micro-action 4-6개로 분해해. "
+        "각각 30자 이내. JSON 배열만 출력 (예: [\"운동 주 3회\", \"항공권 알리미 등록\"]).\n\n"
+        f"골 제목: {title}\n"
+        f"이유: {why or '(없음)'}\n"
+        f"target: D-{days_ahead}\n"
+    )
+    try:
+        data = await chat_completion(
+            [{"role": "user", "content": prompt}],
+            tools=None, chat_id=chat_id, kind="auto_decompose", max_tokens=300,
+        )
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+    except Exception:
+        logger.exception("auto_decompose LLM call failed")
+        return
+    import re as _re
+    blob = _re.sub(r"^\s*```(?:json)?\s*", "", content, flags=_re.IGNORECASE)
+    blob = _re.sub(r"\s*```\s*$", "", blob)
+    m = _re.search(r"\[[\s\S]*\]", blob)
+    if not m:
+        return
+    try:
+        tasks = json.loads(m.group(0))
+    except Exception:
+        return
+    if not isinstance(tasks, list):
+        return
+    cleaned = [str(t).strip()[:60] for t in tasks if str(t).strip()]
+    cleaned = cleaned[:6]
+    if not cleaned:
+        return
+    for text in cleaned:
+        db.add_goal_subtask(goal_id, chat_id, text)
+    if _app and _app.bot:
+        try:
+            await _app.bot.send_message(
+                chat_id=chat_id,
+                text=f"🎯 골 #{goal_id} 자동 분해 — {len(cleaned)}개 sub_task 추가\n  • "
+                     + "\n  • ".join(cleaned)
+                     + "\n\n수정·삭제는 /goals 에서 가능. 자동 분해 끄려면 `/nudges off decompose`.",
+            )
+            db.log_agent_action(
+                chat_id, "auto_decompose",
+                summary=f"골 #{goal_id} 분해 {len(cleaned)}개",
+                payload={"goal_id": goal_id, "sub_tasks": cleaned},
+            )
+        except Exception:
+            logger.exception("auto_decompose notify failed")
 
 
 def tool_list_goals(chat_id: int, args: Dict) -> Dict:
@@ -720,7 +808,23 @@ def tool_log_habit(chat_id: int, args: Dict) -> Dict:
         duration_min=int(args["duration_min"]) if args.get("duration_min") is not None else None,
         notes=args.get("notes"),
     )
-    return {"ok": True, "habit_id": hid}
+    # Bump streak now (don't wait for nightly cron) so the LLM can comment.
+    today_local = datetime.now(TZ).date()
+    today_iso = today_local.isoformat()
+    yesterday_iso = (today_local - timedelta(days=1)).isoformat()
+    prev = db.get_habit_streak(chat_id, key)
+    new_streak = 1
+    if prev and prev["last_log_date"] == today_iso:
+        new_streak = prev["current_streak"]  # second log same day — no change
+    elif prev and prev["last_log_date"] == yesterday_iso:
+        new_streak = prev["current_streak"] + 1
+    db.upsert_habit_streak(chat_id, key, new_streak, today_iso)
+    streak_row = db.get_habit_streak(chat_id, key)
+    return {
+        "ok": True, "habit_id": hid,
+        "current_streak": streak_row["current_streak"] if streak_row else new_streak,
+        "best_streak": streak_row["best_streak"] if streak_row else new_streak,
+    }
 
 
 def tool_summarize_habits(chat_id: int, args: Dict) -> Dict:
@@ -1154,6 +1258,176 @@ async def tool_gmail_recent_summary(chat_id: int, args: Dict) -> Dict:
         return {"ok": False, "error": str(e)}
 
 
+# ---------------- v4 tool handlers (outbound, rules, recall, streaks) ----------------
+
+
+async def tool_gmail_send_email(chat_id: int, args: Dict) -> Dict:
+    try:
+        res = await gmail_mod.send_message(
+            chat_id, args["to"], args["subject"], args["body_text"],
+        )
+        action_id = db.log_agent_action(
+            chat_id, "gmail_send",
+            summary=f"메일 보냄 → {args['to']} · {args['subject'][:40]}",
+            payload={"to": args["to"], "subject": args["subject"],
+                     "body_preview": args["body_text"][:200],
+                     "gmail_message_id": res.get("id")},
+            reversible=None,  # email send is not undoable
+        )
+        return {"ok": True, "gmail_message_id": res.get("id"), "agent_action_id": action_id}
+    except gcal.NotConnected as e:
+        return {"ok": False, "error": str(e), "needs_connect": True}
+    except Exception as e:
+        logger.exception("gmail_send_email failed")
+        return {"ok": False, "error": str(e)}
+
+
+async def tool_gmail_save_draft(chat_id: int, args: Dict) -> Dict:
+    try:
+        res = await gmail_mod.draft_message(
+            chat_id, args["to"], args["subject"], args["body_text"])
+        return {"ok": True, "draft_id": res.get("id")}
+    except gcal.NotConnected as e:
+        return {"ok": False, "error": str(e), "needs_connect": True}
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
+async def tool_gmail_reply_to(chat_id: int, args: Dict) -> Dict:
+    try:
+        # Resolve recipient + subject from source if not supplied
+        to_addr = args.get("to")
+        subject = args.get("subject")
+        if not to_addr or not subject:
+            src = await gmail_mod.get_message(chat_id, args["in_reply_to_msg_id"], body_max_chars=100)
+            if not to_addr:
+                to_addr = (src.get("from") or "").strip()
+            if not subject:
+                src_sub = src.get("subject") or ""
+                subject = src_sub if src_sub.lower().startswith("re:") else f"Re: {src_sub}"
+        res = await gmail_mod.send_message(
+            chat_id, to_addr, subject, args["body_text"],
+            in_reply_to_msg_id=args["in_reply_to_msg_id"],
+        )
+        action_id = db.log_agent_action(
+            chat_id, "gmail_reply",
+            summary=f"메일 답장 → {to_addr} · {subject[:40]}",
+            payload={"to": to_addr, "subject": subject,
+                     "in_reply_to": args["in_reply_to_msg_id"],
+                     "body_preview": args["body_text"][:200]},
+        )
+        return {"ok": True, "gmail_message_id": res.get("id"), "agent_action_id": action_id}
+    except gcal.NotConnected as e:
+        return {"ok": False, "error": str(e), "needs_connect": True}
+    except Exception as e:
+        logger.exception("gmail_reply_to failed")
+        return {"ok": False, "error": str(e)}
+
+
+async def tool_gcal_rsvp(chat_id: int, args: Dict) -> Dict:
+    try:
+        ev = await gcal.respond_to_invite(chat_id, args["event_id"], args["response"])
+        summary = ev.get("summary") or "(제목 없음)"
+        action_id = db.log_agent_action(
+            chat_id, "gcal_rsvp",
+            summary=f"RSVP {args['response']} → {summary[:40]}",
+            payload={"event_id": args["event_id"], "response": args["response"]},
+            reversible={"kind": "gcal_rsvp", "args": {"event_id": args["event_id"], "response": "tentative"}},
+        )
+        return {"ok": True, "event_id": args["event_id"],
+                "response": args["response"], "agent_action_id": action_id}
+    except gcal.NotConnected as e:
+        return {"ok": False, "error": str(e), "needs_connect": True}
+    except Exception as e:
+        logger.exception("gcal_rsvp failed")
+        return {"ok": False, "error": str(e)}
+
+
+def tool_add_auto_rule(chat_id: int, args: Dict) -> Dict:
+    rule_kind = args.get("rule_kind")
+    cond = args.get("condition") or {}
+    if rule_kind not in ("gmail_auto_add_event", "gcal_auto_rsvp"):
+        return {"ok": False, "error": f"unsupported rule_kind {rule_kind}"}
+    rid = db.add_auto_rule(chat_id, rule_kind, cond)
+    return {"ok": True, "rule_id": rid}
+
+
+def tool_list_auto_rules(chat_id: int, args: Dict) -> Dict:
+    rows = db.list_auto_rules(chat_id, only_enabled=False)
+    return {"ok": True, "rules": [
+        {"id": r["id"], "rule_kind": r["rule_kind"],
+         "condition": json.loads(r["condition_json"]),
+         "enabled": bool(r["enabled"])}
+        for r in rows]}
+
+
+def tool_disable_auto_rule(chat_id: int, args: Dict) -> Dict:
+    rid = int(args.get("rule_id") or 0)
+    if not rid:
+        return {"ok": False, "error": "rule_id required"}
+    return {"ok": db.disable_auto_rule(chat_id, rid)}
+
+
+def tool_cross_recall(chat_id: int, args: Dict) -> Dict:
+    """Aggregate everything mentioning `entity` across all silos."""
+    entity = (args.get("entity") or "").strip()
+    if not entity:
+        return {"ok": False, "error": "entity required"}
+    days = int(args.get("days") or 180)
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    lowered = entity.lower()
+    like = f"%{entity}%"
+    out: Dict = {"entity": entity}
+    # People
+    out["people"] = [dict(p) for p in db.find_people_in_text(chat_id, entity)]
+    # Events
+    with db._conn() as c:
+        out["events"] = [{"id": r["id"], "title": r["title"], "when_utc": r["when_utc"],
+                          "location": r["location"], "notes": r["notes"]}
+                          for r in c.execute(
+            "SELECT * FROM events WHERE chat_id=? AND (title LIKE ? OR notes LIKE ? OR location LIKE ?) "
+            "AND when_utc>=? ORDER BY when_utc DESC LIMIT 20",
+            (chat_id, like, like, like, cutoff))]
+        out["goals"] = [{"id": r["id"], "title": r["title"], "why": r["why"],
+                          "status": r["status"], "target": r["target_date_local"]}
+                         for r in c.execute(
+            "SELECT * FROM goals WHERE chat_id=? AND "
+            "(title LIKE ? OR why LIKE ? OR sub_tasks_json LIKE ?) ORDER BY id DESC LIMIT 10",
+            (chat_id, like, like, like))]
+        out["notes"] = [{"id": r["id"], "content": r["content"][:200], "created_at": r["created_at"]}
+                         for r in c.execute(
+            "SELECT * FROM notes WHERE chat_id=? AND (content LIKE ? OR tags LIKE ?) "
+            "AND created_at>=? ORDER BY created_at DESC LIMIT 10",
+            (chat_id, like, like, cutoff))]
+        out["expenses"] = [{"id": r["id"], "amount_won": r["amount_won"],
+                             "merchant": r["merchant"], "category": r["category"],
+                             "when_local": r["when_local"]}
+                            for r in c.execute(
+            "SELECT * FROM expenses WHERE chat_id=? AND (merchant LIKE ? OR notes LIKE ?) "
+            "AND when_local>=? ORDER BY when_local DESC LIMIT 15",
+            (chat_id, like, like,
+             (datetime.now(TZ) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%S")))]
+        out["chat_log"] = [{"role": r["role"], "content": r["content"][:200],
+                             "created_at": r["created_at"]}
+                            for r in c.execute(
+            "SELECT * FROM chat_log WHERE chat_id=? AND content LIKE ? AND created_at>=? "
+            "ORDER BY created_at DESC LIMIT 8",
+            (chat_id, like, cutoff))]
+    return {"ok": True, **out}
+
+
+def tool_detect_routines(chat_id: int, args: Dict) -> Dict:
+    return {"ok": True, **routines.detect_all(chat_id)}
+
+
+def tool_get_habit_streaks(chat_id: int, args: Dict) -> Dict:
+    rows = db.list_habit_streaks(chat_id)
+    return {"ok": True, "streaks": [
+        {"habit_key": r["habit_key"], "current_streak": r["current_streak"],
+         "best_streak": r["best_streak"], "last_log_date": r["last_log_date"]}
+        for r in rows]}
+
+
 SYNC_HANDLERS = {
     "add_event": tool_add_event,
     "list_events": tool_list_events,
@@ -1185,6 +1459,12 @@ SYNC_HANDLERS = {
     "summarize_habits": tool_summarize_habits,
     "korean_holiday_check": tool_korean_holiday_check,
     "add_wedding_timeline": tool_add_wedding_timeline,
+    "add_auto_rule": tool_add_auto_rule,
+    "list_auto_rules": tool_list_auto_rules,
+    "disable_auto_rule": tool_disable_auto_rule,
+    "cross_recall": tool_cross_recall,
+    "detect_routines": tool_detect_routines,
+    "get_habit_streaks": tool_get_habit_streaks,
 }
 
 ASYNC_HANDLERS = {
@@ -1199,6 +1479,10 @@ ASYNC_HANDLERS = {
     "gmail_search": tool_gmail_search,
     "gmail_get_message": tool_gmail_get_message,
     "gmail_recent_summary": tool_gmail_recent_summary,
+    "gmail_send_email": tool_gmail_send_email,
+    "gmail_save_draft": tool_gmail_save_draft,
+    "gmail_reply_to": tool_gmail_reply_to,
+    "gcal_rsvp": tool_gcal_rsvp,
     "weather": tool_weather,
     "track_parcel": tool_track_parcel,
     "transit_text_query": tool_transit_text_query,
@@ -1627,6 +1911,27 @@ async def _extract_event_from_email_text(body: str, *, hint_now_kst: str) -> Opt
 _NOISY_EMAIL_KEYWORDS = ("광고", "홍보", "스팸", "마케팅", "unsubscribe", "프로모션", "이벤트 안내")
 
 
+def _gmail_auto_add_rule_match(chat_id: int, msg: Dict, cls: Dict) -> Optional[Dict]:
+    """Check if any active gmail_auto_add_event rule matches this message + classifier result.
+    Returns the matched rule dict (or None). All rules conjunctively check sender + min_conf."""
+    sender = (msg.get("from") or "").lower()
+    conf = float(cls.get("confidence", 0.0))
+    for r in db.list_auto_rules(chat_id):
+        if r["rule_kind"] != "gmail_auto_add_event":
+            continue
+        try:
+            cond = json.loads(r["condition_json"])
+        except Exception:
+            continue
+        sp = (cond.get("sender_pattern") or "").lower().strip()
+        if sp and sp not in sender:
+            continue
+        if conf < float(cond.get("min_confidence", 0.85)):
+            continue
+        return cond
+    return None
+
+
 async def run_gmail_event_scan(chat_id: int) -> None:
     """Poll Gmail for recently received messages that look like events; surface
     a card with [✅ 추가] / [✏️ 수정] / [❌ 아님] buttons. Every msg_id is dedup'd
@@ -1672,6 +1977,32 @@ async def run_gmail_event_scan(chat_id: int) -> None:
         if not candidate:
             db.mark_gmail_processed(chat_id, mid, "low_conf")
             continue
+        # v4: auto-rule check (gmail_auto_add_event). If any rule matches the
+        # message + confidence + sender pattern, skip the card and execute now.
+        rule_auto = _gmail_auto_add_rule_match(chat_id, msg, cls)
+        if rule_auto and not _toggle_off_local(chat_id, "auto_rules_enabled"):
+            try:
+                when_utc = _parse_local_iso(candidate["when_local"])
+                eid = db.add_event(
+                    chat_id, candidate["title"][:80], when_utc,
+                    notes=candidate.get("source_summary"),
+                    remind_lead_minutes=30,
+                    location=(candidate.get("location") or "").strip() or None,
+                )
+                db.mark_gmail_processed(chat_id, mid, "added")
+                db.log_agent_action(
+                    chat_id, "event_auto_add",
+                    summary=f"메일 → 일정 자동 추가 · {candidate['title'][:40]}",
+                    payload={"gmail_id": mid, "event_id": eid,
+                             "when_local": candidate["when_local"], "from": msg.get("from")},
+                    reversible={"kind": "event_delete", "args": {"event_id": eid}},
+                )
+                row = db.get_event(eid)
+                if row:
+                    scheduler.schedule_for(row)
+                continue
+            except Exception:
+                logger.exception("auto add_event failed; falling back to card")
         # Build card.
         token = secrets.token_urlsafe(8)
         _pending_mail_cards[token] = {
@@ -1965,6 +2296,394 @@ async def run_midday_checkin(chat_id: int) -> None:
         logger.exception("midday checkin send failed")
 
 
+# ---------------- v4 runners: persona, invites, digest, streaks, scorecard, learning, budget ----------------
+
+
+PERSONA_REBUILD_PROMPT = (
+    "다음 사용자 데이터를 보고 비서가 항상 참고할 '인물 요약'을 작성해. "
+    "한국어 마크다운. 6 섹션 — 각 섹션 2-3줄, 총 600자 이내. 추측 금지, "
+    "데이터에 근거한 것만. 빈 섹션은 '(아직 데이터 부족)'.\n\n"
+    "### 1) 루틴 (요일·시간 패턴)\n"
+    "### 2) 관심사 (자주 등장 주제)\n"
+    "### 3) 관계 (핵심 인물 + 마지막 상호작용)\n"
+    "### 4) 감정·스트레스 (리플렉션 톤)\n"
+    "### 5) 목표 진행 (활성 골 + 진척)\n"
+    "### 6) 말투 (사용자 말투 메모 — 봇이 따라야 할 것)\n\n"
+    "데이터:\n{payload}"
+)
+
+
+async def run_persona_rebuild(chat_id: int) -> None:
+    """Sun 09:30 — rebuild persona_doc from chat_log + reflections + facts +
+    people + spending + habits + routines. Saves new version, surfaces 1-line
+    confirmation in chat."""
+    if _toggle_off_local(chat_id, "persona_rebuild_enabled"):
+        return
+    # Gather inputs
+    facts = [(f["key"], f["value"]) for f in db.list_facts(chat_id)]
+    people = [(p["name"], p["role"] or "", p["last_contact_utc"] or "")
+              for p in db.list_people(chat_id)]
+    goals_open = [(g["title"], g["target_date_local"] or "", g["why"] or "")
+                  for g in db.list_goals(chat_id, status="open")]
+    reflections = [(r["date_local"], r["reflection_response"] or "", r["mood_sentiment"] or "")
+                   for r in db.recent_reflections(chat_id, days=28)]
+    spend = db.summarize_expenses(chat_id, days=30)
+    habits_sum = db.summarize_habits(chat_id, days=28)
+    routine_hints = routines.detect_all(chat_id)
+    chat_log_excerpt = []
+    if not _toggle_off_local(chat_id, "persona_chat_scan_enabled"):
+        # last 28d of user messages, capped
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=28)).isoformat()
+        with db._conn() as c:
+            for r in c.execute(
+                "SELECT content FROM chat_log WHERE chat_id=? AND role='user' AND created_at>=? "
+                "ORDER BY created_at DESC LIMIT 80",
+                (chat_id, cutoff)):
+                chat_log_excerpt.append(r["content"][:200])
+
+    payload = {
+        "facts": facts,
+        "people": people,
+        "open_goals": goals_open,
+        "reflections": reflections[:14],
+        "spending_30d": {"total_won": spend.get("total_won", 0),
+                          "by_category": spend.get("by_category", [])[:6]},
+        "habits_28d": habits_sum.get("by_habit", []),
+        "detected_routines": routine_hints,
+        "recent_user_messages_sample": chat_log_excerpt[:30],
+    }
+    prompt = PERSONA_REBUILD_PROMPT.format(payload=json.dumps(payload, ensure_ascii=False))
+    try:
+        data = await chat_completion(
+            [{"role": "user", "content": prompt}],
+            tools=None, chat_id=chat_id, kind="persona_rebuild", max_tokens=1200,
+        )
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+    except Exception:
+        logger.exception("persona rebuild LLM failed")
+        return
+    if not content:
+        return
+    sources = {
+        "facts_n": len(facts), "people_n": len(people),
+        "goals_n": len(goals_open), "reflections_n": len(reflections),
+        "chat_log_n": len(chat_log_excerpt),
+    }
+    db.save_persona(chat_id, content, sources)
+    if _app and _app.bot:
+        try:
+            latest = db.get_latest_persona(chat_id)
+            await _app.bot.send_message(
+                chat_id=chat_id,
+                text=f"🧬 인물 요약 v{latest['version']} 갱신 완료. `/persona`로 열람.",
+            )
+        except Exception:
+            pass
+
+
+# ---------- Rule engine helpers ----------
+
+
+def _rule_matches_gcal_invite(rule_cond: Dict, invite: Dict, chat_id: int) -> Optional[str]:
+    """Return RSVP response string if rule matches, else None."""
+    names = rule_cond.get("from_people_names") or []
+    emails = rule_cond.get("from_emails") or []
+    response = rule_cond.get("response", "accepted")
+    org = (invite.get("organizer_email") or "").lower()
+    if emails and any(e.lower() in org for e in emails):
+        return response
+    if names:
+        # match by people table: any registered person whose name appears in invite
+        people = db.list_people(chat_id)
+        for p in people:
+            if p["name"] in names:
+                # check if any attendee email roughly matches their notes (best-effort)
+                notes = (p["notes"] or "").lower()
+                for att in invite.get("attendees", []):
+                    if att and notes and att.lower() in notes:
+                        return response
+                # if organizer name is in subject/title hint
+                if (invite.get("summary") or "") and p["name"] in (invite["summary"] or ""):
+                    return response
+    return None
+
+
+async def run_gcal_invite_watch(chat_id: int) -> None:
+    """Every 30min: pull needsAction invites. Auto-RSVP on matched rules,
+    otherwise surface a card with [✅ Yes] [❔ Maybe] [❌ No]."""
+    if _toggle_off_local(chat_id, "auto_rules_enabled"):
+        return
+    if not db.get_oauth_token(chat_id, "google"):
+        return
+    try:
+        pending = await gcal.list_pending_invites(chat_id, days_ahead=14)
+    except Exception:
+        logger.exception("list_pending_invites failed")
+        return
+    if not pending:
+        return
+    rules = [r for r in db.list_auto_rules(chat_id)
+             if r["rule_kind"] == "gcal_auto_rsvp"]
+    for inv in pending:
+        # try rules first
+        matched = None
+        for r in rules:
+            try:
+                cond = json.loads(r["condition_json"])
+            except Exception:
+                continue
+            resp = _rule_matches_gcal_invite(cond, inv, chat_id)
+            if resp:
+                matched = resp
+                break
+        if matched:
+            try:
+                await gcal.respond_to_invite(chat_id, inv["id"], matched)
+                db.log_agent_action(
+                    chat_id, "gcal_rsvp",
+                    summary=f"자동 RSVP {matched} → {(inv.get('summary') or '(제목 없음)')[:40]}",
+                    payload={"event_id": inv["id"], "response": matched,
+                             "rule_match": True},
+                    reversible={"kind": "gcal_rsvp",
+                                 "args": {"event_id": inv["id"], "response": "tentative"}},
+                )
+                logger.info("auto-RSVP'd invite %s as %s", inv["id"], matched)
+            except Exception:
+                logger.exception("auto-RSVP failed for %s", inv["id"])
+            continue
+        # No rule → manual card
+        if _app and _app.bot:
+            kb = InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Yes", callback_data=f"act:rsvp_yes:{inv['id']}"),
+                InlineKeyboardButton("❔ Maybe", callback_data=f"act:rsvp_maybe:{inv['id']}"),
+                InlineKeyboardButton("❌ No", callback_data=f"act:rsvp_no:{inv['id']}"),
+            ]])
+            text = f"📨 GCal 초대 미응답\n• {inv.get('summary') or '(제목 없음)'}"
+            if inv.get("start"):
+                text += f"\n• {inv['start']}"
+            if inv.get("location"):
+                text += f"\n• {inv['location']}"
+            try:
+                await _app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+            except Exception:
+                logger.exception("invite card send failed")
+
+
+async def run_agent_digest(chat_id: int) -> None:
+    """21:45 — single message listing today's autonomous actions, each with [↩️]."""
+    if _toggle_off_local(chat_id, "agent_digest_enabled"):
+        return
+    rows = db.list_undigested_actions(chat_id)
+    if not rows:
+        return
+    if _app is None or _app.bot is None:
+        return
+    lines = ["📋 오늘 봇이 자율로 한 일"]
+    ids: List[int] = []
+    for r in rows[:15]:
+        lines.append(f"  • #{r['id']} {r['summary']}")
+        ids.append(r["id"])
+    text = "\n".join(lines)
+    # Inline keyboard with single-button per action (up to 5; the rest text-only)
+    btn_rows = []
+    for r in rows[:5]:
+        if r["reversible_json"]:
+            btn_rows.append([InlineKeyboardButton(
+                f"↩️ #{r['id']} 취소", callback_data=f"act:agent_undo:{r['id']}")])
+    kb = InlineKeyboardMarkup(btn_rows) if btn_rows else None
+    try:
+        await _app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+        db.mark_actions_digested(chat_id, ids)
+    except Exception:
+        logger.exception("agent_digest send failed")
+
+
+async def run_streak_compute(chat_id: int) -> None:
+    """00:30 — for each habit_key, decide today's streak based on yesterday's log."""
+    if _toggle_off_local(chat_id, "streak_compute_enabled"):
+        return
+    today = datetime.now(TZ).date()
+    yesterday = today - timedelta(days=1)
+    for key in db.all_habit_keys(chat_id):
+        dates = set(db.habit_logs_by_date(chat_id, key, days=60))
+        prev = db.get_habit_streak(chat_id, key)
+        if yesterday.isoformat() in dates:
+            new_streak = (prev["current_streak"] + 1) if prev else 1
+            db.upsert_habit_streak(chat_id, key, new_streak, yesterday.isoformat())
+        else:
+            # streak broken
+            if prev and prev["current_streak"] > 0:
+                db.upsert_habit_streak(chat_id, key, 0, prev["last_log_date"] or "")
+
+
+async def run_weekly_scorecard(chat_id: int) -> None:
+    """Sun 18:00 — 4-section scorecard (goals / habits / spending / mood)."""
+    if _app is None or _app.bot is None:
+        return
+    if _toggle_off_local(chat_id, "weekly_scorecard_enabled"):
+        return
+    lines = ["📊 이번 주 스코어카드", ""]
+
+    # 1) goals
+    goals = db.list_goals(chat_id, status="open")
+    lines.append("🎯 골 진척")
+    if not goals:
+        lines.append("  (활성 골 없음)")
+    else:
+        for g in goals[:5]:
+            subs = json.loads(g["sub_tasks_json"] or "[]")
+            done = sum(1 for s in subs if s.get("done"))
+            total = len(subs)
+            pct = int(100 * done / total) if total else 0
+            d = ""
+            if g["target_date_local"]:
+                try:
+                    days = (datetime.fromisoformat(g["target_date_local"]).date()
+                            - datetime.now(TZ).date()).days
+                    d = f" · D-{days}"
+                except Exception:
+                    pass
+            lines.append(f"  • {g['title']}{d}: {done}/{total} ({pct}%)")
+    lines.append("")
+
+    # 2) habits
+    lines.append("💪 습관 스트릭")
+    streaks = db.list_habit_streaks(chat_id)
+    if not streaks:
+        lines.append("  (스트릭 없음 — log_habit으로 시작)")
+    else:
+        for s in streaks[:6]:
+            emoji = "🔥" if s["current_streak"] >= 7 else "✅" if s["current_streak"] >= 3 else "·"
+            lines.append(f"  {emoji} {s['habit_key']}: {s['current_streak']}일 (최고 {s['best_streak']})")
+    lines.append("")
+
+    # 3) spending
+    cur = db.summarize_expenses(chat_id, days=7)
+    prev = db.summarize_expenses(chat_id, days=14)
+    prev_total = max(prev["total_won"] - cur["total_won"], 0)
+    lines.append("💰 지출")
+    lines.append(f"  • 이번 주 ₩{cur['total_won']:,} ({cur['count']}건)")
+    if prev_total:
+        delta = cur["total_won"] - prev_total
+        sign = "+" if delta >= 0 else ""
+        pct = int(100 * delta / prev_total) if prev_total else 0
+        lines.append(f"  • 지난주 ₩{prev_total:,} 대비 {sign}{delta:,} ({sign}{pct}%)")
+    if cur["by_category"]:
+        top = cur["by_category"][0]
+        lines.append(f"  • 1위 카테고리: {top[0]} ₩{top[1]:,}")
+    lines.append("")
+
+    # 4) mood
+    moods = db.recent_mood_stats(chat_id, days=7)
+    if moods:
+        total = sum(moods.values())
+        bits = []
+        for k in ("positive", "neutral", "negative"):
+            if k in moods:
+                bits.append(f"{k} {int(100 * moods[k] / total)}%")
+        lines.append("🌙 무드: " + ", ".join(bits))
+    else:
+        lines.append("🌙 무드: (회고 응답 부족)")
+    try:
+        await _app.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+    except Exception:
+        logger.exception("weekly scorecard send failed")
+
+
+# ---- Active learning: hourly gap detection ----
+
+
+_GAP_QUESTIONS: List[Dict] = [
+    {"key": "home_address",
+     "ask": "🏠 집 주소 한 번 알려줄래? leave-by 알림이 정확해져.",
+     "needed": lambda chat_id: "home_address" not in {f["key"] for f in db.list_facts(chat_id)}},
+    {"key": "work_address",
+     "ask": "🏢 직장(혹은 자대) 주소 알려줄래? 출근/이동 시간 계산에 써.",
+     "needed": lambda chat_id: "work_address" not in {f["key"] for f in db.list_facts(chat_id)}},
+    {"key": "monthly_food_budget",
+     "ask": "💰 한 달 식비 예산 얼마로 잡고 있어? (예: 30만)",
+     "needed": lambda chat_id: "monthly_food_budget" not in {f["key"] for f in db.list_facts(chat_id)}},
+    {"key": "people_role_missing",
+     "ask": None,  # filled at runtime
+     "needed": lambda chat_id: any(not p["role"] for p in db.list_people(chat_id))},
+]
+
+
+def _next_gap_question(chat_id: int) -> Optional[Dict]:
+    for q in _GAP_QUESTIONS:
+        try:
+            if q["needed"](chat_id):
+                if q["key"] == "people_role_missing":
+                    person = next((p for p in db.list_people(chat_id) if not p["role"]), None)
+                    if person:
+                        return {"key": f"role:{person['id']}",
+                                "ask": f"👤 {person['name']}은(는) 어떤 관계야? (친구 / 가족 / 약혼녀 / 동료 / 동기 ...)"}
+                return q
+        except Exception:
+            continue
+    return None
+
+
+async def run_active_learning(chat_id: int) -> None:
+    """Daily HH:MM — ask one memory-gap question. Skip if already asked today."""
+    if _app is None or _app.bot is None:
+        return
+    if _toggle_off_local(chat_id, "active_learning_enabled"):
+        return
+    today_iso = datetime.now(TZ).date().isoformat()
+    state = db.get_daily_state(chat_id, today_iso)
+    if state and state["learning_question_asked"]:
+        return
+    q = _next_gap_question(chat_id)
+    if not q:
+        return
+    try:
+        await _app.bot.send_message(chat_id=chat_id, text=q["ask"])
+        db.mark_learning_question_asked(chat_id, today_iso, q["key"])
+    except Exception:
+        logger.exception("active_learning send failed")
+
+
+async def run_budget_check(chat_id: int) -> None:
+    """Daily 08:30 — for each `monthly_<cat>_budget` fact, alert when ≥80% or ≥100%."""
+    if _app is None or _app.bot is None:
+        return
+    if _toggle_off_local(chat_id, "budget_alert_enabled"):
+        return
+    facts_map = {f["key"]: f["value"] for f in db.list_facts(chat_id)}
+    today = datetime.now(TZ).date()
+    days_in_month = today.day
+    cur = db.summarize_expenses(chat_id, days=days_in_month)
+    by_cat = dict(cur["by_category"])
+    alerts: List[str] = []
+    for key, val in facts_map.items():
+        if not key.startswith("monthly_") or not key.endswith("_budget"):
+            continue
+        cat = key[len("monthly_"):-len("_budget")]
+        try:
+            budget = int(val)
+        except ValueError:
+            continue
+        # category match by Korean alias (식비 vs food etc.)
+        spent = by_cat.get(cat, 0)
+        # try Korean alias too
+        for k2 in by_cat:
+            if k2 and (cat in k2 or k2 in cat):
+                spent = max(spent, by_cat[k2])
+        if budget <= 0:
+            continue
+        pct = int(100 * spent / budget)
+        if pct >= 100:
+            alerts.append(f"⚠️ {cat} 예산 ₩{budget:,} 초과 — 이번 달 ₩{spent:,} ({pct}%)")
+        elif pct >= 80:
+            alerts.append(f"💸 {cat} 예산 ₩{budget:,} 의 {pct}% 도달 — 이번 달 ₩{spent:,}")
+    if alerts:
+        try:
+            await _app.bot.send_message(chat_id=chat_id, text="\n".join(alerts))
+        except Exception:
+            logger.exception("budget alert send failed")
+
+
 # ---------------- Telegram handlers ----------------
 
 
@@ -2239,6 +2958,16 @@ _NUDGE_KEYS = {
     "브리핑":     ("briefing_enabled",                  True,  "아침 브리핑"),
     "reflect":    ("reflection_enabled",                True,  "저녁 회고"),
     "회고":       ("reflection_enabled",                True,  "저녁 회고"),
+    # v4
+    "persona":    ("persona_rebuild_enabled",           True,  "인물 요약 재생성"),
+    "rules":      ("auto_rules_enabled",                True,  "자동 규칙 마스터"),
+    "digest":     ("agent_digest_enabled",              True,  "어제 봇이 한 일 디지스트"),
+    "decompose":  ("auto_decompose_enabled",            True,  "골 자동 분해"),
+    "scorecard":  ("weekly_scorecard_enabled",          True,  "주간 스코어카드"),
+    "streak":     ("streak_compute_enabled",            True,  "스트릭 계산"),
+    "budget":     ("budget_alert_enabled",              True,  "예산 알림"),
+    "learning":   ("active_learning_enabled",           True,  "하루 1 질문"),
+    "voice":      ("voice_replies_enabled",             False, "음성 답장 (cost)"),
 }
 
 
@@ -2329,6 +3058,181 @@ async def cmd_nudges(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(
         "사용법: /nudges (상태) | /nudges on|off <alias> | /nudges <alias> HH:MM"
     )
+
+
+async def cmd_rules(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/rules` 목록 · `/rules add <자연어>` LLM이 JSON 변환 · `/rules off <id>` 비활성화."""
+    chat_id = update.effective_chat.id
+    args = list(context.args or [])
+    if not args:
+        rows = db.list_auto_rules(chat_id, only_enabled=False)
+        if not rows:
+            await update.message.reply_text(
+                "🤖 자동 규칙 없음.\n"
+                "사용: /rules add 신세계상품권 메일은 자동으로 일정 추가\n"
+                "      /rules add 경서 보낸 GCal 초대는 자동 yes\n"
+                "      /rules off <id>"
+            )
+            return
+        lines = ["🤖 자동 규칙"]
+        for r in rows:
+            status = "ON " if r["enabled"] else "OFF"
+            cond = r["condition_json"]
+            lines.append(f"  • #{r['id']} [{status}] {r['rule_kind']} {cond}")
+        await update.message.reply_text("\n".join(lines))
+        return
+    op = args[0].lower()
+    if op == "off" and len(args) >= 2:
+        try:
+            rid = int(args[1])
+        except ValueError:
+            await update.message.reply_text("rule_id는 숫자여야 해.")
+            return
+        ok = db.disable_auto_rule(chat_id, rid)
+        await update.message.reply_text(
+            f"🔕 규칙 #{rid} 비활성화" if ok else f"#{rid} 못 찾음.")
+        return
+    if op == "add" and len(args) >= 2:
+        raw = " ".join(args[1:]).strip()
+        # LLM converts NL → JSON
+        prompt = (
+            "사용자가 비서 자동 규칙을 자연어로 묘사했어. JSON으로 변환해서 한 줄만 출력:\n"
+            '{"rule_kind": "gmail_auto_add_event"|"gcal_auto_rsvp", "condition": {...}}\n'
+            "examples:\n"
+            "  - 신세계 메일 자동 일정 → {\"rule_kind\":\"gmail_auto_add_event\","
+            "\"condition\":{\"sender_pattern\":\"@shinsegae\",\"min_confidence\":0.85}}\n"
+            "  - 경서 초대 자동 yes → {\"rule_kind\":\"gcal_auto_rsvp\","
+            "\"condition\":{\"from_people_names\":[\"경서\"],\"response\":\"accepted\"}}\n"
+            f"\n사용자 문장: {raw}\n\nJSON만 출력."
+        )
+        try:
+            data = await chat_completion(
+                [{"role": "user", "content": prompt}],
+                tools=None, chat_id=chat_id, kind="rule_parse", max_tokens=200,
+            )
+            content = (data["choices"][0]["message"].get("content") or "").strip()
+        except Exception:
+            await update.message.reply_text("⚠ LLM 변환 실패.")
+            return
+        import re as _re
+        m = _re.search(r"\{[\s\S]*\}", content)
+        if not m:
+            await update.message.reply_text(f"⚠ JSON 파싱 실패:\n{content[:200]}")
+            return
+        try:
+            parsed = json.loads(m.group(0))
+            rid = db.add_auto_rule(chat_id, parsed["rule_kind"], parsed["condition"])
+            await update.message.reply_text(
+                f"🤖 규칙 #{rid} 등록\n  • kind: {parsed['rule_kind']}\n  • cond: {parsed['condition']}"
+            )
+        except Exception as e:
+            await update.message.reply_text(f"⚠ 등록 실패: {e}")
+        return
+    await update.message.reply_text(
+        "사용: /rules | /rules add <자연어> | /rules off <id>")
+
+
+async def cmd_persona(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/persona` 최신 인물 요약 · `/persona rebuild` 지금 재생성."""
+    chat_id = update.effective_chat.id
+    arg = (context.args[0] if context.args else "").strip().lower()
+    if arg == "rebuild":
+        await update.message.reply_text("🧬 인물 요약 재생성 중… (조금 걸려)")
+        scheduler.trigger_persona_rebuild_now(chat_id)
+        return
+    p = db.get_latest_persona(chat_id)
+    if not p:
+        await update.message.reply_text(
+            "🧬 아직 인물 요약 없음. /persona rebuild 로 생성 가능."
+        )
+        return
+    text = (
+        f"🧬 인물 요약 v{p['version']} (갱신 {p['generated_at'][:10]})\n\n"
+        + p["content_md"]
+    )
+    for i in range(0, len(text), 4000):
+        await update.message.reply_text(text[i:i + 4000])
+
+
+async def cmd_recall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/recall <엔티티>` cross-table 회수."""
+    chat_id = update.effective_chat.id
+    if not context.args:
+        await update.message.reply_text("사용: /recall 경서")
+        return
+    entity = " ".join(context.args).strip()
+    res = tool_cross_recall(chat_id, {"entity": entity})
+    lines = [f"🔎 '{entity}' 회수"]
+    if res.get("people"):
+        lines.append(f"  👤 사람 {len(res['people'])}: " +
+                     ", ".join(p["name"] for p in res["people"][:5]))
+    if res.get("events"):
+        lines.append(f"  📅 이벤트 {len(res['events'])}: " +
+                     ", ".join(e["title"][:20] for e in res["events"][:5]))
+    if res.get("goals"):
+        lines.append(f"  🎯 골 {len(res['goals'])}: " +
+                     ", ".join(g["title"][:20] for g in res["goals"][:5]))
+    if res.get("notes"):
+        lines.append(f"  📝 노트 {len(res['notes'])}")
+    if res.get("expenses"):
+        total = sum(e["amount_won"] for e in res["expenses"])
+        lines.append(f"  💰 지출 {len(res['expenses'])}건 ₩{total:,}")
+    if res.get("chat_log"):
+        lines.append(f"  💬 채팅 {len(res['chat_log'])} 히트")
+    if len(lines) == 1:
+        lines.append("  (관련 데이터 없음)")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_scorecard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/scorecard` 지금 스코어카드 발사."""
+    chat_id = update.effective_chat.id
+    await update.message.reply_text("📊 스코어카드 만들고 있어…")
+    scheduler.trigger_weekly_scorecard_now(chat_id)
+
+
+async def cmd_agent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/agent <목표>` 다단계 자율 에이전트 모드 — max_hops 20, 외부 액션은 auto_rule만."""
+    chat_id = update.effective_chat.id
+    if not context.args:
+        await update.message.reply_text(
+            "사용: /agent 다음주 부산 KTX 예약 시각 확인 + 호텔 후보\n"
+            "    (web_search·fetch_url·gmail·gcal 등 다단계 자율)"
+        )
+        return
+    goal = " ".join(context.args).strip()
+    db.log_chat(chat_id, "user", f"[/agent] {goal}")
+    await update.message.reply_text(f"🤖 에이전트 시작 — '{goal[:60]}'")
+    try:
+        reply = await run_agent(
+            chat_id,
+            f"[AGENT MODE] {goal}\n\n자율로 도구를 조합해 단계적으로 해결해. "
+            "외부 액션(메일 전송·RSVP)은 auto_rule 통과한 것만 자동. 나머지는 초안 제안.",
+            history=[], max_hops=20,
+        )
+        for i in range(0, len(reply), 4000):
+            await update.message.reply_text(reply[i:i + 4000])
+    except Exception as e:
+        logger.exception("/agent failed")
+        await update.message.reply_text(f"⚠ {e}")
+
+
+async def cmd_say(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/say <텍스트>` TTS로 음성 답장."""
+    chat_id = update.effective_chat.id
+    text = " ".join(context.args or []).strip()
+    if not text:
+        await update.message.reply_text("사용: /say 텍스트")
+        return
+    try:
+        audio = await transcribe.synthesize_voice(text)
+    except Exception as e:
+        await update.message.reply_text(f"⚠ TTS 실패: {e}")
+        return
+    try:
+        await context.bot.send_voice(chat_id=chat_id, voice=audio, caption=text[:120])
+    except Exception as e:
+        await update.message.reply_text(f"⚠ 음성 전송 실패: {e}")
 
 
 async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2594,6 +3498,42 @@ async def on_callback_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await cq.edit_message_reply_markup(reply_markup=None)
             except Exception:
                 pass
+        elif kind in ("rsvp_yes", "rsvp_maybe", "rsvp_no"):
+            response = {"rsvp_yes": "accepted", "rsvp_maybe": "tentative",
+                        "rsvp_no": "declined"}[kind]
+            try:
+                ev = await gcal.respond_to_invite(chat_id, rest, response)
+                db.log_agent_action(
+                    chat_id, "gcal_rsvp",
+                    summary=f"RSVP {response} → {(ev.get('summary') or '(제목 없음)')[:40]}",
+                    payload={"event_id": rest, "response": response},
+                    reversible={"kind": "gcal_rsvp",
+                                 "args": {"event_id": rest, "response": "tentative"}},
+                )
+                await cq.answer(f"✅ {response}", show_alert=False)
+                try:
+                    await cq.edit_message_reply_markup(reply_markup=None)
+                except Exception:
+                    pass
+            except Exception as e:
+                await cq.answer(f"⚠ {e}", show_alert=True)
+        elif kind == "agent_undo":
+            aid = int(rest)
+            row = db.get_agent_action(chat_id, aid)
+            if not row or not row["reversible_json"]:
+                await cq.answer("취소 불가", show_alert=False)
+                return
+            try:
+                rev = json.loads(row["reversible_json"])
+                if rev.get("kind") == "gcal_rsvp":
+                    a = rev["args"]
+                    await gcal.respond_to_invite(chat_id, a["event_id"], a["response"])
+                    db.mark_action_reversed(chat_id, aid)
+                    await cq.answer("취소 처리됨 (tentative로 되돌림)", show_alert=False)
+                else:
+                    await cq.answer("이 액션은 취소 미지원", show_alert=False)
+            except Exception as e:
+                await cq.answer(f"⚠ {e}", show_alert=True)
         elif kind == "bday_draft":
             pid = int(rest)
             people = [p for p in db.list_people(chat_id) if p["id"] == pid]
@@ -2906,6 +3846,12 @@ BOT_COMMANDS: List[BotCommand] = [
     BotCommand("setup", "가이드 온보딩"),
     BotCommand("cost", "OpenRouter 사용량 요약"),
     BotCommand("nudges", "능동 알림 토글 + 상태"),
+    BotCommand("rules", "자동 액션 규칙 (메일 자동, RSVP 자동)"),
+    BotCommand("persona", "내가 누구인지 봇이 그린 인물 요약"),
+    BotCommand("recall", "특정 사람/키워드 cross-table 회수"),
+    BotCommand("scorecard", "주간 스코어카드 (골/습관/지출/무드)"),
+    BotCommand("agent", "다단계 자율 에이전트 실행"),
+    BotCommand("say", "TTS로 음성 답장"),
     BotCommand("diag", "봇 상태 진단"),
     BotCommand("export", "내 데이터 마크다운으로 보기"),
     BotCommand("reset", "이번 대화 메모리 초기화"),
@@ -2930,6 +3876,13 @@ async def post_init(app: Application) -> None:
         midday_checkin_runner=run_midday_checkin,
         leave_by_recompute_runner=run_leave_by_recompute,
         leave_by_runner=_send_leave_by_for_event,
+        persona_rebuild_runner=run_persona_rebuild,
+        gcal_invite_watch_runner=run_gcal_invite_watch,
+        agent_digest_runner=run_agent_digest,
+        streak_compute_runner=run_streak_compute,
+        weekly_scorecard_runner=run_weekly_scorecard,
+        active_learning_runner=run_active_learning,
+        budget_check_runner=run_budget_check,
     )
     # Register the slash-command menu so Telegram clients show autocomplete.
     # Failure is non-fatal (the bot still works without the menu).
@@ -2974,6 +3927,12 @@ def main() -> None:
     app.add_handler(CommandHandler("spending", cmd_spending))
     app.add_handler(CommandHandler("habits", cmd_habits))
     app.add_handler(CommandHandler("nudges", cmd_nudges))
+    app.add_handler(CommandHandler("rules", cmd_rules))
+    app.add_handler(CommandHandler("persona", cmd_persona))
+    app.add_handler(CommandHandler("recall", cmd_recall))
+    app.add_handler(CommandHandler("scorecard", cmd_scorecard))
+    app.add_handler(CommandHandler("agent", cmd_agent))
+    app.add_handler(CommandHandler("say", cmd_say))
     app.add_handler(CommandHandler("diag", cmd_diag))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("connect_gcal", cmd_connect_gcal))

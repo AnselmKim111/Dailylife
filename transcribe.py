@@ -174,6 +174,44 @@ async def classify_content(text: str, hint: Optional[str] = None) -> dict:
     }
 
 
+OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech"
+
+
+async def synthesize_voice(
+    text: str,
+    voice: str = "nova",
+    model: str = "gpt-4o-mini-tts",
+    response_format: str = "opus",
+) -> bytes:
+    """Render Korean text → Telegram-friendly voice note (OGG Opus).
+
+    Caller usually feeds the returned bytes into bot.send_voice. ~$0.015/1000
+    chars on OpenAI gpt-4o-mini-tts; cap input to keep cost bounded."""
+    if not OPENAI_API_KEY:
+        raise TranscribeUnavailable("OPENAI_API_KEY not configured")
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("empty text for TTS")
+    if len(text) > 4000:
+        text = text[:4000]
+    payload = {
+        "model": model,
+        "input": text,
+        "voice": voice,
+        "response_format": response_format,
+    }
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=120.0) as c:
+        r = await c.post(OPENAI_TTS_URL, json=payload, headers=headers)
+        if r.status_code >= 400:
+            logger.error("TTS %s: %s", r.status_code, r.text[:300])
+            r.raise_for_status()
+    return r.content
+
+
 def extract_pdf_text(file_bytes: bytes, max_pages: int = 30, max_chars: int = 12000) -> str:
     """Extract text from a PDF using pypdf. Pure Python, no system deps.
 

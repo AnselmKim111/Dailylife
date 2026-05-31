@@ -27,12 +27,15 @@ async def _gmail_api(
     path: str,
     *,
     params: Optional[Dict] = None,
+    json_body: Optional[Dict] = None,
 ) -> Dict[str, Any]:
     token = await gcal.get_valid_access_token(chat_id)
     headers = {"Authorization": f"Bearer {token}"}
+    if json_body is not None:
+        headers["Content-Type"] = "application/json"
     url = f"{API_BASE}{path}"
     async with httpx.AsyncClient(timeout=30.0) as c:
-        r = await c.request(method, url, headers=headers, params=params)
+        r = await c.request(method, url, headers=headers, params=params, json=json_body)
         if r.status_code == 401:
             # One forced refresh
             row = db.get_oauth_token(chat_id, "google")
@@ -40,9 +43,9 @@ async def _gmail_api(
                 refreshed = await gcal.refresh_access(row["refresh_token"])
                 gcal.store_token_response(chat_id, refreshed)
                 headers["Authorization"] = f"Bearer {refreshed['access_token']}"
-                r = await c.request(method, url, headers=headers, params=params)
+                r = await c.request(method, url, headers=headers, params=params, json=json_body)
         if r.status_code == 403:
-            # Likely missing gmail.readonly scope — token issued for calendar only.
+            # Likely missing scope — token issued for fewer scopes than needed.
             raise gcal.NotConnected(
                 "Gmail scope not granted. /connect_gcal 다시 눌러 권한 재동의 필요"
             )
@@ -143,6 +146,73 @@ async def get_message(
         "body": body[:body_max_chars],
         "truncated": len(body) > body_max_chars,
     }
+
+
+def _b64url_encode(s: bytes) -> str:
+    return base64.urlsafe_b64encode(s).decode("ascii").rstrip("=")
+
+
+def _build_rfc822(
+    to: str, subject: str, body_text: str,
+    *, in_reply_to: Optional[str] = None, references: Optional[str] = None,
+) -> str:
+    """Compose a minimal RFC 822 email + return the base64url-encoded raw form
+    Gmail's users.messages.send expects."""
+    from email.message import EmailMessage
+    msg = EmailMessage()
+    msg["To"] = to
+    msg["Subject"] = subject
+    if in_reply_to:
+        msg["In-Reply-To"] = in_reply_to
+        msg["References"] = references or in_reply_to
+    msg.set_content(body_text)
+    return _b64url_encode(msg.as_bytes())
+
+
+async def send_message(
+    chat_id: int,
+    to: str,
+    subject: str,
+    body_text: str,
+    *,
+    in_reply_to_msg_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Send an email via Gmail. If `in_reply_to_msg_id` is set, we fetch that
+    message's Message-ID header so the reply threads in Gmail."""
+    in_reply_to = None
+    thread_id = None
+    if in_reply_to_msg_id:
+        try:
+            src = await get_message(chat_id, in_reply_to_msg_id, body_max_chars=200)
+            thread_id = src.get("thread_id")
+            # Fetch full headers for Message-ID
+            data = await _gmail_api(
+                chat_id, "GET", f"/messages/{in_reply_to_msg_id}",
+                params={"format": "metadata", "metadataHeaders": "Message-ID"},
+            )
+            for h in (data.get("payload") or {}).get("headers", []):
+                if h.get("name", "").lower() == "message-id":
+                    in_reply_to = h.get("value")
+                    break
+        except Exception:
+            logger.exception("failed to load source for in_reply_to")
+    raw = _build_rfc822(to, subject, body_text, in_reply_to=in_reply_to)
+    body = {"raw": raw}
+    if thread_id:
+        body["threadId"] = thread_id
+    return await _gmail_api(chat_id, "POST", "/messages/send", json_body=body)
+
+
+async def draft_message(
+    chat_id: int,
+    to: str,
+    subject: str,
+    body_text: str,
+) -> Dict[str, Any]:
+    """Save an email as a Gmail draft (does NOT send)."""
+    raw = _build_rfc822(to, subject, body_text)
+    body = {"message": {"raw": raw}}
+    return await _gmail_api(chat_id, "POST", "/drafts", json_body=body)
 
 
 async def recent_summary(

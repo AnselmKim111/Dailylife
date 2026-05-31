@@ -30,6 +30,14 @@ _birthday_solo_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _midday_checkin_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _leave_by_recompute_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _leave_by_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = event_id
+# v4 runners
+_persona_rebuild_runner: Optional[Callable[[int], Awaitable[None]]] = None
+_gcal_invite_watch_runner: Optional[Callable[[int], Awaitable[None]]] = None
+_agent_digest_runner: Optional[Callable[[int], Awaitable[None]]] = None
+_streak_compute_runner: Optional[Callable[[int], Awaitable[None]]] = None
+_weekly_scorecard_runner: Optional[Callable[[int], Awaitable[None]]] = None
+_active_learning_runner: Optional[Callable[[int], Awaitable[None]]] = None
+_budget_check_runner: Optional[Callable[[int], Awaitable[None]]] = None
 
 
 def init(
@@ -45,11 +53,21 @@ def init(
     midday_checkin_runner: Optional[Callable[[int], Awaitable[None]]] = None,
     leave_by_recompute_runner: Optional[Callable[[int], Awaitable[None]]] = None,
     leave_by_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    persona_rebuild_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    gcal_invite_watch_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    agent_digest_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    streak_compute_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    weekly_scorecard_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    active_learning_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    budget_check_runner: Optional[Callable[[int], Awaitable[None]]] = None,
 ) -> None:
     global _scheduler, _bot, _recurring_runner, _weekly_review_runner, _daily_imminent_runner
     global _morning_briefing_runner, _evening_reflection_runner
     global _gmail_event_scan_runner, _evening_preview_runner, _birthday_solo_runner
     global _midday_checkin_runner, _leave_by_recompute_runner, _leave_by_runner
+    global _persona_rebuild_runner, _gcal_invite_watch_runner, _agent_digest_runner
+    global _streak_compute_runner, _weekly_scorecard_runner, _active_learning_runner
+    global _budget_check_runner
     _bot = bot
     _recurring_runner = recurring_runner
     _weekly_review_runner = weekly_review_runner
@@ -62,6 +80,13 @@ def init(
     _midday_checkin_runner = midday_checkin_runner
     _leave_by_recompute_runner = leave_by_recompute_runner
     _leave_by_runner = leave_by_runner
+    _persona_rebuild_runner = persona_rebuild_runner
+    _gcal_invite_watch_runner = gcal_invite_watch_runner
+    _agent_digest_runner = agent_digest_runner
+    _streak_compute_runner = streak_compute_runner
+    _weekly_scorecard_runner = weekly_scorecard_runner
+    _active_learning_runner = active_learning_runner
+    _budget_check_runner = budget_check_runner
     _scheduler = AsyncIOScheduler(timezone=TZ)
     _scheduler.start()
 
@@ -100,6 +125,13 @@ def init(
         _run_gcal_mirror,
         CronTrigger(hour=3, minute=0, timezone=TZ),
         id="gcal-mirror",
+        replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    _scheduler.add_job(
+        _run_v4_storage_cleanup,
+        CronTrigger(day_of_week="sun", hour=4, minute=0, timezone=TZ),
+        id="v4-storage-cleanup-weekly",
         replace_existing=True,
         misfire_grace_time=3600,
     )
@@ -371,6 +403,72 @@ def ensure_daily_rhythm_for(chat_id: int) -> None:
             replace_existing=True,
             misfire_grace_time=600,
         )
+    # ===== v4 nudges =====
+    if _persona_rebuild_runner and not _toggle_off(chat_id, "persona_rebuild_enabled"):
+        _scheduler.add_job(
+            _run_persona_rebuild,
+            CronTrigger(day_of_week="sun", hour=9, minute=30, timezone=TZ),
+            args=[chat_id],
+            id=f"persona-rebuild-{chat_id}",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+    if _gcal_invite_watch_runner and not _toggle_off(chat_id, "auto_rules_enabled"):
+        _scheduler.add_job(
+            _run_gcal_invite_watch,
+            CronTrigger(minute="*/30", timezone=TZ),
+            args=[chat_id],
+            id=f"gcal-invite-watch-{chat_id}",
+            replace_existing=True,
+            misfire_grace_time=600,
+        )
+    if _agent_digest_runner and not _toggle_off(chat_id, "agent_digest_enabled"):
+        _scheduler.add_job(
+            _run_agent_digest,
+            CronTrigger(hour=21, minute=45, timezone=TZ),
+            args=[chat_id],
+            id=f"agent-digest-{chat_id}",
+            replace_existing=True,
+            misfire_grace_time=1800,
+        )
+    if _streak_compute_runner and not _toggle_off(chat_id, "streak_compute_enabled"):
+        _scheduler.add_job(
+            _run_streak_compute,
+            CronTrigger(hour=0, minute=30, timezone=TZ),
+            args=[chat_id],
+            id=f"streak-compute-{chat_id}",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+    if _weekly_scorecard_runner and not _toggle_off(chat_id, "weekly_scorecard_enabled"):
+        _scheduler.add_job(
+            _run_weekly_scorecard,
+            CronTrigger(day_of_week="sun", hour=18, minute=0, timezone=TZ),
+            args=[chat_id],
+            id=f"weekly-scorecard-{chat_id}",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+    if _active_learning_runner and not _toggle_off(chat_id, "active_learning_enabled"):
+        t = _fact_value(chat_id, "learning_question_time") or "14:00"
+        hour, minute = _parse_hhmm(t, 14, 0)
+        _scheduler.add_job(
+            _run_active_learning,
+            CronTrigger(hour=hour, minute=minute, timezone=TZ),
+            args=[chat_id],
+            id=f"active-learning-{chat_id}",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+    if _budget_check_runner and not _toggle_off(chat_id, "budget_alert_enabled"):
+        _scheduler.add_job(
+            _run_budget_check,
+            CronTrigger(hour=8, minute=30, timezone=TZ),
+            args=[chat_id],
+            id=f"budget-check-{chat_id}",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
     logger.info("daily rhythm armed for chat %s", chat_id)
 
 
@@ -391,6 +489,13 @@ def disable_daily_rhythm_for(chat_id: int) -> None:
         f"midday-checkin-{chat_id}",
         f"leave-by-recompute-{chat_id}",
         f"gmail-event-scan-{chat_id}",
+        f"persona-rebuild-{chat_id}",
+        f"gcal-invite-watch-{chat_id}",
+        f"agent-digest-{chat_id}",
+        f"streak-compute-{chat_id}",
+        f"weekly-scorecard-{chat_id}",
+        f"active-learning-{chat_id}",
+        f"budget-check-{chat_id}",
     ):
         if _scheduler.get_job(jid):
             _scheduler.remove_job(jid)
@@ -534,6 +639,131 @@ def trigger_gmail_scan_now(chat_id: int) -> None:
         id=f"gmail-scan-{chat_id}-once-{int(datetime.now(timezone.utc).timestamp())}",
         misfire_grace_time=120,
     )
+
+
+# ---------------- v4 wrappers ----------------
+
+
+async def _run_persona_rebuild(chat_id: int) -> None:
+    if _persona_rebuild_runner is None or _toggle_off(chat_id, "persona_rebuild_enabled"):
+        return
+    try:
+        await _persona_rebuild_runner(chat_id)
+    except Exception:
+        logger.exception("persona rebuild failed for chat %s", chat_id)
+
+
+async def _run_gcal_invite_watch(chat_id: int) -> None:
+    if _gcal_invite_watch_runner is None or _toggle_off(chat_id, "auto_rules_enabled"):
+        return
+    try:
+        await _gcal_invite_watch_runner(chat_id)
+    except Exception:
+        logger.exception("gcal invite watch failed for chat %s", chat_id)
+
+
+async def _run_agent_digest(chat_id: int) -> None:
+    if _agent_digest_runner is None or _toggle_off(chat_id, "agent_digest_enabled"):
+        return
+    try:
+        await _agent_digest_runner(chat_id)
+    except Exception:
+        logger.exception("agent digest failed for chat %s", chat_id)
+
+
+async def _run_streak_compute(chat_id: int) -> None:
+    if _streak_compute_runner is None or _toggle_off(chat_id, "streak_compute_enabled"):
+        return
+    try:
+        await _streak_compute_runner(chat_id)
+    except Exception:
+        logger.exception("streak compute failed for chat %s", chat_id)
+
+
+async def _run_weekly_scorecard(chat_id: int) -> None:
+    if _weekly_scorecard_runner is None or _toggle_off(chat_id, "weekly_scorecard_enabled"):
+        return
+    try:
+        await _weekly_scorecard_runner(chat_id)
+    except Exception:
+        logger.exception("weekly scorecard failed for chat %s", chat_id)
+
+
+async def _run_active_learning(chat_id: int) -> None:
+    if _active_learning_runner is None or _toggle_off(chat_id, "active_learning_enabled"):
+        return
+    try:
+        await _active_learning_runner(chat_id)
+    except Exception:
+        logger.exception("active learning failed for chat %s", chat_id)
+
+
+async def _run_budget_check(chat_id: int) -> None:
+    if _budget_check_runner is None or _toggle_off(chat_id, "budget_alert_enabled"):
+        return
+    try:
+        await _budget_check_runner(chat_id)
+    except Exception:
+        logger.exception("budget check failed for chat %s", chat_id)
+
+
+def trigger_persona_rebuild_now(chat_id: int) -> None:
+    if _scheduler is None:
+        return
+    _scheduler.add_job(
+        _run_persona_rebuild, "date",
+        run_date=datetime.now(timezone.utc) + timedelta(seconds=2),
+        args=[chat_id],
+        id=f"persona-rebuild-{chat_id}-once-{int(datetime.now(timezone.utc).timestamp())}",
+        misfire_grace_time=120,
+    )
+
+
+def trigger_weekly_scorecard_now(chat_id: int) -> None:
+    if _scheduler is None:
+        return
+    _scheduler.add_job(
+        _run_weekly_scorecard, "date",
+        run_date=datetime.now(timezone.utc) + timedelta(seconds=2),
+        args=[chat_id],
+        id=f"weekly-scorecard-{chat_id}-once-{int(datetime.now(timezone.utc).timestamp())}",
+        misfire_grace_time=120,
+    )
+
+
+def trigger_agent_digest_now(chat_id: int) -> None:
+    if _scheduler is None:
+        return
+    _scheduler.add_job(
+        _run_agent_digest, "date",
+        run_date=datetime.now(timezone.utc) + timedelta(seconds=2),
+        args=[chat_id],
+        id=f"agent-digest-{chat_id}-once-{int(datetime.now(timezone.utc).timestamp())}",
+        misfire_grace_time=120,
+    )
+
+
+# v4 weekly housekeeping (called once at init below)
+
+
+async def _run_v4_storage_cleanup() -> None:
+    """Sun 04:00 KST: trim persona_doc versions + ancient digested agent_actions."""
+    try:
+        n = db.cleanup_old_personas(keep_recent=8)
+        if n:
+            logger.info("persona cleanup: dropped %d old versions", n)
+    except Exception:
+        logger.exception("persona cleanup failed")
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=90)).isoformat()
+        with db._conn() as c:
+            cur = c.execute(
+                "DELETE FROM agent_actions WHERE status IN ('reversed','digested') "
+                "AND executed_at < ?", (cutoff,))
+            if cur.rowcount:
+                logger.info("agent_actions cleanup: dropped %d rows", cur.rowcount)
+    except Exception:
+        logger.exception("agent_actions cleanup failed")
 
 
 def trigger_morning_briefing_now(chat_id: int) -> None:
