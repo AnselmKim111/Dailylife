@@ -2644,6 +2644,39 @@ async def run_active_learning(chat_id: int) -> None:
         logger.exception("active_learning send failed")
 
 
+_MOOD_PROMPT = (
+    "다음 한 줄 회고의 감정 톤을 분류해. "
+    "JSON 한 줄: {\"mood\": \"positive\"|\"neutral\"|\"negative\"}\n\n회고: "
+)
+
+
+async def _classify_and_store_mood(chat_id: int, date_iso: str, text: str) -> None:
+    """Micro-LLM (~$0.0002): classify reflection text → daily_state.mood_sentiment."""
+    text = (text or "").strip()
+    if not text or len(text) < 2:
+        return
+    try:
+        data = await chat_completion(
+            [{"role": "user", "content": _MOOD_PROMPT + text[:500]}],
+            tools=None, chat_id=chat_id, kind="mood_classify", max_tokens=40,
+        )
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+    except Exception:
+        logger.exception("mood classify failed (non-fatal)")
+        return
+    import re as _re
+    m = _re.search(r"\{[\s\S]*\}", content)
+    if not m:
+        return
+    try:
+        parsed = json.loads(m.group(0))
+    except Exception:
+        return
+    mood = parsed.get("mood")
+    if mood in ("positive", "neutral", "negative"):
+        db.set_mood_sentiment(chat_id, date_iso, mood)
+
+
 async def run_budget_check(chat_id: int) -> None:
     """Daily 08:30 — for each `monthly_<cat>_budget` fact, alert when ≥80% or ≥100%."""
     if _app is None or _app.bot is None:
@@ -3631,6 +3664,8 @@ async def _process_user_text(
         state = db.get_daily_state(chat_id, today_iso)
         if state and state["reflection_prompted"] and not state["reflection_response"]:
             db.save_reflection_response(chat_id, today_iso, user_text)
+            # Fire-and-forget mood classifier (~$0.0002) — fills /scorecard mood bar.
+            asyncio.create_task(_classify_and_store_mood(chat_id, today_iso, user_text))
     except Exception:
         logger.exception("reflection capture failed (non-fatal)")
     # Opportunistic cleanup of idle chats (no extra cost — only sweeps every msg).
