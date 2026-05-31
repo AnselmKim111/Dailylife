@@ -42,6 +42,7 @@ _late_check_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = e
 _mission_tick_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = mission_id
 _relation_extract_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _self_improve_runner: Optional[Callable[[int], Awaitable[None]]] = None
+_subscription_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = sub_id
 
 
 def init(
@@ -68,6 +69,7 @@ def init(
     mission_tick_runner: Optional[Callable[[int], Awaitable[None]]] = None,
     relation_extract_runner: Optional[Callable[[int], Awaitable[None]]] = None,
     self_improve_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    subscription_runner: Optional[Callable[[int], Awaitable[None]]] = None,
 ) -> None:
     global _scheduler, _bot, _recurring_runner, _weekly_review_runner, _daily_imminent_runner
     global _morning_briefing_runner, _evening_reflection_runner
@@ -76,7 +78,7 @@ def init(
     global _persona_rebuild_runner, _gcal_invite_watch_runner, _agent_digest_runner
     global _streak_compute_runner, _weekly_scorecard_runner, _active_learning_runner
     global _budget_check_runner, _late_check_runner, _mission_tick_runner
-    global _relation_extract_runner, _self_improve_runner
+    global _relation_extract_runner, _self_improve_runner, _subscription_runner
     _bot = bot
     _recurring_runner = recurring_runner
     _weekly_review_runner = weekly_review_runner
@@ -100,6 +102,14 @@ def init(
     _mission_tick_runner = mission_tick_runner
     _relation_extract_runner = relation_extract_runner
     _self_improve_runner = self_improve_runner
+    _subscription_runner = subscription_runner
+    # Re-arm any existing subscriptions on boot
+    if _subscription_runner:
+        try:
+            for s in db.all_enabled_subscriptions():
+                schedule_subscription(s)
+        except Exception:
+            logger.exception("re-arming subscriptions failed")
     _scheduler = AsyncIOScheduler(timezone=TZ)
     _scheduler.start()
 
@@ -766,6 +776,57 @@ async def _run_late_check(event_id: int) -> None:
         await _late_check_runner(event_id)
     except Exception:
         logger.exception("late check failed for event %s", event_id)
+
+
+def schedule_subscription(row) -> bool:
+    """Arm a daily / weekly cron for a subscription row. Supports 'HH:MM' (daily)
+    and '<3-letter weekday> HH:MM' (weekly, e.g. 'mon 09:00')."""
+    assert _scheduler is not None and _subscription_runner is not None
+    cron = (row["cron_kst"] or "").strip().lower()
+    weekday_map = {"mon": "mon", "tue": "tue", "wed": "wed", "thu": "thu",
+                    "fri": "fri", "sat": "sat", "sun": "sun"}
+    weekday = None
+    time_part = cron
+    if " " in cron:
+        wd, rest = cron.split(maxsplit=1)
+        if wd in weekday_map:
+            weekday = weekday_map[wd]
+            time_part = rest
+    try:
+        hh, mm = time_part.split(":")
+        hour, minute = int(hh), int(mm)
+    except ValueError:
+        logger.warning("bad subscription cron %r for sub %s", cron, row["id"])
+        return False
+    trig_kwargs = {"hour": hour, "minute": minute, "timezone": TZ}
+    if weekday:
+        trig_kwargs["day_of_week"] = weekday
+    _scheduler.add_job(
+        _run_subscription,
+        CronTrigger(**trig_kwargs),
+        args=[row["id"]],
+        id=f"subscription-{row['id']}",
+        replace_existing=True,
+        misfire_grace_time=1800,
+    )
+    return True
+
+
+def cancel_subscription_job(sub_id: int) -> None:
+    if _scheduler is None:
+        return
+    jid = f"subscription-{sub_id}"
+    if _scheduler.get_job(jid):
+        _scheduler.remove_job(jid)
+
+
+async def _run_subscription(sub_id: int) -> None:
+    if _subscription_runner is None:
+        return
+    try:
+        await _subscription_runner(sub_id)
+    except Exception:
+        logger.exception("subscription run failed for sub %s", sub_id)
 
 
 def schedule_late_check(event_id: int, run_at_utc: datetime) -> Optional[str]:

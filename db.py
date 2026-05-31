@@ -306,6 +306,20 @@ CREATE TABLE IF NOT EXISTS macros (
 );
 CREATE INDEX IF NOT EXISTS idx_macros_chat ON macros(chat_id);
 
+CREATE TABLE IF NOT EXISTS subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    topic TEXT NOT NULL,
+    cron_kst TEXT NOT NULL,
+    enabled INTEGER NOT NULL DEFAULT 1,
+    last_run_utc TEXT,
+    last_digest_md TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(chat_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_subs_chat ON subscriptions(chat_id, enabled);
+
 CREATE TABLE IF NOT EXISTS error_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts_utc TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -345,6 +359,8 @@ _MIGRATIONS: List[Tuple[str, str, str]] = [
     ("daily_state", "mood_sentiment", "TEXT"),  # 'positive'|'neutral'|'negative'
     ("daily_state", "learning_question_asked", "INTEGER NOT NULL DEFAULT 0"),
     ("daily_state", "learning_question_key", "TEXT"),  # what fact/person we asked about
+    # v8: live mission UI — the Telegram message_id we keep editing for progress.
+    ("missions", "progress_message_id", "INTEGER"),
 ]
 
 
@@ -1873,6 +1889,65 @@ def delete_macro(chat_id: int, name: str) -> bool:
     with _conn() as c:
         cur = c.execute(
             "DELETE FROM macros WHERE chat_id=? AND name=?",
+            (chat_id, name.strip()))
+        return cur.rowcount > 0
+
+
+# ---------------- v8: subscriptions ----------------
+
+
+def add_subscription(chat_id: int, name: str, topic: str, cron_kst: str) -> Optional[int]:
+    with _conn() as c:
+        try:
+            cur = c.execute(
+                "INSERT INTO subscriptions (chat_id, name, topic, cron_kst) VALUES (?,?,?,?)",
+                (chat_id, name.strip(), topic.strip(), cron_kst.strip()))
+            return cur.lastrowid
+        except sqlite3.IntegrityError:
+            return None
+
+
+def list_subscriptions(chat_id: int, only_enabled: bool = False) -> List[sqlite3.Row]:
+    with _conn() as c:
+        if only_enabled:
+            return list(c.execute(
+                "SELECT * FROM subscriptions WHERE chat_id=? AND enabled=1 ORDER BY name",
+                (chat_id,)))
+        return list(c.execute(
+            "SELECT * FROM subscriptions WHERE chat_id=? ORDER BY name",
+            (chat_id,)))
+
+
+def get_subscription(sub_id: int) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute("SELECT * FROM subscriptions WHERE id=?", (sub_id,)).fetchone()
+
+
+def all_enabled_subscriptions() -> List[sqlite3.Row]:
+    with _conn() as c:
+        return list(c.execute("SELECT * FROM subscriptions WHERE enabled=1"))
+
+
+def update_subscription_run(sub_id: int, digest_md: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "UPDATE subscriptions SET last_run_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
+            "last_digest_md=? WHERE id=?",
+            (digest_md[:4000], sub_id))
+
+
+def disable_subscription(chat_id: int, name: str) -> bool:
+    with _conn() as c:
+        cur = c.execute(
+            "UPDATE subscriptions SET enabled=0 WHERE chat_id=? AND name=?",
+            (chat_id, name.strip()))
+        return cur.rowcount > 0
+
+
+def delete_subscription(chat_id: int, name: str) -> bool:
+    with _conn() as c:
+        cur = c.execute(
+            "DELETE FROM subscriptions WHERE chat_id=? AND name=?",
             (chat_id, name.strip()))
         return cur.rowcount > 0
 

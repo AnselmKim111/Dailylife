@@ -945,6 +945,144 @@ def tool_merge_people(chat_id: int, args: Dict) -> Dict:
 # SYNC_HANDLERS dict is defined.)
 
 
+SUBSCRIPTION_SYSTEM = (
+    "다음은 사용자가 정기 구독한 토픽이야. 최신 정보를 web_search/fetch_url로 조사해 "
+    "한국어 마크다운 ≤500자 digest로 만들어. 핵심 수치·날짜·링크 inline 인용. "
+    "변동 없으면 한 줄 'no change since {last_run}'.\n\n토픽: {topic}\n"
+    "지난 실행: {last_run_utc}\n지난 digest:\n{last_md}"
+)
+
+
+async def run_subscription(sub_id: int) -> None:
+    """Cron-fired: run a tiny research mission for a subscription topic."""
+    row = db.get_subscription(sub_id)
+    if not row or not row["enabled"]:
+        return
+    chat_id = row["chat_id"]
+    last_md = (row["last_digest_md"] or "(첫 실행)")[:1500]
+    prompt = SUBSCRIPTION_SYSTEM.format(
+        topic=row["topic"],
+        last_run_utc=row["last_run_utc"] or "—",
+        last_md=last_md,
+    )
+    try:
+        digest = await run_agent(chat_id, prompt, history=[], max_hops=6, kind="ask")
+    except Exception:
+        logger.exception("subscription %s run failed", sub_id)
+        return
+    db.update_subscription_run(sub_id, digest)
+    if _app and _app.bot and digest.strip():
+        try:
+            text = f"📰 {row['name']}\n\n{digest[:3500]}"
+            await _app.bot.send_message(chat_id=chat_id, text=text)
+        except Exception:
+            logger.exception("subscription send failed")
+
+
+async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/subscribe <name> <HH:MM | mon HH:MM> <topic>` 정기 토픽 구독."""
+    chat_id = update.effective_chat.id
+    args = list(context.args or [])
+    if not args:
+        rows = db.list_subscriptions(chat_id)
+        if not rows:
+            await update.message.reply_text(
+                "📰 구독 없음.\n"
+                "사용: /subscribe 환율 09:00 USD/KRW 환율 + 한 줄 분석\n"
+                "       /subscribe 항공권 mon 08:00 부산↔도쿄 특가\n"
+                "       /unsubscribe <name>"
+            )
+            return
+        lines = ["📰 구독 목록"]
+        for r in rows:
+            status = "✓" if r["enabled"] else "✗"
+            lines.append(f"  {status} {r['name']} @{r['cron_kst']} — {r['topic'][:50]}")
+            if r["last_run_utc"]:
+                lines.append(f"      마지막 실행 {r['last_run_utc'][:16]}")
+        await update.message.reply_text("\n".join(lines))
+        return
+    if len(args) < 3:
+        await update.message.reply_text("사용: /subscribe <name> <HH:MM | mon HH:MM> <topic>")
+        return
+    name = args[0]
+    # Look for "mon HH:MM" form
+    if len(args) >= 4 and args[1].lower() in {"mon","tue","wed","thu","fri","sat","sun"} \
+            and ":" in args[2]:
+        cron = f"{args[1].lower()} {args[2]}"
+        topic = " ".join(args[3:])
+    elif ":" in args[1]:
+        cron = args[1]
+        topic = " ".join(args[2:])
+    else:
+        await update.message.reply_text("cron 형식 오류 (예: 09:00 또는 mon 09:00).")
+        return
+    sid = db.add_subscription(chat_id, name, topic, cron)
+    if not sid:
+        await update.message.reply_text(f"⚠ '{name}' 이미 있음 — /unsubscribe 먼저")
+        return
+    row = db.get_subscription(sid)
+    if row:
+        scheduler.schedule_subscription(row)
+    await update.message.reply_text(f"📰 구독 #{sid} '{name}' 생성 — {cron} KST")
+
+
+async def cmd_unsubscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    if not context.args:
+        await update.message.reply_text("사용: /unsubscribe <name>")
+        return
+    name = context.args[0]
+    rows = db.list_subscriptions(chat_id)
+    target = next((r for r in rows if r["name"] == name), None)
+    if not target:
+        await update.message.reply_text("없음.")
+        return
+    scheduler.cancel_subscription_job(target["id"])
+    db.delete_subscription(chat_id, name)
+    await update.message.reply_text(f"🗑 '{name}' 구독 해지")
+
+
+async def cmd_quiet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/quiet` 상태 · `/quiet 22:30 07:30` 변경 · `/quiet off` 끄기."""
+    chat_id = update.effective_chat.id
+    args = list(context.args or [])
+    if not args:
+        start = _fact_value_local(chat_id, "quiet_hours_start") or "23:00"
+        end = _fact_value_local(chat_id, "quiet_hours_end") or "07:00"
+        disabled = _toggle_off_local(chat_id, "quiet_hours_enabled")
+        now_silent = "🌙 지금 조용 모드" if _is_quiet_now(chat_id) else "🔔 지금 알림 가능"
+        await update.message.reply_text(
+            f"{'🔕 OFF' if disabled else f'🌙 조용 시간 {start}–{end}'}\n"
+            f"{now_silent}\n\n"
+            "사용:\n  /quiet 22:30 07:30  — 시간 변경\n"
+            "  /quiet off            — 항시 알림\n"
+            "  /quiet on             — 다시 켜기"
+        )
+        return
+    if args[0].lower() == "off":
+        db.remember_fact(chat_id, "quiet_hours_enabled", "false")
+        await update.message.reply_text("🔔 조용 시간 OFF — 24h 알림 가능")
+        return
+    if args[0].lower() == "on":
+        db.forget_fact(chat_id, "quiet_hours_enabled")
+        await update.message.reply_text("🌙 조용 시간 ON")
+        return
+    if len(args) >= 2:
+        try:
+            for s in (args[0], args[1]):
+                hh, mm = s.split(":")
+                int(hh); int(mm)
+        except Exception:
+            await update.message.reply_text("HH:MM 형식 오류")
+            return
+        db.remember_fact(chat_id, "quiet_hours_start", args[0])
+        db.remember_fact(chat_id, "quiet_hours_end", args[1])
+        db.forget_fact(chat_id, "quiet_hours_enabled")
+        await update.message.reply_text(f"🌙 조용 시간 {args[0]}–{args[1]} KST")
+        return
+    await update.message.reply_text("/quiet | /quiet HH:MM HH:MM | /quiet off")
+
+
 async def cmd_macro(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """`/macro` 목록 · `/macro save <name> <recipe>` 저장 · `/macro <name>` 실행 ·
     `/macro delete <name>` 삭제."""
@@ -2175,6 +2313,8 @@ def _gmail_auto_add_rule_match(chat_id: int, msg: Dict, cls: Dict) -> Optional[D
 
 async def run_gmail_event_scan(chat_id: int) -> None:
     """Poll Gmail for recently received messages that look like events; surface
+    if _is_quiet_now(chat_id):
+        return
     a card with [✅ 추가] / [✏️ 수정] / [❌ 아님] buttons. Every msg_id is dedup'd
     in processed_gmail_msg_ids so we never re-offer the same message."""
     if _app is None or _app.bot is None:
@@ -2357,6 +2497,29 @@ def _fact_value_local(chat_id: int, key: str) -> Optional[str]:
     return None
 
 
+def _is_quiet_now(chat_id: int) -> bool:
+    """True if current KST time falls in user's quiet window (default 23:00-07:00).
+    Used by nudge runners to self-suppress. Critical alerts (mission done,
+    D-0 reminders) ignore this."""
+    if _toggle_off_local(chat_id, "quiet_hours_enabled"):
+        return False
+    start = _fact_value_local(chat_id, "quiet_hours_start") or "23:00"
+    end = _fact_value_local(chat_id, "quiet_hours_end") or "07:00"
+    try:
+        sh, sm = (int(x) for x in start.split(":"))
+        eh, em = (int(x) for x in end.split(":"))
+    except Exception:
+        return False
+    now = datetime.now(TZ)
+    cur_min = now.hour * 60 + now.minute
+    s_min = sh * 60 + sm
+    e_min = eh * 60 + em
+    if s_min <= e_min:
+        return s_min <= cur_min < e_min
+    # wrap (23 → 07)
+    return cur_min >= s_min or cur_min < e_min
+
+
 # event_id → utc timestamp when the leave-by fired; consumed by run_late_check.
 _leave_by_sent_at: Dict[int, datetime] = {}
 
@@ -2520,6 +2683,8 @@ async def _predict_tomorrow_blindspots(chat_id: int, items: list) -> list:
 
 async def run_evening_preview(chat_id: int) -> None:
     """22:00 KST — single-line preview of tomorrow. Silent unless tomorrow has
+    if _is_quiet_now(chat_id):
+        return
     an event, is a Korean holiday, or weather flags rain/snow > 30%."""
     if _app is None or _app.bot is None:
         return
@@ -2623,6 +2788,8 @@ async def run_evening_preview(chat_id: int) -> None:
 
 
 async def run_birthday_solo(chat_id: int) -> None:
+    if _is_quiet_now(chat_id):
+        return
     if _app is None or _app.bot is None:
         return
     if not _toggle_on_local(chat_id, "birthday_alert_separate_enabled"):
@@ -2654,6 +2821,8 @@ def _toggle_on_local(chat_id: int, key: str) -> bool:
 
 
 async def run_midday_checkin(chat_id: int) -> None:
+    if _is_quiet_now(chat_id):
+        return
     if _app is None or _app.bot is None:
         return
     if _toggle_off_local(chat_id, "midday_checkin_enabled"):
@@ -2857,6 +3026,8 @@ async def run_gcal_invite_watch(chat_id: int) -> None:
 
 async def run_agent_digest(chat_id: int) -> None:
     """21:45 — single message listing today's autonomous actions, each with [↩️]."""
+    if _is_quiet_now(chat_id):
+        return
     if _toggle_off_local(chat_id, "agent_digest_enabled"):
         return
     rows = db.list_undigested_actions(chat_id)
@@ -3012,6 +3183,8 @@ def _next_gap_question(chat_id: int) -> Optional[Dict]:
 
 async def run_active_learning(chat_id: int) -> None:
     """Daily HH:MM — ask one memory-gap question. Skip if already asked today."""
+    if _is_quiet_now(chat_id):
+        return
     if _app is None or _app.bot is None:
         return
     if _toggle_off_local(chat_id, "active_learning_enabled"):
@@ -3981,24 +4154,30 @@ async def run_mission_tick(mission_id: int) -> None:
         await _send_mission_result(mission_id, result_md.strip())
         return
 
-    # Mid-mission checkpoint: send a short progress message every ~90min.
-    elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(m["created_at"])).total_seconds() / 60
-    last_cp_min = 0
-    if m["last_checkpoint_at"]:
-        last_cp_min = (datetime.now(timezone.utc) - datetime.fromisoformat(m["last_checkpoint_at"])).total_seconds() / 60
-    # Only send checkpoint if (a) we've been running >30min and (b) it's been
-    # >60min since the last persisted checkpoint update. The last_checkpoint_at
-    # field is updated every tick, so use elapsed buckets instead.
-    if elapsed > 30 and (m["current_hop"] + hops_this_tick) in (5, 12, 25, 50):
+    # v8: Live progress UI — edit a single Telegram message in place each tick
+    # so the user can watch the mission move forward.
+    if _app and _app.bot:
         recent = history[-1] if history else {}
-        snippet = (recent.get("content") or "")[:160] if isinstance(recent, dict) else ""
-        if _app and _app.bot:
-            await _app.bot.send_message(
-                chat_id=chat_id,
-                text=(f"🛠 Mission #{mission_id} 진행 중 — "
-                      f"{m['current_hop'] + hops_this_tick}/{m['max_hops']} hop, "
-                      f"${cost_before + max(0, _last_usage_cost(chat_id, since=started_at)):.4f}\n"
-                      f"  ↳ {snippet}"))
+        snippet = (recent.get("content") or "")[:200] if isinstance(recent, dict) else ""
+        if not snippet and len(history) >= 2 and isinstance(history[-2], dict):
+            snippet = (history[-2].get("content") or "")[:200]
+        cost_now = cost_before + max(0, _last_usage_cost(chat_id, since=started_at))
+        progress_text = (
+            f"🛠 Mission #{mission_id} 진행 중 — {m['title'][:40]}\n"
+            f"  • {m['current_hop'] + hops_this_tick}/{m['max_hops']} hop · ${cost_now:.4f}\n"
+            f"  • 최근: {snippet[:200]}"
+        )
+        try:
+            if m["progress_message_id"]:
+                await _app.bot.edit_message_text(
+                    chat_id=chat_id, message_id=m["progress_message_id"],
+                    text=progress_text)
+            else:
+                sent = await _app.bot.send_message(chat_id=chat_id, text=progress_text)
+                db.update_mission(mission_id, progress_message_id=sent.message_id)
+        except Exception:
+            # Telegram errors on 'message not modified' or expired msg — non-fatal
+            pass
 
 
 def _last_usage_cost(chat_id: int, since: Optional[datetime] = None) -> float:
@@ -5249,6 +5428,9 @@ BOT_COMMANDS: List[BotCommand] = [
     BotCommand("dashboard", "오늘 + 골 + mission + persona 한 통"),
     BotCommand("cleanup", "메모리 중복 정리 (사람 / facts / relations)"),
     BotCommand("macro", "재사용 가능 명령 매크로 (save/delete/실행)"),
+    BotCommand("subscribe", "토픽 정기 구독 (환율 / 항공권 / 부동산)"),
+    BotCommand("unsubscribe", "구독 해지"),
+    BotCommand("quiet", "조용 시간 (23:00-07:00 nudge 자동 억제)"),
     BotCommand("improvements", "봇이 자기를 어떻게 조정했는지 (Sun 10:00)"),
     BotCommand("rules", "자동 액션 규칙 (메일 자동, RSVP 자동)"),
     BotCommand("persona", "내가 누구인지 봇이 그린 인물 요약"),
@@ -5297,6 +5479,7 @@ async def post_init(app: Application) -> None:
         mission_tick_runner=run_mission_tick,
         relation_extract_runner=run_relation_extract,
         self_improve_runner=run_self_improve,
+        subscription_runner=run_subscription,
     )
     # Register the slash-command menu so Telegram clients show autocomplete.
     # Failure is non-fatal (the bot still works without the menu).
@@ -5346,6 +5529,9 @@ def main() -> None:
     app.add_handler(CommandHandler("dashboard", cmd_dashboard))
     app.add_handler(CommandHandler("cleanup", cmd_cleanup))
     app.add_handler(CommandHandler("macro", cmd_macro))
+    app.add_handler(CommandHandler("subscribe", cmd_subscribe))
+    app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
+    app.add_handler(CommandHandler("quiet", cmd_quiet))
     app.add_handler(CommandHandler("improvements", cmd_improvements))
     app.add_handler(CommandHandler("rules", cmd_rules))
     app.add_handler(CommandHandler("persona", cmd_persona))
