@@ -8,3 +8,4 @@ venv/
 .vscode/
 .claude/secrets.local.md
 .claude/*.local.md
+.claude/settings.local.json
