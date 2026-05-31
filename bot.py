@@ -334,6 +334,18 @@ def _system_message(chat_id: int, recent_user_text: str = "") -> Dict:
             f"{override}\n\n"
             + base
         )
+    # v9: travel mode — when user is currently on a trip, prefix the prompt so
+    # weather/leave-by/persona answers anchor to the destination, not home.
+    today_iso = datetime.now(TZ).date().isoformat()
+    travel = db.active_travel_for(chat_id, today_iso)
+    if travel:
+        base = (
+            f"🛫 TRAVEL MODE — User is currently in {travel['destination']} "
+            f"({travel['start_date_local']} → {travel['end_date_local']}). "
+            "Anchor weather/transport/leave-by to the destination unless asked "
+            "otherwise. Tone slightly more 'travelling' (less routine nudges).\n\n"
+            + base
+        )
     if recent_user_text:
         people_ctx = _people_context_for_text(chat_id, recent_user_text)
         if people_ctx:
@@ -501,6 +513,12 @@ def tool_add_event(chat_id: int, args: Dict) -> Dict:
             leave_by_queued = True
         except Exception:
             logger.exception("leave-by enqueue failed for event %s", eid)
+    # v9: travel-mode auto-detect on new event.
+    if row and not _toggle_off_local(chat_id, "travel_autodetect_enabled"):
+        try:
+            asyncio.create_task(_maybe_detect_travel(chat_id, row))
+        except Exception:
+            logger.exception("travel autodetect enqueue failed")
     return {
         "ok": True,
         "event_id": eid,
@@ -943,6 +961,204 @@ def tool_merge_people(chat_id: int, args: Dict) -> Dict:
 
 # (SYNC_HANDLERS.update for find_duplicates/merge_people lives later, after the
 # SYNC_HANDLERS dict is defined.)
+
+
+# ---------------- v9: inbox zero — daily Gmail triage ----------------
+
+
+INBOX_TRIAGE_PROMPT = (
+    "다음 Gmail 메시지 한 통을 4 카테고리로 분류해 1줄 JSON: "
+    '{{"category": "important"|"draft_reply"|"archive"|"noise", '
+    '"summary": "<≤80자 한국어 요약>"}}. '
+    "important: 사용자가 봐야 할 메일 (직장·계약·중요한 사람). "
+    "draft_reply: 답장이 필요한 메일 — 짧은 답장 초안. "
+    "archive: 알림·뉴스레터·확인 (자동 archive). "
+    "noise: 광고·스팸 (자동 archive).\n\n"
+    "보낸 사람: {sender}\n제목: {subject}\n본문:\n{body}"
+)
+
+
+async def run_inbox_triage(chat_id: int) -> None:
+    """Daily 06:30 — fetch all unread in last 24h, classify each, archive
+    auto categories, send digest of important + draft suggestions."""
+    if _toggle_off_local(chat_id, "inbox_triage_enabled"):
+        return
+    if not db.get_oauth_token(chat_id, "google"):
+        return
+    try:
+        ids = await gmail_mod.list_messages(
+            chat_id, query="is:unread newer_than:1d", max_results=30)
+    except Exception:
+        logger.exception("inbox_triage list failed")
+        return
+    if not ids:
+        return
+    important: List[Dict] = []
+    drafts: List[Dict] = []
+    archived = 0
+    noise = 0
+    for mid in ids[:25]:  # cap LLM calls
+        try:
+            msg = await gmail_mod.get_message(chat_id, mid, body_max_chars=2000)
+        except Exception:
+            continue
+        body = (msg.get("body") or msg.get("snippet") or "")[:1500]
+        sender = msg.get("from") or ""
+        subject = msg.get("subject") or ""
+        prompt = INBOX_TRIAGE_PROMPT.format(
+            sender=sender, subject=subject, body=body)
+        try:
+            data = await chat_completion(
+                [{"role": "user", "content": prompt}],
+                tools=None, chat_id=chat_id, kind="classify_content",
+                max_tokens=160,
+            )
+            content = (data["choices"][0]["message"].get("content") or "").strip()
+        except Exception:
+            logger.exception("triage LLM failed for %s", mid)
+            continue
+        import re as _re
+        m = _re.search(r"\{[\s\S]*\}", content)
+        if not m:
+            continue
+        try:
+            parsed = json.loads(m.group(0))
+        except Exception:
+            continue
+        cat = parsed.get("category", "")
+        summary = (parsed.get("summary") or "")[:120]
+        entry = {"id": mid, "subject": subject, "from": sender,
+                  "summary": summary}
+        if cat == "important":
+            important.append(entry)
+        elif cat == "draft_reply":
+            drafts.append(entry)
+        elif cat in ("archive", "noise"):
+            try:
+                await gmail_mod.archive(chat_id, mid)
+                if cat == "noise":
+                    noise += 1
+                else:
+                    archived += 1
+            except Exception:
+                logger.debug("archive failed for %s", mid)
+    if _app is None or _app.bot is None:
+        return
+    lines = ["📬 Inbox Zero"]
+    if important:
+        lines.append(f"⭐ 중요 {len(important)}건 — 봐줘:")
+        for e in important[:6]:
+            lines.append(f"  • {e['subject'][:60]}")
+            lines.append(f"      ↳ {e['summary']}")
+    if drafts:
+        lines.append(f"✍️ 답장 후보 {len(drafts)}건:")
+        for e in drafts[:5]:
+            lines.append(f"  • {e['subject'][:60]} ({e['from'][:30]})")
+    lines.append("")
+    lines.append(f"🗃 자동 아카이브: {archived}건 · 🗑 스팸: {noise}건")
+    if archived + noise > 0:
+        db.log_agent_action(
+            chat_id, "inbox_triage",
+            summary=f"Inbox triage: arch={archived} noise={noise} imp={len(important)} drft={len(drafts)}",
+            payload={"archived": archived, "noise": noise,
+                     "important_count": len(important), "drafts_count": len(drafts)},
+        )
+    try:
+        await _app.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+        db.record_nudge(chat_id, "inbox_triage")
+    except Exception:
+        logger.exception("inbox_triage send failed")
+
+
+# ---------------- v9: habit experiments ----------------
+
+
+async def run_experiment_followup(exp_id: int) -> None:
+    """End-of-experiment evaluator: summarize habit log delta, mark complete."""
+    exp = db.get_experiment(exp_id)
+    if not exp or exp["status"] != "active":
+        return
+    chat_id = exp["chat_id"]
+    # crude evaluation: how many habit logs in the experiment window?
+    with db._conn() as c:
+        rows = list(c.execute(
+            "SELECT habit_key, COUNT(*) AS n FROM habits "
+            "WHERE chat_id=? AND substr(when_local,1,10)>=? AND substr(when_local,1,10)<=? "
+            "GROUP BY habit_key",
+            (chat_id, exp["start_date_local"], exp["end_date_local"])))
+    counts = {r["habit_key"]: r["n"] for r in rows}
+    summary_md = (
+        f"## 실험 결과 — {exp['title']}\n\n"
+        f"**가설**: {exp['hypothesis']}\n\n"
+        f"**기간**: {exp['start_date_local']} ~ {exp['end_date_local']}\n\n"
+        f"**habit 로그 수**:\n"
+        + ("\n".join(f"  - {k}: {v}회" for k, v in counts.items())
+           or "  - (없음)")
+        + "\n\n계속할지 결정해줘 — `/experiment keep` 또는 `/experiment drop`."
+    )
+    db.complete_experiment(chat_id, exp_id, summary_md)
+    if _app and _app.bot:
+        try:
+            await _app.bot.send_message(
+                chat_id=chat_id,
+                text=f"🧪 실험 종료 #{exp_id}\n\n{summary_md}",
+            )
+        except Exception:
+            logger.exception("experiment followup send failed")
+
+
+async def cmd_experiment(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/experiment` 목록 · `/experiment new <title> <hypothesis>` · `/experiment <id>`."""
+    chat_id = update.effective_chat.id
+    args = list(context.args or [])
+    if not args:
+        rows = db.list_habit_experiments(chat_id)
+        if not rows:
+            await update.message.reply_text(
+                "🧪 실험 없음.\n"
+                "사용: /experiment new 일찍자기 \"3일 22시 취침 → 컨디션 좋아진다\"\n"
+                "      /experiment <id>"
+            )
+            return
+        lines = ["🧪 실험 기록"]
+        for r in rows[:15]:
+            emoji = "🟢" if r["status"] == "active" else "✅" if r["status"] == "completed" else "·"
+            lines.append(f"  {emoji} #{r['id']} {r['title']} ({r['start_date_local']}~{r['end_date_local']})")
+        await update.message.reply_text("\n".join(lines))
+        return
+    if args[0].lower() == "new" and len(args) >= 3:
+        title = args[1]
+        hyp = " ".join(args[2:])
+        # default 7-day window
+        today = datetime.now(TZ).date()
+        end = today + timedelta(days=7)
+        eid = db.add_habit_experiment(
+            chat_id, title, hyp, today.isoformat(), end.isoformat())
+        scheduler.schedule_experiment_followup(eid, end.isoformat())
+        await update.message.reply_text(
+            f"🧪 실험 #{eid} 시작 — {title}\n"
+            f"  • 가설: {hyp}\n"
+            f"  • 기간: {today} ~ {end}\n"
+            f"  • 종료일 21:00에 결과 자동 정리"
+        )
+        return
+    if args[0].isdigit():
+        row = db.get_experiment(int(args[0]))
+        if not row or row["chat_id"] != chat_id:
+            await update.message.reply_text("없는 실험")
+            return
+        text = (
+            f"🧪 실험 #{row['id']} [{row['status']}]\n"
+            f"• {row['title']}\n"
+            f"• 가설: {row['hypothesis']}\n"
+            f"• 기간: {row['start_date_local']} ~ {row['end_date_local']}"
+        )
+        if row["result_md"]:
+            text += "\n\n" + row["result_md"][:2000]
+        await update.message.reply_text(text)
+        return
+    await update.message.reply_text(
+        "/experiment | /experiment new <title> <hypothesis> | /experiment <id>")
 
 
 SUBSCRIPTION_SYSTEM = (
@@ -2437,6 +2653,114 @@ async def _resolve_to_coord(text: str) -> Optional[Dict]:
     except Exception:
         pass
     return None
+
+
+# v9: travel mode auto-detection
+
+_TRAVEL_KEYWORDS = ("출장", "여행", "휴가", "trip", "vacation", "business trip",
+                     "신혼여행", "워크샵", "워크숍")
+_TRAVEL_CITIES = ("도쿄", "오사카", "후쿠오카", "교토", "삿포로", "오키나와",
+                   "타이베이", "방콕", "치앙마이", "발리", "보라카이",
+                   "다낭", "하노이", "호치민", "싱가포르",
+                   "뉴욕", "LA", "샌프란시스코", "보스턴", "시애틀",
+                   "런던", "파리", "로마", "바르셀로나", "프라하",
+                   "부산", "제주", "강릉", "여수")
+
+
+async def _maybe_detect_travel(chat_id: int, event_row) -> None:
+    """Best-effort: classify a new event as travel-related. If yes, register a
+    travel_period covering the event's local date + nearby days."""
+    title = (event_row["title"] or "").strip().lower()
+    notes = (event_row["notes"] or "").lower()
+    location = (event_row["location"] or "").strip()
+    text = title + " " + notes + " " + location.lower()
+    matched_kw = any(kw in text for kw in _TRAVEL_KEYWORDS)
+    matched_city = next((c for c in _TRAVEL_CITIES if c in title or c in location), None)
+    if not matched_kw and not matched_city:
+        return
+    # Skip if already in an active travel period
+    try:
+        when_local = datetime.fromisoformat(event_row["when_utc"]).astimezone(TZ).date()
+    except Exception:
+        return
+    today_iso = when_local.isoformat()
+    if db.active_travel_for(chat_id, today_iso):
+        return
+    destination = matched_city or location or (
+        # try to extract place name from title — pick longest non-keyword token
+        max((t for t in title.split() if t not in _TRAVEL_KEYWORDS), default="여행")
+    )
+    destination = destination.strip()[:40] or "여행"
+    # Default window: event day ± 1 (will be refined by user)
+    start = when_local
+    end = when_local + timedelta(days=2)
+    tid = db.add_travel_period(
+        chat_id, destination, start.isoformat(), end.isoformat(),
+        detected_from_event_id=event_row["id"],
+        notes=f"auto-detected from event #{event_row['id']}",
+    )
+    if _app and _app.bot:
+        try:
+            await _app.bot.send_message(
+                chat_id=chat_id,
+                text=(f"🛫 여행 감지 — '{event_row['title']}' → {destination}\n"
+                      f"  • 기간 {start.isoformat()} ~ {end.isoformat()}\n"
+                      "  • 그 기간에는 날씨/leave-by가 destination 기준으로 전환\n"
+                      f"  • 수정/삭제: /travel"),
+            )
+            db.log_agent_action(
+                chat_id, "travel_detect",
+                summary=f"{destination} 여행 자동 등록 #{tid}",
+                payload={"travel_id": tid, "event_id": event_row["id"]},
+            )
+        except Exception:
+            logger.exception("travel detect notify failed")
+
+
+async def cmd_travel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/travel` 목록 + 활성 · `/travel add <dest> <YYYY-MM-DD> <YYYY-MM-DD>` ·
+    `/travel delete <id>`."""
+    chat_id = update.effective_chat.id
+    args = list(context.args or [])
+    if not args:
+        today_iso = datetime.now(TZ).date().isoformat()
+        active = db.active_travel_for(chat_id, today_iso)
+        rows = db.list_travel_periods(chat_id)
+        lines = ["🛫 여행 기록"]
+        if active:
+            lines.append(f"  ▶️ 현재: {active['destination']} ({active['start_date_local']}~{active['end_date_local']})")
+        else:
+            lines.append("  ▶️ 현재: 여행 중 아님")
+        lines.append("")
+        for r in rows[:10]:
+            lines.append(f"  #{r['id']} {r['destination']}: {r['start_date_local']}~{r['end_date_local']}")
+        if not rows:
+            lines.append("  (등록 없음)")
+        await update.message.reply_text("\n".join(lines))
+        return
+    op = args[0].lower()
+    if op == "add" and len(args) >= 4:
+        dest = args[1]
+        start = args[2]; end = args[3]
+        try:
+            datetime.fromisoformat(start); datetime.fromisoformat(end)
+        except Exception:
+            await update.message.reply_text("날짜는 YYYY-MM-DD")
+            return
+        tid = db.add_travel_period(chat_id, dest, start, end)
+        await update.message.reply_text(f"🛫 #{tid} {dest} {start}~{end} 등록")
+        return
+    if op == "delete" and len(args) >= 2:
+        try:
+            tid = int(args[1])
+        except ValueError:
+            await update.message.reply_text("travel_id는 숫자")
+            return
+        ok = db.delete_travel_period(chat_id, tid)
+        await update.message.reply_text(f"🗑 #{tid} 삭제" if ok else "없음")
+        return
+    await update.message.reply_text(
+        "사용:\n  /travel\n  /travel add 도쿄 2026-07-10 2026-07-13\n  /travel delete <id>")
 
 
 async def _try_schedule_leave_by(chat_id: int, event_row) -> None:
@@ -5431,6 +5755,8 @@ BOT_COMMANDS: List[BotCommand] = [
     BotCommand("subscribe", "토픽 정기 구독 (환율 / 항공권 / 부동산)"),
     BotCommand("unsubscribe", "구독 해지"),
     BotCommand("quiet", "조용 시간 (23:00-07:00 nudge 자동 억제)"),
+    BotCommand("travel", "여행 모드 (자동 감지 + 수동 등록)"),
+    BotCommand("experiment", "1주 습관 실험 (자동 평가)"),
     BotCommand("improvements", "봇이 자기를 어떻게 조정했는지 (Sun 10:00)"),
     BotCommand("rules", "자동 액션 규칙 (메일 자동, RSVP 자동)"),
     BotCommand("persona", "내가 누구인지 봇이 그린 인물 요약"),
@@ -5480,6 +5806,8 @@ async def post_init(app: Application) -> None:
         relation_extract_runner=run_relation_extract,
         self_improve_runner=run_self_improve,
         subscription_runner=run_subscription,
+        inbox_triage_runner=run_inbox_triage,
+        experiment_followup_runner=run_experiment_followup,
     )
     # Register the slash-command menu so Telegram clients show autocomplete.
     # Failure is non-fatal (the bot still works without the menu).
@@ -5532,6 +5860,8 @@ def main() -> None:
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
     app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
     app.add_handler(CommandHandler("quiet", cmd_quiet))
+    app.add_handler(CommandHandler("travel", cmd_travel))
+    app.add_handler(CommandHandler("experiment", cmd_experiment))
     app.add_handler(CommandHandler("improvements", cmd_improvements))
     app.add_handler(CommandHandler("rules", cmd_rules))
     app.add_handler(CommandHandler("persona", cmd_persona))

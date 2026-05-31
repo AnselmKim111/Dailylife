@@ -43,6 +43,8 @@ _mission_tick_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg =
 _relation_extract_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _self_improve_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _subscription_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = sub_id
+_inbox_triage_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = chat_id
+_experiment_followup_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = exp_id
 
 
 def init(
@@ -70,6 +72,8 @@ def init(
     relation_extract_runner: Optional[Callable[[int], Awaitable[None]]] = None,
     self_improve_runner: Optional[Callable[[int], Awaitable[None]]] = None,
     subscription_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    inbox_triage_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    experiment_followup_runner: Optional[Callable[[int], Awaitable[None]]] = None,
 ) -> None:
     global _scheduler, _bot, _recurring_runner, _weekly_review_runner, _daily_imminent_runner
     global _morning_briefing_runner, _evening_reflection_runner
@@ -79,6 +83,7 @@ def init(
     global _streak_compute_runner, _weekly_scorecard_runner, _active_learning_runner
     global _budget_check_runner, _late_check_runner, _mission_tick_runner
     global _relation_extract_runner, _self_improve_runner, _subscription_runner
+    global _inbox_triage_runner, _experiment_followup_runner
     _bot = bot
     _recurring_runner = recurring_runner
     _weekly_review_runner = weekly_review_runner
@@ -103,6 +108,8 @@ def init(
     _relation_extract_runner = relation_extract_runner
     _self_improve_runner = self_improve_runner
     _subscription_runner = subscription_runner
+    _inbox_triage_runner = inbox_triage_runner
+    _experiment_followup_runner = experiment_followup_runner
     # Re-arm any existing subscriptions on boot
     if _subscription_runner:
         try:
@@ -513,6 +520,17 @@ def ensure_daily_rhythm_for(chat_id: int) -> None:
             replace_existing=True,
             misfire_grace_time=3600,
         )
+    if _inbox_triage_runner and not _toggle_off(chat_id, "inbox_triage_enabled"):
+        t = _fact_value(chat_id, "inbox_triage_time") or "06:30"
+        hour, minute = _parse_hhmm(t, 6, 30)
+        _scheduler.add_job(
+            _run_inbox_triage,
+            CronTrigger(hour=hour, minute=minute, timezone=TZ),
+            args=[chat_id],
+            id=f"inbox-triage-{chat_id}",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
     if _relation_extract_runner and not _toggle_off(chat_id, "graph_extract_enabled"):
         _scheduler.add_job(
             _run_relation_extract,
@@ -827,6 +845,45 @@ async def _run_subscription(sub_id: int) -> None:
         await _subscription_runner(sub_id)
     except Exception:
         logger.exception("subscription run failed for sub %s", sub_id)
+
+
+async def _run_inbox_triage(chat_id: int) -> None:
+    if _inbox_triage_runner is None or _toggle_off(chat_id, "inbox_triage_enabled"):
+        return
+    try:
+        await _inbox_triage_runner(chat_id)
+    except Exception:
+        logger.exception("inbox triage failed for chat %s", chat_id)
+
+
+async def _run_experiment_followup(exp_id: int) -> None:
+    if _experiment_followup_runner is None:
+        return
+    try:
+        await _experiment_followup_runner(exp_id)
+    except Exception:
+        logger.exception("experiment followup failed for exp %s", exp_id)
+
+
+def schedule_experiment_followup(exp_id: int, end_date_iso: str) -> Optional[str]:
+    """One-shot job at end_date local 21:00 KST that closes the experiment."""
+    if _scheduler is None or _experiment_followup_runner is None:
+        return None
+    try:
+        end_local = datetime.fromisoformat(end_date_iso).replace(
+            hour=21, minute=0, tzinfo=TZ)
+    except Exception:
+        return None
+    if end_local <= datetime.now(TZ):
+        return None
+    job_id = f"experiment-followup-{exp_id}"
+    _scheduler.add_job(
+        _run_experiment_followup,
+        DateTrigger(run_date=end_local.astimezone(timezone.utc)),
+        args=[exp_id], id=job_id, replace_existing=True,
+        misfire_grace_time=3600,
+    )
+    return job_id
 
 
 def schedule_late_check(event_id: int, run_at_utc: datetime) -> Optional[str]:

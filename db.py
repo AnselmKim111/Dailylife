@@ -320,6 +320,31 @@ CREATE TABLE IF NOT EXISTS subscriptions (
 );
 CREATE INDEX IF NOT EXISTS idx_subs_chat ON subscriptions(chat_id, enabled);
 
+CREATE TABLE IF NOT EXISTS travel_periods (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    destination TEXT NOT NULL,         -- '도쿄' '부산' etc.
+    start_date_local TEXT NOT NULL,    -- YYYY-MM-DD
+    end_date_local TEXT NOT NULL,
+    detected_from_event_id INTEGER,
+    notes TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_travel_chat_dates ON travel_periods(chat_id, start_date_local, end_date_local);
+
+CREATE TABLE IF NOT EXISTS habit_experiments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    hypothesis TEXT NOT NULL,
+    start_date_local TEXT NOT NULL,
+    end_date_local TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',   -- active|completed|abandoned
+    result_md TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_experiments_chat_status ON habit_experiments(chat_id, status);
+
 CREATE TABLE IF NOT EXISTS error_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts_utc TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -1950,6 +1975,98 @@ def delete_subscription(chat_id: int, name: str) -> bool:
             "DELETE FROM subscriptions WHERE chat_id=? AND name=?",
             (chat_id, name.strip()))
         return cur.rowcount > 0
+
+
+# ---------------- v9: travel periods ----------------
+
+
+def add_travel_period(
+    chat_id: int, destination: str,
+    start_date_local: str, end_date_local: str,
+    detected_from_event_id: Optional[int] = None,
+    notes: Optional[str] = None,
+) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO travel_periods (chat_id, destination, start_date_local, "
+            "end_date_local, detected_from_event_id, notes) VALUES (?,?,?,?,?,?)",
+            (chat_id, destination.strip(), start_date_local, end_date_local,
+             detected_from_event_id, notes))
+        return cur.lastrowid
+
+
+def active_travel_for(chat_id: int, today_iso: str) -> Optional[sqlite3.Row]:
+    """Return the travel_period covering today_iso (if any)."""
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM travel_periods WHERE chat_id=? "
+            "AND start_date_local <= ? AND end_date_local >= ? "
+            "ORDER BY start_date_local DESC LIMIT 1",
+            (chat_id, today_iso, today_iso)).fetchone()
+
+
+def list_travel_periods(chat_id: int) -> List[sqlite3.Row]:
+    with _conn() as c:
+        return list(c.execute(
+            "SELECT * FROM travel_periods WHERE chat_id=? "
+            "ORDER BY start_date_local DESC LIMIT 30", (chat_id,)))
+
+
+def delete_travel_period(chat_id: int, travel_id: int) -> bool:
+    with _conn() as c:
+        cur = c.execute(
+            "DELETE FROM travel_periods WHERE chat_id=? AND id=?",
+            (chat_id, travel_id))
+        return cur.rowcount > 0
+
+
+# ---------------- v9: habit_experiments ----------------
+
+
+def add_habit_experiment(
+    chat_id: int, title: str, hypothesis: str,
+    start_date_local: str, end_date_local: str,
+) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO habit_experiments (chat_id, title, hypothesis, "
+            "start_date_local, end_date_local) VALUES (?,?,?,?,?)",
+            (chat_id, title.strip(), hypothesis.strip(),
+             start_date_local, end_date_local))
+        return cur.lastrowid
+
+
+def list_habit_experiments(chat_id: int, status: Optional[str] = None) -> List[sqlite3.Row]:
+    with _conn() as c:
+        if status:
+            return list(c.execute(
+                "SELECT * FROM habit_experiments WHERE chat_id=? AND status=? "
+                "ORDER BY created_at DESC", (chat_id, status)))
+        return list(c.execute(
+            "SELECT * FROM habit_experiments WHERE chat_id=? "
+            "ORDER BY created_at DESC", (chat_id,)))
+
+
+def get_experiment(exp_id: int) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM habit_experiments WHERE id=?", (exp_id,)).fetchone()
+
+
+def complete_experiment(chat_id: int, exp_id: int, result_md: str) -> bool:
+    with _conn() as c:
+        cur = c.execute(
+            "UPDATE habit_experiments SET status='completed', result_md=? "
+            "WHERE id=? AND chat_id=? AND status='active'",
+            (result_md[:2000], exp_id, chat_id))
+        return cur.rowcount > 0
+
+
+def all_active_experiments() -> List[sqlite3.Row]:
+    with _conn() as c:
+        return list(c.execute(
+            "SELECT * FROM habit_experiments WHERE status='active' "
+            "AND end_date_local <= date('now','+1 day')"))
 
 
 def find_duplicate_people(chat_id: int) -> List[Dict]:

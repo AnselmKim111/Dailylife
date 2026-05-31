@@ -215,6 +215,26 @@ async def draft_message(
     return await _gmail_api(chat_id, "POST", "/drafts", json_body=body)
 
 
+async def modify_labels(
+    chat_id: int, message_id: str,
+    add: Optional[list] = None, remove: Optional[list] = None,
+) -> Dict[str, Any]:
+    """Apply Gmail labels. Common use: remove=['UNREAD'] to archive-as-read."""
+    body = {}
+    if add:
+        body["addLabelIds"] = list(add)
+    if remove:
+        body["removeLabelIds"] = list(remove)
+    return await _gmail_api(
+        chat_id, "POST", f"/messages/{message_id}/modify", json_body=body,
+    )
+
+
+async def archive(chat_id: int, message_id: str) -> Dict[str, Any]:
+    """Archive a message — removes INBOX label (Gmail's archive semantics)."""
+    return await modify_labels(chat_id, message_id, remove=["INBOX"])
+
+
 async def recent_summary(
     chat_id: int,
     hours: int = 24,
