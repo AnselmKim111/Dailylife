@@ -38,6 +38,7 @@ _streak_compute_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _weekly_scorecard_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _active_learning_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _budget_check_runner: Optional[Callable[[int], Awaitable[None]]] = None
+_late_check_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = event_id
 
 
 def init(
@@ -60,6 +61,7 @@ def init(
     weekly_scorecard_runner: Optional[Callable[[int], Awaitable[None]]] = None,
     active_learning_runner: Optional[Callable[[int], Awaitable[None]]] = None,
     budget_check_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    late_check_runner: Optional[Callable[[int], Awaitable[None]]] = None,
 ) -> None:
     global _scheduler, _bot, _recurring_runner, _weekly_review_runner, _daily_imminent_runner
     global _morning_briefing_runner, _evening_reflection_runner
@@ -67,7 +69,7 @@ def init(
     global _midday_checkin_runner, _leave_by_recompute_runner, _leave_by_runner
     global _persona_rebuild_runner, _gcal_invite_watch_runner, _agent_digest_runner
     global _streak_compute_runner, _weekly_scorecard_runner, _active_learning_runner
-    global _budget_check_runner
+    global _budget_check_runner, _late_check_runner
     _bot = bot
     _recurring_runner = recurring_runner
     _weekly_review_runner = weekly_review_runner
@@ -87,6 +89,7 @@ def init(
     _weekly_scorecard_runner = weekly_scorecard_runner
     _active_learning_runner = active_learning_runner
     _budget_check_runner = budget_check_runner
+    _late_check_runner = late_check_runner
     _scheduler = AsyncIOScheduler(timezone=TZ)
     _scheduler.start()
 
@@ -705,6 +708,34 @@ async def _run_budget_check(chat_id: int) -> None:
         await _budget_check_runner(chat_id)
     except Exception:
         logger.exception("budget check failed for chat %s", chat_id)
+
+
+async def _run_late_check(event_id: int) -> None:
+    if _late_check_runner is None:
+        return
+    try:
+        await _late_check_runner(event_id)
+    except Exception:
+        logger.exception("late check failed for event %s", event_id)
+
+
+def schedule_late_check(event_id: int, run_at_utc: datetime) -> Optional[str]:
+    """Arm a one-shot late-check ~8min after a leave-by fired. Caller is the
+    leave-by runner itself."""
+    if _scheduler is None or _late_check_runner is None:
+        return None
+    if run_at_utc <= datetime.now(timezone.utc):
+        return None
+    job_id = f"late-check-{event_id}"
+    _scheduler.add_job(
+        _run_late_check,
+        DateTrigger(run_date=run_at_utc),
+        args=[event_id],
+        id=job_id,
+        replace_existing=True,
+        misfire_grace_time=300,
+    )
+    return job_id
 
 
 def trigger_persona_rebuild_now(chat_id: int) -> None:

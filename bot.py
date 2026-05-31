@@ -2116,6 +2116,10 @@ def _fact_value_local(chat_id: int, key: str) -> Optional[str]:
     return None
 
 
+# event_id → utc timestamp when the leave-by fired; consumed by run_late_check.
+_leave_by_sent_at: Dict[int, datetime] = {}
+
+
 async def _send_leave_by_for_event(event_id: int) -> None:
     if _app is None or _app.bot is None:
         return
@@ -2133,8 +2137,72 @@ async def _send_leave_by_for_event(event_id: int) -> None:
     text += f"\n• 도착 목표: {when_local.strftime('%H:%M')} ({delta_min}분 뒤)"
     try:
         await _app.bot.send_message(chat_id=row["chat_id"], text=text)
+        # Arm the 8-min late check (a no-op if user moves / replies in time).
+        sent_at = datetime.now(timezone.utc)
+        _leave_by_sent_at[event_id] = sent_at
+        scheduler.schedule_late_check(event_id, sent_at + timedelta(minutes=8))
     except Exception:
         logger.exception("leave-by send failed for event %s", event_id)
+
+
+# Short-lived in-memory map for late-card buttons.
+_pending_late_cards: Dict[str, Dict] = {}
+
+
+async def run_late_check(event_id: int) -> None:
+    """8 min after a leave-by fired: if the user hasn't sent any message since
+    (suggesting they're not actually moving), surface a 'looks like you're
+    running late — want me to tell anyone?' card."""
+    if _app is None or _app.bot is None:
+        return
+    row = db.get_event(event_id)
+    if not row:
+        return
+    sent_at = _leave_by_sent_at.pop(event_id, None)
+    if not sent_at:
+        return
+    chat_id = row["chat_id"]
+    # Activity check — any user message since the leave-by went out?
+    with db._conn() as c:
+        recent = c.execute(
+            "SELECT 1 FROM chat_log WHERE chat_id=? AND role='user' "
+            "AND created_at>? LIMIT 1",
+            (chat_id, sent_at.isoformat()),
+        ).fetchone()
+    if recent:
+        return  # user is engaging — assume they're on the move
+    # Don't nudge for events long past.
+    when_utc = datetime.fromisoformat(row["when_utc"])
+    if (datetime.now(timezone.utc) - when_utc).total_seconds() > 30 * 60:
+        return
+    # Best-effort: look up GCal organizer email so we can offer "mail them" button.
+    organizer = None
+    if row["gcal_event_id"] and db.get_oauth_token(chat_id, "google"):
+        try:
+            ev = await gcal._api(
+                chat_id, "GET", f"/calendars/primary/events/{row['gcal_event_id']}")
+            organizer = (ev.get("organizer") or {}).get("email")
+        except Exception:
+            organizer = None
+
+    token = secrets.token_urlsafe(8)
+    _pending_late_cards[token] = {
+        "chat_id": chat_id, "event_id": event_id,
+        "event_title": row["title"], "organizer_email": organizer,
+    }
+    btn_row = [InlineKeyboardButton("📋 메시지 초안", callback_data=f"act:late_msg:{token}")]
+    if organizer:
+        btn_row.append(InlineKeyboardButton("📨 그분께 메일",
+                                              callback_data=f"act:late_mail:{token}"))
+    kb = InlineKeyboardMarkup([
+        btn_row,
+        [InlineKeyboardButton("👀 안 늦었어", callback_data=f"act:late_dismiss:{token}")],
+    ])
+    text = f"🚗 {row['title']} — 늦어지는 것 같아. 알릴까?"
+    try:
+        await _app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+    except Exception:
+        logger.exception("late check send failed for event %s", event_id)
 
 
 async def run_leave_by_recompute(chat_id: int) -> None:
@@ -3567,6 +3635,46 @@ async def on_callback_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     await cq.answer("이 액션은 취소 미지원", show_alert=False)
             except Exception as e:
                 await cq.answer(f"⚠ {e}", show_alert=True)
+        elif kind in ("late_msg", "late_mail", "late_dismiss"):
+            cand = _pending_late_cards.pop(rest, None)
+            if not cand or cand["chat_id"] != chat_id:
+                await cq.answer("만료된 카드", show_alert=False)
+                return
+            try:
+                await cq.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            if kind == "late_dismiss":
+                await cq.answer("OK", show_alert=False)
+            elif kind == "late_msg":
+                draft = (f"지금 가는 중인데 {cand['event_title']} 5분 정도 "
+                         "늦을 것 같아요. 죄송합니다 🙏")
+                await context.bot.send_message(chat_id=chat_id,
+                                                text=f"📋 복사용 초안:\n\n{draft}")
+                await cq.answer("초안 보냄", show_alert=False)
+            elif kind == "late_mail":
+                org = cand.get("organizer_email")
+                if not org:
+                    await cq.answer("organizer 이메일 없음", show_alert=False)
+                    return
+                subject = f"Re: {cand['event_title']} — 5분 정도 늦겠습니다"
+                body = (
+                    f"안녕하세요,\n\n{cand['event_title']}에 5분 정도 늦을 것 같습니다. "
+                    "양해 부탁드립니다.\n감사합니다."
+                )
+                try:
+                    res = await gmail_mod.send_message(chat_id, org, subject, body)
+                    db.log_agent_action(
+                        chat_id, "gmail_send",
+                        summary=f"늦음 안내 메일 → {org} · {cand['event_title'][:40]}",
+                        payload={"to": org, "subject": subject,
+                                  "event_id": cand["event_id"],
+                                  "gmail_message_id": res.get("id")},
+                    )
+                    await cq.answer(f"✅ {org}에게 메일", show_alert=False)
+                except Exception as e:
+                    logger.exception("late mail send failed")
+                    await cq.answer(f"⚠ {e}", show_alert=True)
         elif kind == "bday_draft":
             pid = int(rest)
             people = [p for p in db.list_people(chat_id) if p["id"] == pid]
@@ -3918,6 +4026,7 @@ async def post_init(app: Application) -> None:
         weekly_scorecard_runner=run_weekly_scorecard,
         active_learning_runner=run_active_learning,
         budget_check_runner=run_budget_check,
+        late_check_runner=run_late_check,
     )
     # Register the slash-command menu so Telegram clients show autocomplete.
     # Failure is non-fatal (the bot still works without the menu).
