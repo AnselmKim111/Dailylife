@@ -396,8 +396,9 @@ def ensure_daily_rhythm_for(chat_id: int) -> None:
             replace_existing=True,
             misfire_grace_time=3600,
         )
-    # Pre-emptive nudges — each gated by its own fact toggle.
-    if _evening_preview_runner and not _toggle_off(chat_id, "weather_preview_enabled"):
+    # v10: morning_briefing absorbs evening preview / midday checkin / inbox
+    # triage. All opt-in via `/nudges on <name>` — user gets ONE morning msg.
+    if _evening_preview_runner and _toggle_on(chat_id, "weather_preview_enabled"):
         t = _fact_value(chat_id, "weather_preview_time") or "22:00"
         hour, minute = _parse_hhmm(t, 22, 0)
         _scheduler.add_job(
@@ -417,7 +418,7 @@ def ensure_daily_rhythm_for(chat_id: int) -> None:
             replace_existing=True,
             misfire_grace_time=3600,
         )
-    if _midday_checkin_runner and not _toggle_off(chat_id, "midday_checkin_enabled"):
+    if _midday_checkin_runner and _toggle_on(chat_id, "midday_checkin_enabled"):
         t = _fact_value(chat_id, "midday_checkin_time") or "13:00"
         hour, minute = _parse_hhmm(t, 13, 0)
         _scheduler.add_job(
@@ -491,7 +492,7 @@ def ensure_daily_rhythm_for(chat_id: int) -> None:
             replace_existing=True,
             misfire_grace_time=3600,
         )
-    if _weekly_scorecard_runner and not _toggle_off(chat_id, "weekly_scorecard_enabled"):
+    if _weekly_scorecard_runner and _toggle_on(chat_id, "weekly_scorecard_enabled"):
         _scheduler.add_job(
             _run_weekly_scorecard,
             CronTrigger(day_of_week="sun", hour=18, minute=0, timezone=TZ),
@@ -520,7 +521,7 @@ def ensure_daily_rhythm_for(chat_id: int) -> None:
             replace_existing=True,
             misfire_grace_time=3600,
         )
-    if _inbox_triage_runner and not _toggle_off(chat_id, "inbox_triage_enabled"):
+    if _inbox_triage_runner and _toggle_on(chat_id, "inbox_triage_enabled"):
         t = _fact_value(chat_id, "inbox_triage_time") or "06:30"
         hour, minute = _parse_hhmm(t, 6, 30)
         _scheduler.add_job(

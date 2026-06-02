@@ -74,8 +74,21 @@ HISTORY_LIMIT = int(os.environ.get("HISTORY_LIMIT", "16"))
 TZ = ZoneInfo(USER_TZ)
 
 SYSTEM_PROMPT_TEMPLATE = (
-    "You are Dailylife, the user's personal Telegram assistant for schedule, errands, memory, and "
-    "general questions. Default to Korean unless the user writes another language. Be warm and concise.\n\n"
+    "You are the user's chief of staff — not a cheerleader, not a coach, not a "
+    "tracker. Job #1: ABSORB DECISIONS so the user makes fewer.\n\n"
+    "TONE RULES (override anything below if conflict):\n"
+    "1. Brevity is respect. Match user message length. 5 단어면 5 단어로 답.\n"
+    "2. Decisions: 추천 1개 + 이유 1줄. 옵션 나열 금지. 사용자가 명시적으로 "
+    "'대안 알려줘' 했을 때만 1개 alternative + trade-off 1줄.\n"
+    "3. Never score the user. 점수·%·streak·'잘하고 있어'·'이번 주 어땠어' 금지. "
+    "🔥·💪·✅ emoji는 performance mark로 쓰지 마. 데이터는 조용히 추적, 사용자는 "
+    "결과만 받음.\n"
+    "4. 사용자 기분·컨디션 질문 금지. 사용자가 먼저 말하지 않으면 묻지 않음.\n"
+    "5. 모르면 '모름' — guess 금지. 추측이면 '추측이지만' 접두.\n"
+    "6. Persona (위에) = source of truth. 사용자의 평소 패턴을 자연스럽게 회상 "
+    "('너 평소 화/목 운동이지', '그거 경서랑 약속한 거 아니야?'). DB가 아니라 "
+    "사람처럼 기억해. Persona에 없는 디테일은 만들지 마.\n"
+    "7. 한국어 기본. 사용자가 다른 언어로 쓰면 그 언어로.\n\n"
     "All datetimes the user mentions are in {tz} timezone. Convert relative times "
     "('내일 3시', 'in 2 hours', '다음 주 월요일') against current_time below.\n"
     "current_time: {now} ({tz})\n\n"
@@ -116,9 +129,6 @@ SYSTEM_PROMPT_TEMPLATE = (
     "gcal_rsvp work. Only fire them when the user explicitly asks ('메일 보내줘', "
     "'회의 수락해줘') OR an auto_rule matched (which the runner enforces, you don't gate). "
     "Otherwise PROPOSE the draft and ask.\n"
-    "- Coaching tone: when habits broken or goals slipping, warm rather than scolding "
-    "('괜찮아, 내일 다시 시작'). Single exception — goal at D-7 with 0% progress: "
-    "be honest, suggest pause vs push.\n\n"
     "Known facts about this user:\n{facts_block}"
 )
 
@@ -1932,7 +1942,7 @@ async def tool_gcal_rsvp(chat_id: int, args: Dict) -> Dict:
 def tool_add_auto_rule(chat_id: int, args: Dict) -> Dict:
     rule_kind = args.get("rule_kind")
     cond = args.get("condition") or {}
-    if rule_kind not in ("gmail_auto_add_event", "gcal_auto_rsvp"):
+    if rule_kind not in ("gmail_auto_add_event", "gcal_auto_rsvp", "gcal_auto_decline"):
         return {"ok": False, "error": f"unsupported rule_kind {rule_kind}"}
     rid = db.add_auto_rule(chat_id, rule_kind, cond)
     return {"ok": True, "rule_id": rid}
@@ -2268,101 +2278,154 @@ async def run_weekly_goal_review(chat_id: int) -> None:
 # ---------------- daily rhythm: morning briefing + evening reflection ----------------
 
 
-MORNING_BRIEFING_PROMPT = (
-    "지금부터 사용자에게 보낼 오늘 아침 브리핑을 작성해. 친근한 한국어로 1-2분 분량.\n"
-    "주어진 데이터를 잘 엮어서, 의미 있는 것만 강조하고 너무 형식적이지 않게.\n\n"
-    "오늘 일정 (로컬+구글 캘린더 통합):\n{schedule}\n\n"
-    "내일 미리보기:\n{tomorrow}\n\n"
-    "임박한 골 (D-14 이내):\n{goals}\n\n"
-    "오늘 important_date가 있는 사람:\n{people}\n\n"
-    "{extras}\n"
-    "구성 추천: '굿모닝 + 한줄 컨디션 코멘트' → '핵심 일정 3-4줄' → "
-    "'챙길 것 1-2개' → '응원 한마디'. 빈 섹션은 자연스럽게 묶거나 생략."
-)
-
-
 async def run_morning_briefing(chat_id: int) -> None:
-    """Build today's briefing and push as a single message."""
+    """v10: deterministic, factual, score-free morning briefing. 흡수 대상 —
+    evening_preview / midday_checkin / birthday_solo / inbox_triage. 하나의
+    아침 메시지로 끝. 점수·% 0. 응원·기분 질문 0. 빈 섹션은 생략."""
     if _app is None or _app.bot is None:
         return
     today_local = datetime.now(TZ).date()
-    if db.get_daily_state(chat_id, today_local.isoformat()) and \
-            db.get_daily_state(chat_id, today_local.isoformat())["briefing_sent"]:
-        # Skip if already sent today (safe against duplicate triggers)
+    today_iso = today_local.isoformat()
+    state = db.get_daily_state(chat_id, today_iso)
+    if state and state["briefing_sent"]:
+        return
+    if _is_quiet_now(chat_id):
+        return
+    # 48h 침묵한 사용자 (휴가·아픔·바쁨) → 봇도 침묵
+    if not _user_was_active(chat_id, hours=48):
+        logger.info("briefing: chat %s silent 48h+, skip", chat_id)
         return
 
     now_local = datetime.now(TZ)
     end_today = now_local.replace(hour=23, minute=59, second=59)
-    tomorrow_start = (now_local + timedelta(days=1)).replace(hour=0, minute=0, second=0)
-    tomorrow_end = tomorrow_start + timedelta(hours=12)
-
     today_items = await _merge_schedule(
         chat_id, now_local.astimezone(timezone.utc), end_today.astimezone(timezone.utc))
-    tomorrow_items = await _merge_schedule(
-        chat_id, tomorrow_start.astimezone(timezone.utc), tomorrow_end.astimezone(timezone.utc))
 
-    def fmt_items(items: List[Dict]) -> str:
-        if not items:
-            return "  (없음)"
-        return "\n".join("  " + _format_merged_event(it) for it in items)
+    # 임박 골 — v10 D-14 → D-3 (D-14는 noise)
+    goals_imminent = [
+        g for g in db.goals_due_within(chat_id, days=3)
+        if g["target_date_local"]
+    ]
 
-    goals_due = db.goals_due_within(chat_id, days=14)
-    goals_str = "\n".join(
-        f"  - {r['title']} (D-{_days_until(r['target_date_local'])})" for r in goals_due
-    ) or "  (없음)"
-
-    people_today = []
+    # 오늘 important_date 매칭 (음력 인식)
+    birthdays_today: List[str] = []
     person_ids_today: List[int] = []
-    for r in db.list_people(chat_id):
-        for d in json.loads(r["important_dates_json"] or "[]"):
+    for p in db.list_people(chat_id):
+        for d in json.loads(p["important_dates_json"] or "[]"):
             try:
                 if _date_matches_today(d, today_local):
-                    lunar_tag = " (음력)" if d.get("is_lunar") else ""
-                    people_today.append(f"  - {r['name']}: {d['label']}{lunar_tag}")
-                    if r["id"] not in person_ids_today:
-                        person_ids_today.append(r["id"])
+                    tag = " (음력)" if d.get("is_lunar") else ""
+                    role = f" {p['role']}" if p["role"] else ""
+                    label = d.get("label") or "기념일"
+                    birthdays_today.append(f"{p['name']}{role} {label}{tag}")
+                    if p["id"] not in person_ids_today:
+                        person_ids_today.append(p["id"])
             except Exception:
                 pass
-    # Persist for the 09:00 birthday-solo cron (opt-in via fact).
-    db.mark_birthdays_today(chat_id, today_local.isoformat(), person_ids_today)
-    people_str = "\n".join(people_today) or "  (없음)"
+    db.mark_birthdays_today(chat_id, today_iso, person_ids_today)
 
-    extras_parts = []
-    # Optional Gmail summary
-    if (not _toggle_off_local(chat_id, "gmail_morning_scan") and
-            db.get_oauth_token(chat_id, "google")):
+    # 잊을 만한 거 (predictive)
+    blindspots: List[str] = []
+    if today_items and not _toggle_off_local(chat_id, "predictive_nudge_enabled"):
         try:
-            msgs = await gmail_mod.recent_summary(chat_id, hours=12, max_messages=8)
-            if msgs:
-                lines = []
-                for m in msgs:
-                    subject = (m.get("subject") or "(제목 없음)")[:60]
-                    lines.append(f"  - {subject}")
-                extras_parts.append("최근 12시간 메일:\n" + "\n".join(lines))
+            blindspots = await _predict_blindspots(chat_id, today_items)
         except Exception:
-            logger.exception("gmail_morning_scan failed (briefing continues)")
+            logger.exception("briefing predict failed (non-fatal)")
 
-    extras = "\n".join(extras_parts) if extras_parts else ""
+    # Inline inbox triage — Gmail 연결돼 있을 때만 (별도 cron 흡수)
+    inbox_starred: List[Dict] = []
+    inbox_archived = 0
+    if db.get_oauth_token(chat_id, "google"):
+        try:
+            inbox_starred, inbox_archived = await _inline_inbox_triage(chat_id, cap=10)
+        except Exception:
+            logger.exception("briefing inbox triage failed (non-fatal)")
 
-    user_msg = MORNING_BRIEFING_PROMPT.format(
-        schedule=fmt_items(today_items),
-        tomorrow=fmt_items(tomorrow_items),
-        goals=goals_str,
-        people=people_str,
-        extras=("기타:\n" + extras + "\n") if extras else "",
-    )
+    # 결정형 텍스트 빌드 — 점수·응원·기분질문 0
+    lines = [f"☀️ {today_local.strftime('%m월 %d일 (%a)')}", ""]
+    if today_items:
+        lines.append("오늘")
+        for it in today_items[:6]:
+            when = it["when_utc"].astimezone(TZ).strftime("%H:%M")
+            loc = f" @{it['location']}" if it.get("location") else ""
+            lines.append(f"  • {when} {it['title']}{loc}")
+        lines.append("")
+    if blindspots:
+        lines.append("잊을 만한 거")
+        for b in blindspots:
+            lines.append(f"  • {b}")
+        lines.append("")
+    if inbox_starred or inbox_archived:
+        lines.append("📬 메일")
+        for m in inbox_starred[:5]:
+            subj = (m.get("subject") or "")[:60]
+            lines.append(f"  • ⭐ {subj}")
+        if inbox_archived:
+            lines.append(f"  • {inbox_archived}건 자동 정리")
+        lines.append("")
+    for b in birthdays_today[:3]:
+        lines.append(f"🎂 {b}")
+    for g in goals_imminent[:3]:
+        d = _days_until(g["target_date_local"])
+        lines.append(f"🎯 {g['title']} D-{d}")
 
+    while lines and not lines[-1]:
+        lines.pop()
+    # 신호 0건이면 침묵
+    if len(lines) <= 2:
+        return
+    await _app.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+    db.mark_briefing_sent(chat_id, today_iso)
+    db.record_nudge(chat_id, "morning_briefing")
+
+
+async def _inline_inbox_triage(chat_id: int, cap: int = 10) -> tuple:
+    """run_inbox_triage 경량판 — (starred, archived_count) 반환. briefing이 호출."""
     try:
-        reply = await run_agent(chat_id, user_msg, history=[], max_hops=4)
-    except Exception as exc:
-        logger.exception("morning briefing agent failed")
-        reply = f"☀️ 굿모닝! (브리핑 생성 중 오류: {exc})"
-
-    header = f"☀️ 오늘 아침 브리핑 — {today_local.strftime('%m월 %d일 (%a)')}\n\n"
-    text = header + reply
-    for i in range(0, len(text), 4000):
-        await _app.bot.send_message(chat_id=chat_id, text=text[i:i + 4000])
-    db.mark_briefing_sent(chat_id, today_local.isoformat())
+        ids = await gmail_mod.list_messages(
+            chat_id, query="is:unread newer_than:1d", max_results=cap * 2)
+    except Exception:
+        return ([], 0)
+    starred: List[Dict] = []
+    archived = 0
+    for mid in ids[:cap]:
+        try:
+            msg = await gmail_mod.get_message(chat_id, mid, body_max_chars=1200)
+        except Exception:
+            continue
+        body = (msg.get("body") or msg.get("snippet") or "")[:1000]
+        sender = msg.get("from") or ""
+        subject = msg.get("subject") or ""
+        prompt = INBOX_TRIAGE_PROMPT.format(
+            sender=sender, subject=subject, body=body)
+        try:
+            data = await chat_completion(
+                [{"role": "user", "content": prompt}],
+                tools=None, chat_id=chat_id, kind="classify_content",
+                max_tokens=140,
+            )
+            content = (data["choices"][0]["message"].get("content") or "").strip()
+        except Exception:
+            continue
+        import re as _re
+        m = _re.search(r"\{[\s\S]*\}", content)
+        if not m:
+            continue
+        try:
+            parsed = json.loads(m.group(0))
+        except Exception:
+            continue
+        cat = parsed.get("category", "")
+        if cat in ("important", "draft_reply"):
+            starred.append({"id": mid, "subject": subject, "from": sender,
+                              "summary": (parsed.get("summary") or "")[:80]})
+        elif cat in ("archive", "noise"):
+            try:
+                await gmail_mod.archive(chat_id, mid)
+                archived += 1
+            except Exception:
+                pass
+    return (starred, archived)
     db.record_nudge(chat_id, "morning_briefing")
 
 
@@ -2844,6 +2907,17 @@ def _is_quiet_now(chat_id: int) -> bool:
     return cur_min >= s_min or cur_min < e_min
 
 
+def _user_was_active(chat_id: int, hours: int = 48) -> bool:
+    """v10: 사용자가 최근 N시간 안에 한 마디라도 했으면 True. nudge cron이
+    이 가드를 먼저 보고 묵음 결정 — 휴가·아픈 날·바쁜 시즌엔 봇도 묵음."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+    with db._conn() as c:
+        row = c.execute(
+            "SELECT 1 FROM chat_log WHERE chat_id=? AND role='user' AND created_at>=? LIMIT 1",
+            (chat_id, cutoff)).fetchone()
+        return row is not None
+
+
 # event_id → utc timestamp when the leave-by fired; consumed by run_late_check.
 _leave_by_sent_at: Dict[int, datetime] = {}
 
@@ -2960,9 +3034,8 @@ PREDICTIVE_PROMPT = (
 )
 
 
-async def _predict_tomorrow_blindspots(chat_id: int, items: list) -> list:
-    """Best-effort: ask the LLM what the user is likely to forget about tomorrow.
-    Returns up to 3 short Korean strings. Silent on any failure."""
+async def _predict_blindspots(chat_id: int, items: list) -> list:
+    """오늘/내일 이벤트 리스트 기준 사용자가 잊을 만한 것 ≤3개. 실패 시 빈 리스트."""
     if not items:
         return []
     persona = db.get_latest_persona(chat_id)
@@ -3094,7 +3167,7 @@ async def run_evening_preview(chat_id: int) -> None:
     # v7: predictive nudge — what might the user forget?
     if items and not _toggle_off_local(chat_id, "predictive_nudge_enabled"):
         try:
-            blind = await _predict_tomorrow_blindspots(chat_id, items)
+            blind = await _predict_blindspots(chat_id, items)
             if blind:
                 parts.append("")
                 parts.append("🔮 잊을 만한 거:")
@@ -3287,6 +3360,71 @@ def _rule_matches_gcal_invite(rule_cond: Dict, invite: Dict, chat_id: int) -> Op
     return None
 
 
+def _invite_in_protected(invite: Dict, protected_spec: str) -> bool:
+    """v10: invite의 시작 시각(KST)이 'HH:MM-HH:MM' 보호 구간 안인가."""
+    start_iso = invite.get("start")
+    if not start_iso:
+        return False
+    try:
+        start_dt = datetime.fromisoformat(start_iso.replace("Z", "+00:00")).astimezone(TZ)
+    except Exception:
+        return False
+    try:
+        a, b = protected_spec.split("-")
+        sh, sm = (int(x) for x in a.split(":"))
+        eh, em = (int(x) for x in b.split(":"))
+    except Exception:
+        return False
+    cur = start_dt.hour * 60 + start_dt.minute
+    s = sh * 60 + sm
+    e = eh * 60 + em
+    if s <= e:
+        return s <= cur < e
+    return cur >= s or cur < e
+
+
+async def _handle_protected_invite(chat_id: int, invite: Dict, protected: str) -> None:
+    """v10: 보호 시간에 들어온 invite — 자동 tentative + 정중한 답장 초안 카드."""
+    try:
+        await gcal.respond_to_invite(chat_id, invite["id"], "tentative")
+    except Exception:
+        logger.exception("protected invite tentative failed")
+    organizer = (invite.get("organizer_email") or "").strip()
+    title = (invite.get("summary") or "(제목 없음)")[:60]
+    draft = (
+        f"안녕하세요, {title} 잘 받았습니다. "
+        f"해당 시간({protected})은 깊은 작업 시간으로 비워두고 있어서, "
+        "다른 시간 가능하실까요? 양해 부탁드립니다."
+    )
+    token = secrets.token_urlsafe(8)
+    _pending_late_cards[token] = {
+        "chat_id": chat_id, "kind": "protected_decline",
+        "to": organizer, "subject": f"Re: {title}", "body": draft,
+        "event_id": invite["id"],
+    }
+    btn_rows = []
+    if organizer:
+        btn_rows.append([InlineKeyboardButton(
+            "📧 이대로 보내기", callback_data=f"act:proto_send:{token}")])
+    btn_rows.append([
+        InlineKeyboardButton("그래도 수락", callback_data=f"act:proto_accept:{token}"),
+        InlineKeyboardButton("거절", callback_data=f"act:proto_decline:{token}"),
+    ])
+    kb = InlineKeyboardMarkup(btn_rows)
+    text = (
+        f"🛡 보호 시간({protected}) 침범 invite\n"
+        f"• {title}\n"
+        f"• 시작 {invite.get('start')}\n"
+        f"• 자동 tentative 처리됨"
+    )
+    if organizer:
+        text += f"\n\n초안:\n{draft}"
+    try:
+        await _app.bot.send_message(chat_id=chat_id, text=text, reply_markup=kb)
+    except Exception:
+        logger.exception("protected invite card failed")
+
+
 async def run_gcal_invite_watch(chat_id: int) -> None:
     """Every 30min: pull needsAction invites. Auto-RSVP on matched rules,
     otherwise surface a card with [✅ Yes] [❔ Maybe] [❌ No]."""
@@ -3302,9 +3440,13 @@ async def run_gcal_invite_watch(chat_id: int) -> None:
     if not pending:
         return
     rules = [r for r in db.list_auto_rules(chat_id)
-             if r["rule_kind"] == "gcal_auto_rsvp"]
+             if r["rule_kind"] in ("gcal_auto_rsvp", "gcal_auto_decline")]
+    # v10: accept rules win over decline rules (사용자가 명시한 yes 우선)
+    rules.sort(key=lambda r: 0 if r["rule_kind"] == "gcal_auto_rsvp" else 1)
+    # v10: protected_hours_kst — '10:00-12:00' 같은 fact가 있으면 그 시간에
+    # 시작하는 invite는 자동 tentative + 정중한 거절 메일 초안 카드.
+    protected = _fact_value_local(chat_id, "protected_hours_kst")
     for inv in pending:
-        # try rules first
         matched = None
         for r in rules:
             try:
@@ -3315,6 +3457,10 @@ async def run_gcal_invite_watch(chat_id: int) -> None:
             if resp:
                 matched = resp
                 break
+        # protected_hours: 명시 룰이 없을 때만 적용 (사용자 명시 동의는 룰)
+        if not matched and protected and _invite_in_protected(inv, protected):
+            await _handle_protected_invite(chat_id, inv, protected)
+            continue
         if matched:
             try:
                 await gcal.respond_to_invite(chat_id, inv["id"], matched)
@@ -3430,12 +3576,9 @@ async def run_weekly_scorecard(chat_id: int) -> None:
     # 2) habits
     lines.append("💪 습관 스트릭")
     streaks = db.list_habit_streaks(chat_id)
-    if not streaks:
-        lines.append("  (스트릭 없음 — log_habit으로 시작)")
-    else:
+    if streaks:
         for s in streaks[:6]:
-            emoji = "🔥" if s["current_streak"] >= 7 else "✅" if s["current_streak"] >= 3 else "·"
-            lines.append(f"  {emoji} {s['habit_key']}: {s['current_streak']}일 (최고 {s['best_streak']})")
+            lines.append(f"  {s['habit_key']}: {s['current_streak']}일")
     lines.append("")
 
     # 3) spending
@@ -3862,14 +4005,14 @@ _NUDGE_KEYS = {
     "gmail":      ("gmail_event_scan_enabled",         True,  "메일→일정 감지"),
     "leaveby":    ("leave_by_enabled",                  True,  "Leave-by"),
     "출발":       ("leave_by_enabled",                  True,  "Leave-by"),
-    "preview":    ("weather_preview_enabled",           True,  "전날 밤 프리뷰"),
-    "프리뷰":     ("weather_preview_enabled",           True,  "전날 밤 프리뷰"),
+    "preview":    ("weather_preview_enabled",           False, "전날 밤 프리뷰"),
+    "프리뷰":     ("weather_preview_enabled",           False, "전날 밤 프리뷰"),
     "milestone":  ("goal_milestone_enabled",            True,  "골 마일스톤"),
     "마일스톤":   ("goal_milestone_enabled",            True,  "골 마일스톤"),
     "birthday":   ("birthday_alert_separate_enabled",   False, "생일 단독 알림"),
     "생일":       ("birthday_alert_separate_enabled",   False, "생일 단독 알림"),
-    "checkin":    ("midday_checkin_enabled",            True,  "점심 체크인"),
-    "점심":       ("midday_checkin_enabled",            True,  "점심 체크인"),
+    "checkin":    ("midday_checkin_enabled",            False, "점심 체크인"),
+    "점심":       ("midday_checkin_enabled",            False, "점심 체크인"),
     "briefing":   ("briefing_enabled",                  True,  "아침 브리핑"),
     "브리핑":     ("briefing_enabled",                  True,  "아침 브리핑"),
     "reflect":    ("reflection_enabled",                True,  "저녁 회고"),
@@ -3879,7 +4022,7 @@ _NUDGE_KEYS = {
     "rules":      ("auto_rules_enabled",                True,  "자동 규칙 마스터"),
     "digest":     ("agent_digest_enabled",              True,  "어제 봇이 한 일 디지스트"),
     "decompose":  ("auto_decompose_enabled",            True,  "골 자동 분해"),
-    "scorecard":  ("weekly_scorecard_enabled",          True,  "주간 스코어카드"),
+    "scorecard":  ("weekly_scorecard_enabled",          False, "주간 스코어카드"),
     "streak":     ("streak_compute_enabled",            True,  "스트릭 계산"),
     "budget":     ("budget_alert_enabled",              True,  "예산 알림"),
     "learning":   ("active_learning_enabled",           True,  "하루 1 질문"),
@@ -3908,11 +4051,11 @@ async def cmd_nudges(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             ("gmail_event_scan_enabled",       True,  "메일→일정 감지", None,
              f"매 {_fact_value_local(chat_id, 'gmail_event_scan_minutes') or '60'}분"),
             ("leave_by_enabled",               True,  "Leave-by",          None, None),
-            ("weather_preview_enabled",        True,  "전날 밤 프리뷰",
+            ("weather_preview_enabled",        False, "전날 밤 프리뷰",
              _fact_value_local(chat_id, "weather_preview_time") or "22:00", None),
             ("goal_milestone_enabled",         True,  "골 마일스톤",        None, "D-30/14/3/1"),
             ("birthday_alert_separate_enabled", False, "생일 단독 알림",     "09:00", None),
-            ("midday_checkin_enabled",         True,  "점심 체크인",
+            ("midday_checkin_enabled",         False, "점심 체크인",
              _fact_value_local(chat_id, "midday_checkin_time") or "13:00", None),
             ("briefing_enabled",               True,  "아침 브리핑",
              _fact_value_local(chat_id, "briefing_time") or "07:30", None),
@@ -4852,23 +4995,24 @@ async def run_self_improve(chat_id: int) -> None:
     except Exception:
         return
     changes: List[str] = []
+    disabled_names: List[str] = []
     for fact_key in (parsed.get("disable_nudges") or []):
         if fact_key in {v for v in _NUDGE_FACT_MAP.values()}:
             db.remember_fact(chat_id, fact_key, "false")
-            # Re-arm scheduler to drop the disabled cron
             scheduler.disable_daily_rhythm_for(chat_id)
             scheduler.ensure_daily_rhythm_for(chat_id)
-            changes.append(f"🔕 {fact_key} → OFF")
+            disabled_names.append(fact_key.replace("_enabled", ""))
+            changes.append(fact_key)
     tone = (parsed.get("tone_override") or "").strip()
     if tone:
         db.set_prompt_override(chat_id, tone[:600])
-        changes.append(f"🎨 톤 override 갱신: {tone[:80]}...")
-    if changes and _app and _app.bot:
+        changes.append("tone_override")
+    # v10: 한 줄. 사용자가 자세히 보고 싶으면 /improvements 직접.
+    if disabled_names and _app and _app.bot:
         try:
             await _app.bot.send_message(
                 chat_id=chat_id,
-                text=("🤖 이번 주 자기 조정:\n  " + "\n  ".join(changes)
-                      + "\n\n실수면 /improvements undo 로 되돌리기."),
+                text=f"🔕 {', '.join(disabled_names)} 자동 OFF.",
             )
             db.log_agent_action(
                 chat_id, "self_improve",
@@ -4979,72 +5123,67 @@ async def cmd_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/dashboard` — single-view: today, imminent goals, active missions,
-    recent self-improve, this-week cost, top nudge engagement."""
+    """v10: 오늘 + 임박 골 D-3 + 활성 mission. 스트릭/% 0. 빈 섹션 생략."""
     chat_id = update.effective_chat.id
     today_local = datetime.now(TZ).date()
     now_local = datetime.now(TZ)
     end_today = now_local.replace(hour=23, minute=59, second=59)
-    items = await _merge_schedule(chat_id, now_local.astimezone(timezone.utc),
-                                    end_today.astimezone(timezone.utc))
-    goals_imminent = db.goals_due_within(chat_id, days=14)
+    items = await _merge_schedule(
+        chat_id, now_local.astimezone(timezone.utc),
+        end_today.astimezone(timezone.utc))
+    goals_imminent = [
+        g for g in db.goals_due_within(chat_id, days=3) if g["target_date_local"]
+    ]
     missions = db.list_missions(chat_id, status="running")
-    cost = db.usage_summary(chat_id)
-    persona = db.get_latest_persona(chat_id)
-    override = db.get_prompt_override(chat_id)
-    nudges = db.nudge_stats_by_kind(chat_id, days=7)
-    streaks = db.list_habit_streaks(chat_id)
 
-    # People birthdays today (lunar-aware)
     bdays = []
     for p in db.list_people(chat_id):
         for d in json.loads(p["important_dates_json"] or "[]"):
             if _date_matches_today(d, today_local):
-                lt = " (음력)" if d.get("is_lunar") else ""
-                bdays.append(f"{p['name']}: {d['label']}{lt}")
+                bdays.append(f"{p['name']}: {d['label']}")
 
-    solar_term = lunar.solar_term_on(today_local.isoformat())
-    next_term = lunar.next_solar_term(today_local.isoformat())
-
-    lines = [f"📋 Dashboard · {today_local.strftime('%Y-%m-%d (%a)')}"]
-    if solar_term:
-        lines.append(f"🌿 오늘 절기: {solar_term['name']}")
-    elif next_term:
-        lines.append(f"🌿 다음 절기: {next_term['name']} D-{next_term['days_until']}")
-    if bdays:
-        lines.append("🎂 오늘: " + ", ".join(bdays))
-    lines.append("")
-    lines.append(f"📅 오늘 일정 ({len(items)}건)")
-    for it in items[:5]:
-        when = it["when_utc"].astimezone(TZ).strftime("%H:%M")
-        lines.append(f"  • {when} {it['title']}")
-    if not items:
-        lines.append("  (없음)")
-    lines.append("")
-    lines.append(f"🎯 임박한 골 D-14 ({len(goals_imminent)}건)")
-    for g in goals_imminent[:5]:
+    lines = [f"📋 {today_local.strftime('%m월 %d일 (%a)')}", ""]
+    if items:
+        for it in items[:6]:
+            when = it["when_utc"].astimezone(TZ).strftime("%H:%M")
+            loc = f" @{it['location']}" if it.get("location") else ""
+            lines.append(f"  • {when} {it['title']}{loc}")
+        lines.append("")
+    for g in goals_imminent[:3]:
         d = _days_until(g["target_date_local"])
-        lines.append(f"  • D-{d} {g['title']}")
-    if not goals_imminent:
-        lines.append("  (없음)")
-    lines.append("")
-    if missions:
-        lines.append(f"🚀 진행 중 mission ({len(missions)}건)")
-        for m in missions[:3]:
-            lines.append(f"  • #{m['id']} {m['title']} — {m['current_hop']}/{m['max_hops']} hop · ${m['cost_usd_running']:.4f}")
-        lines.append("")
-    if streaks:
-        top = streaks[:3]
-        lines.append("💪 스트릭 top 3")
-        for s in top:
-            emoji = "🔥" if s["current_streak"] >= 7 else "✅" if s["current_streak"] >= 3 else "·"
-            lines.append(f"  {emoji} {s['habit_key']}: {s['current_streak']}일")
-        lines.append("")
-    lines.append(f"💰 이번 달 ${cost['month']['cost']:.4f} · 오늘 ${cost['today']['cost']:.4f}")
-    if persona:
-        lines.append(f"🧬 persona v{persona['version']} ({persona['generated_at'][:10]})")
-    if override:
-        lines.append(f"🤖 self-tune: {override[:60]}...")
+        lines.append(f"🎯 {g['title']} D-{d}")
+    for m in missions[:3]:
+        lines.append(f"🚀 #{m['id']} {m['title']} ({m['current_hop']}/{m['max_hops']})")
+    for b in bdays[:3]:
+        lines.append(f"🎂 {b}")
+    while lines and not lines[-1]:
+        lines.pop()
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """v10: 지금 알아야 할 4줄. 다음 일정 / 활성 mission / 미답 메일 / D-3 골."""
+    chat_id = update.effective_chat.id
+    now_utc = datetime.now(timezone.utc)
+    end_today = datetime.now(TZ).replace(hour=23, minute=59, second=59).astimezone(timezone.utc)
+    items = await _merge_schedule(chat_id, now_utc, end_today)
+    missions = db.list_missions(chat_id, status="running")
+    goals_imminent = [
+        g for g in db.goals_due_within(chat_id, days=3) if g["target_date_local"]
+    ]
+    lines = []
+    if items:
+        nxt = items[0]
+        when = nxt["when_utc"].astimezone(TZ).strftime("%H:%M")
+        loc = f" @{nxt['location']}" if nxt.get("location") else ""
+        lines.append(f"📅 다음 {when} {nxt['title']}{loc}")
+    for m in missions[:1]:
+        lines.append(f"🚀 #{m['id']} {m['title']} ({m['current_hop']}/{m['max_hops']})")
+    for g in goals_imminent[:1]:
+        d = _days_until(g["target_date_local"])
+        lines.append(f"🎯 {g['title']} D-{d}")
+    if not lines:
+        lines.append("(조용한 시간)")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -5371,6 +5510,54 @@ async def on_callback_action(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 chat_id=chat_id,
                 text=f"💳 expense #{eid} 저장 — ₩{cand['amount']:,} {cand['merchant']}",
             )
+        elif kind in ("proto_send", "proto_accept", "proto_decline"):
+            cand = _pending_late_cards.pop(rest, None)
+            if not cand or cand.get("chat_id") != chat_id or cand.get("kind") != "protected_decline":
+                await cq.answer("만료된 카드")
+                return
+            try:
+                await cq.edit_message_reply_markup(reply_markup=None)
+            except Exception:
+                pass
+            if kind == "proto_accept":
+                try:
+                    await gcal.respond_to_invite(chat_id, cand["event_id"], "accepted")
+                    db.log_agent_action(
+                        chat_id, "gcal_rsvp",
+                        summary="보호 시간 침범 수락",
+                        payload={"event_id": cand["event_id"]},
+                    )
+                    await cq.answer("수락")
+                except Exception as e:
+                    await cq.answer(f"⚠ {e}", show_alert=True)
+            elif kind == "proto_decline":
+                try:
+                    await gcal.respond_to_invite(chat_id, cand["event_id"], "declined")
+                    db.log_agent_action(
+                        chat_id, "gcal_rsvp",
+                        summary="보호 시간 거절",
+                        payload={"event_id": cand["event_id"]},
+                    )
+                    await cq.answer("거절")
+                except Exception as e:
+                    await cq.answer(f"⚠ {e}", show_alert=True)
+            elif kind == "proto_send":
+                to_addr = cand.get("to")
+                if not to_addr:
+                    await cq.answer("organizer 이메일 없음")
+                    return
+                try:
+                    await gmail_mod.send_message(
+                        chat_id, to_addr, cand["subject"], cand["body"])
+                    await gcal.respond_to_invite(chat_id, cand["event_id"], "declined")
+                    db.log_agent_action(
+                        chat_id, "gmail_send",
+                        summary=f"보호 시간 거절 메일 → {to_addr}",
+                        payload={"to": to_addr, "subject": cand["subject"]},
+                    )
+                    await cq.answer(f"✅ {to_addr}에게 메일")
+                except Exception as e:
+                    await cq.answer(f"⚠ {e}", show_alert=True)
         elif kind in ("late_msg", "late_mail", "late_dismiss"):
             cand = _pending_late_cards.pop(rest, None)
             if not cand or cand["chat_id"] != chat_id:
@@ -5722,57 +5909,23 @@ async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 BOT_COMMANDS: List[BotCommand] = [
-    # Daily flow — most common
-    BotCommand("today", "오늘 일정 (로컬+구글 캘린더)"),
-    BotCommand("week", "이번 주 일정"),
-    BotCommand("agenda", "앞으로 60일 일정"),
-    BotCommand("briefing", "아침 브리핑 (지금 / on / off / HH:MM)"),
-    BotCommand("reflect", "저녁 회고 (지금 / on / off / HH:MM)"),
-    # Memory
-    BotCommand("notes", "최근 메모 모음"),
-    BotCommand("facts", "기억하고 있는 personal facts"),
-    BotCommand("people", "등록된 사람 + 마지막 연락"),
-    # Goals + recurring
-    BotCommand("goals", "진행 중인 장기 골"),
-    BotCommand("review", "주간 골 리뷰 지금 돌리기"),
-    BotCommand("tasks", "정기 작업 (매일 cron) 목록"),
-    # Spending + habits
-    BotCommand("spending", "이번 달 지출 요약"),
-    BotCommand("habits", "최근 습관 통계"),
-    # Google
-    BotCommand("connect_gcal", "Google 캘린더 + Gmail 연동"),
-    BotCommand("gcal_status", "Google 연동 상태"),
-    BotCommand("disconnect_gcal", "Google 연동 해제"),
-    # Setup & ops
-    BotCommand("setup", "가이드 온보딩"),
-    BotCommand("cost", "OpenRouter 사용량 요약"),
-    BotCommand("nudges", "능동 알림 토글 + 상태"),
-    BotCommand("models", "현재 LLM 라우팅 + 커스텀 override"),
-    BotCommand("metrics", "시스템 헬스 (에러 / 비용 / nudge 반응)"),
-    BotCommand("dashboard", "오늘 + 골 + mission + persona 한 통"),
-    BotCommand("cleanup", "메모리 중복 정리 (사람 / facts / relations)"),
-    BotCommand("macro", "재사용 가능 명령 매크로 (save/delete/실행)"),
-    BotCommand("subscribe", "토픽 정기 구독 (환율 / 항공권 / 부동산)"),
-    BotCommand("unsubscribe", "구독 해지"),
-    BotCommand("quiet", "조용 시간 (23:00-07:00 nudge 자동 억제)"),
-    BotCommand("travel", "여행 모드 (자동 감지 + 수동 등록)"),
-    BotCommand("experiment", "1주 습관 실험 (자동 평가)"),
-    BotCommand("improvements", "봇이 자기를 어떻게 조정했는지 (Sun 10:00)"),
-    BotCommand("rules", "자동 액션 규칙 (메일 자동, RSVP 자동)"),
-    BotCommand("persona", "내가 누구인지 봇이 그린 인물 요약"),
-    BotCommand("recall", "특정 사람/키워드 cross-table 회수"),
-    BotCommand("scorecard", "주간 스코어카드 (골/습관/지출/무드)"),
-    BotCommand("agent", "다단계 자율 에이전트 실행"),
-    BotCommand("ask", "엔티티 관계 multi-hop 질문 (그래프 회수)"),
-    BotCommand("mission", "밤사이 자율 프로젝트 시작"),
-    BotCommand("missions", "진행 중 mission 목록"),
-    BotCommand("bank_sms", "카드 SMS 자동 가계부"),
-    BotCommand("image", "AI 이미지 생성"),
-    BotCommand("voice", "다음 N분 음성 답장 모드"),
-    BotCommand("say", "TTS로 음성 답장"),
-    BotCommand("diag", "봇 상태 진단"),
-    BotCommand("export", "내 데이터 마크다운으로 보기"),
-    BotCommand("reset", "이번 대화 메모리 초기화"),
+    # v10: 메뉴 17개만. 나머지 명령은 handler 살아있어서 직접 타이핑하면 작동.
+    BotCommand("now", "지금 알아야 할 것"),
+    BotCommand("today", "오늘 일정"),
+    BotCommand("week", "이번 주"),
+    BotCommand("agenda", "앞으로 60일"),
+    BotCommand("notes", "최근 메모"),
+    BotCommand("facts", "기억"),
+    BotCommand("people", "사람"),
+    BotCommand("goals", "장기 골"),
+    BotCommand("spending", "이번 달 지출"),
+    BotCommand("habits", "습관"),
+    BotCommand("mission", "자율 프로젝트"),
+    BotCommand("dashboard", "오늘 상태"),
+    BotCommand("nudges", "알림 토글"),
+    BotCommand("rules", "자동 액션 규칙"),
+    BotCommand("connect_gcal", "Google 연동"),
+    BotCommand("setup", "온보딩"),
     BotCommand("help", "사용법"),
 ]
 
@@ -5835,6 +5988,7 @@ def main() -> None:
     )
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
+    app.add_handler(CommandHandler("now", cmd_now))
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("week", cmd_week))
     app.add_handler(CommandHandler("agenda", cmd_agenda))
