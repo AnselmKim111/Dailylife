@@ -44,6 +44,8 @@ import finance
 import writing
 import trip_planner
 import negotiator
+import capabilities
+import command_hints
 import weather as weather_mod
 from llm import TOOLS, USER_TZ, chat_completion, parse_tool_calls
 
@@ -141,6 +143,9 @@ SYSTEM_PROMPT_TEMPLATE = (
     "gcal_rsvp work. Only fire them when the user explicitly asks ('메일 보내줘', "
     "'회의 수락해줘') OR an auto_rule matched (which the runner enforces, you don't gate). "
     "Otherwise PROPOSE the draft and ask.\n"
+    "- Capability questions ('뭐 할 수 있어?', '이거 가능?', '도와줄래?'): "
+    "answer in natural Korean, list categories not command names. User should NEVER need "
+    "to memorize commands — they can ask anything in Korean and you route to the right tool.\n"
     "Known facts about this user:\n{facts_block}"
 )
 
@@ -2746,18 +2751,31 @@ ASYNC_HANDLERS = {
 
 
 async def run_agent(chat_id: int, user_text: str, history: Optional[List[Dict]] = None,
-                    max_hops: int = 6, kind: str = "chat") -> str:
+                    max_hops: int = 6, kind: str = "chat",
+                    intent: Optional[str] = None) -> str:
     """Run the agent loop with tool-use until it returns a text answer.
 
     `kind` is forwarded to chat_completion so model_router can pick the right
-    tier (chat→sonnet, agent→opus, ask→opus, etc.)."""
+    tier (chat→sonnet, agent→opus, ask→opus, etc.).
+    `intent` (v13 W1): subset TOOLS만 LLM에 보냄 — 도구 선택 정확도 + 비용↓.
+    None일 때 chat kind면 자동 classify, 그 외엔 전체 도구."""
     history = history if history is not None else []
     history.append({"role": "user", "content": user_text})
+
+    # v13 W1: intent → TOOLS subset
+    tools_for_loop = TOOLS
+    if intent is None and kind == "chat" and not _toggle_off_local(chat_id, "intent_routing_enabled"):
+        try:
+            intent = await _classify_intent(user_text, chat_id)
+        except Exception:
+            intent = "general"
+    if intent and intent != "general":
+        tools_for_loop = _tools_for_intent(intent)
 
     final_text = ""
     for hop in range(max_hops):
         messages = [_system_message(chat_id, recent_user_text=user_text), *history]
-        data = await chat_completion(messages, tools=TOOLS, chat_id=chat_id, kind=kind)
+        data = await chat_completion(messages, tools=tools_for_loop, chat_id=chat_id, kind=kind)
         msg = data["choices"][0]["message"]
         history.append(
             {
@@ -3572,6 +3590,226 @@ def _is_quiet_now(chat_id: int) -> bool:
         return s_min <= cur_min < e_min
     # wrap (23 → 07)
     return cur_min >= s_min or cur_min < e_min
+
+
+# v13 W1: intent → tool subset 매핑.
+# 65+ 도구 전부 매 turn마다 LLM에 보내는 대신 intent별 5-15개만.
+# 모르는 intent (general)는 전체 TOOLS fallback.
+TOOLS_BY_INTENT: Dict[str, List[str]] = {
+    "schedule": [
+        "add_event", "list_events", "update_event", "delete_event",
+        "gcal_list_events", "gcal_create_event", "gcal_update_event",
+        "gcal_delete_event", "gcal_rsvp", "korean_holiday_check",
+        "solar_term_check", "weather", "kakao_directions_drive",
+        "kakao_local_search",
+    ],
+    "memory": [
+        "remember_fact", "forget_fact", "save_note", "search_memory",
+        "add_person", "update_person", "list_people", "recall_person",
+        "log_contact_with", "cross_recall", "lifelog_search",
+        "graph_query", "add_relation", "find_duplicates", "merge_people",
+    ],
+    "decision": [
+        "list_goals", "add_goal", "update_goal", "list_events",
+        "summarize_expenses", "lifelog_search", "cross_recall",
+        "web_search", "fetch_url",
+    ],
+    "write": [
+        "save_note", "search_memory", "lifelog_search",
+        "analyze_document",
+    ],
+    "negotiate": [
+        "list_events", "gcal_list_events", "gmail_search",
+        "gmail_get_message", "gmail_send_email", "gmail_reply_to",
+        "gcal_rsvp", "add_auto_rule",
+    ],
+    "trip": [
+        "weather", "web_search", "fetch_url", "kakao_local_search",
+        "kakao_directions_drive", "start_mission",
+        "gcal_create_event", "add_event",
+    ],
+    "expert": [
+        "analyze_document", "web_search", "fetch_url", "lifelog_search",
+    ],
+    "translate": [
+        # translation handled by /translate command + agent rarely
+        "gmail_search", "gmail_get_message",
+    ],
+    "charges": [
+        "log_expense", "summarize_expenses", "list_recurring_charges"
+        if False else "summarize_expenses",  # filter to existing names
+    ],
+    "watch": [
+        "add_watch", "list_watches", "web_search", "fetch_url",
+    ],
+    "lifelog": [
+        "lifelog_search", "cross_recall", "search_memory",
+        "recall_person",
+    ],
+    "relationship": [
+        "list_people", "recall_person", "log_contact_with",
+        "cross_recall",
+    ],
+    "external_action": [
+        "gmail_send_email", "gmail_reply_to", "gmail_save_draft",
+        "gcal_rsvp", "place_phone_call", "web_scrape", "web_screenshot",
+    ],
+    "habit": [
+        "log_habit", "summarize_habits", "get_habit_streaks",
+        "detect_routines",
+    ],
+    "expense": [
+        "log_expense", "summarize_expenses",
+    ],
+}
+
+
+_INTENT_CLASSIFY_PROMPT = (
+    "사용자 메시지의 *주요 intent* 1개를 다음 키워드 중 하나로 답해. "
+    "단어 1개만, 그 외 텍스트 금지.\n"
+    "intent: schedule, memory, decision, write, negotiate, trip, expert, "
+    "translate, charges, watch, lifelog, relationship, external_action, "
+    "habit, expense, general\n\n"
+    "메시지: {text}"
+)
+
+
+async def _classify_intent(text: str, chat_id: int) -> str:
+    """Haiku micro-call ~$0.0001. 1 단어 답 → intent."""
+    if not text or len(text.strip()) < 3:
+        return "general"
+    snippet = text[:500]
+    try:
+        data = await chat_completion(
+            [{"role": "user", "content": _INTENT_CLASSIFY_PROMPT.format(text=snippet)}],
+            tools=None, chat_id=chat_id, kind="intent_classify", max_tokens=10,
+        )
+        raw = (data["choices"][0]["message"].get("content") or "").strip().lower()
+    except Exception:
+        return "general"
+    # 첫 단어만, 알려진 intent에 매칭
+    candidate = raw.split()[0] if raw else "general"
+    candidate = candidate.strip(".,;:'\"`")
+    if candidate in TOOLS_BY_INTENT:
+        return candidate
+    return "general"
+
+
+def _tools_for_intent(intent: str) -> List[Dict]:
+    """intent에 해당하는 도구 schema list."""
+    wanted = set(TOOLS_BY_INTENT.get(intent, []))
+    if not wanted:
+        return TOOLS
+    return [t for t in TOOLS if t.get("function", {}).get("name") in wanted]
+
+
+# v13 W4: ambiguity 감지 — 짧고 referent 모호하면 *옵션 2-3개 카드* 1번만.
+_AMBIGUOUS_REFERENTS = ("그거", "그것", "그분", "그 사람", "그날", "그 때",
+                          "그 메일", "그 거", "이거", "그 친구", "그 메시지",
+                          "그 약속")
+
+
+_AMBIGUITY_PROMPT = (
+    "최근 대화 4 turn을 보고 사용자가 *짧고 모호한 메시지*에서 가리키는 "
+    "후보 2-3개를 짧은 명사구로 추출.\n"
+    'JSON 배열만: ["경서 메일", "관현 메시지"]. 후보 부족하면 빈 배열.\n\n'
+    "최근 대화:\n{recent}\n\n"
+    "현재 메시지: {current}"
+)
+
+
+async def _detect_ambiguity(chat_id: int, user_text: str) -> Optional[List[str]]:
+    """짧은 + 모호 referent → 후보 2-3개 추출. 모호하지 않으면 None."""
+    text = (user_text or "").strip()
+    if len(text) > 20 or len(text) < 2:
+        return None
+    if not any(r in text for r in _AMBIGUOUS_REFERENTS):
+        return None
+    # 최근 4 turn 가져오기
+    history = chat_history.get(chat_id, [])
+    recent_turns = []
+    for m in history[-8:]:
+        if isinstance(m, dict):
+            content = (m.get("content") or "")[:200]
+            role = m.get("role", "")
+            if content and role in ("user", "assistant"):
+                recent_turns.append(f"{role}: {content}")
+    if len(recent_turns) < 2:
+        return None
+    recent_md = "\n".join(recent_turns[-6:])
+    try:
+        data = await chat_completion(
+            [{"role": "user", "content": _AMBIGUITY_PROMPT.format(
+                recent=recent_md, current=text)}],
+            tools=None, chat_id=chat_id, kind="ambiguity_detect",
+            max_tokens=150,
+        )
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+    except Exception:
+        return None
+    import re as _re
+    m = _re.search(r"\[[\s\S]*\]", content)
+    if not m:
+        return None
+    try:
+        parsed = json.loads(m.group(0))
+    except Exception:
+        return None
+    if not isinstance(parsed, list) or len(parsed) < 2:
+        return None
+    return [str(x)[:40] for x in parsed[:3]]
+
+
+# v13 W5: persona 자연 회상 verify — 답변에 persona 키워드 누락 시 1줄 추가
+_PERSONA_VERIFY_PROMPT = (
+    "사용자 persona와 user 메시지가 주어졌어. 봇이 작성한 답변이 persona의 "
+    "*명백히 관련된* 사실을 반영했는지 1줄로 답해.\n"
+    'JSON: {{"missed": true|false, "natural_addendum": "<≤30자 한국어 1줄>"}}\n'
+    "missed=false면 addendum 빈 문자열. "
+    "natural_addendum은 답변 끝에 자연스레 붙일 수 있어야 — '~지', '~잖아', "
+    "'~던가' 같은 친한 톤. *별도 줄로 분리될 정도면 missed=false*.\n"
+    "JSON만, 그 외 텍스트 금지.\n\n"
+    "persona snapshot:\n{persona}\n\n"
+    "user 메시지: {user_text}\n\n"
+    "봇 답변:\n{reply}"
+)
+
+
+async def _verify_persona_recall(
+    chat_id: int, user_text: str, reply: str,
+) -> Optional[str]:
+    """답변에 persona 사실이 자연스레 녹았는지 검증. 누락이면 1줄 추가."""
+    persona = db.get_latest_persona(chat_id)
+    if not persona:
+        return None
+    persona_md = persona["content_md"][:1500]
+    # 길이 제한 — 작은 답변만 (짧은 답이 missed 효과 큼)
+    if len(reply) < 5 or len(reply) > 1500:
+        return None
+    try:
+        data = await chat_completion(
+            [{"role": "user", "content": _PERSONA_VERIFY_PROMPT.format(
+                persona=persona_md, user_text=user_text[:300], reply=reply[:1500])}],
+            tools=None, chat_id=chat_id, kind="persona_verify",
+            max_tokens=150,
+        )
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+    except Exception:
+        return None
+    import re as _re
+    m = _re.search(r"\{[\s\S]*\}", content)
+    if not m:
+        return None
+    try:
+        parsed = json.loads(m.group(0))
+    except Exception:
+        return None
+    if not parsed.get("missed"):
+        return None
+    add = (parsed.get("natural_addendum") or "").strip()
+    if not add or len(add) > 60:
+        return None
+    return add
 
 
 def _user_was_active(chat_id: int, hours: int = 48) -> bool:
@@ -5895,6 +6133,16 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines))
 
 
+async def cmd_can(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/can` 카테고리 목록 · `/can <카테고리>` 상세. 명령 노출 X — 자연어로 부탁 가능 강조."""
+    args = list(context.args or [])
+    if not args:
+        await update.message.reply_text(capabilities.render_overview())
+        return
+    cat = " ".join(args).strip()
+    await update.message.reply_text(capabilities.render_category(cat))
+
+
 async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """`/translate <텍스트>` 또는 `/translate en <텍스트>` — 한국어↔외국어 통역.
     target 미지정 시 입력 언어 감지 → 반대 방향 (외국어→한국어 또는 한국어→영어)."""
@@ -6750,6 +6998,15 @@ async def _process_user_text(
                 user_text = f"{ctx_note}\n{user_text}"
         except Exception:
             logger.exception("context inference failed (non-fatal)")
+    # v13 W4: 모호 referent 후보 prepend (LLM이 명확화하거나 best guess)
+    if not _toggle_off_local(chat_id, "ambiguity_card_enabled"):
+        try:
+            candidates = await _detect_ambiguity(chat_id, user_text)
+            if candidates:
+                cand_str = " / ".join(candidates)
+                user_text = f"[모호한 referent 후보: {cand_str} — 명확하지 않으면 1줄 질문]\n{user_text}"
+        except Exception:
+            logger.exception("ambiguity detect failed (non-fatal)")
     # If we asked for a reflection today and haven't captured it yet, this
     # message is the response (best-effort heuristic — works for short replies).
     try:
@@ -6778,13 +7035,31 @@ async def _process_user_text(
             history.pop()
         return
 
+    # v13 W5: persona 자연 회상 verify (addendum이 답변에 자연스레)
+    if not _toggle_off_local(chat_id, "persona_verify_enabled"):
+        try:
+            addendum = await _verify_persona_recall(chat_id, user_text, reply)
+            if addendum and addendum not in reply:
+                reply = f"{reply} {addendum}"
+        except Exception:
+            logger.exception("persona verify failed (non-fatal)")
     db.log_chat(chat_id, "assistant", reply)
     _trim_history(chat_id)
     undo_offers = _collect_undo_offers(history)
-    for i in range(0, len(reply), 4000):
-        chunk = reply[i : i + 4000]
+    # v13 W3: slash hint — 자연어 → 명령 매칭 1줄 (같은 답에서 1회만)
+    hint_suffix = ""
+    if not _toggle_off_local(chat_id, "slash_hint_enabled"):
+        try:
+            cmd = command_hints.suggest_command(user_text)
+            if cmd:
+                hint_suffix = f"\n\n💡 다음엔 `{cmd}`"
+        except Exception:
+            pass
+    full_reply = reply + hint_suffix
+    for i in range(0, len(full_reply), 4000):
+        chunk = full_reply[i : i + 4000]
         # Attach undo button (only first one) to the FINAL message chunk.
-        is_last = i + 4000 >= len(reply)
+        is_last = i + 4000 >= len(full_reply)
         if is_last and undo_offers:
             token, label = undo_offers[0]
             await update.message.reply_text(chunk, reply_markup=_undo_keyboard(token, label))
@@ -7056,6 +7331,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("now", cmd_now))
     # v12: 메뉴 등록 X — 직접 타이핑만
+    app.add_handler(CommandHandler("can", cmd_can))
     app.add_handler(CommandHandler("translate", cmd_translate))
     app.add_handler(CommandHandler("expert", cmd_expert))
     app.add_handler(CommandHandler("relationships", cmd_relationships))

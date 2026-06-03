@@ -38,6 +38,9 @@ KIND_TO_TIER: Dict[str, str] = {
     "translate":         HAIKU,
     "context_infer":     HAIKU,
     "finance_detect":    HAIKU,
+    "intent_classify":   HAIKU,
+    "ambiguity_detect":  HAIKU,
+    "persona_verify":    HAIKU,
     "compaction":        HAIKU,
     # everyday assistant
     "chat":              SONNET,
