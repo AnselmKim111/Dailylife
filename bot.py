@@ -42,6 +42,8 @@ import experts
 import crm
 import finance
 import writing
+import trip_planner
+import negotiator
 import weather as weather_mod
 from llm import TOOLS, USER_TZ, chat_completion, parse_tool_calls
 
@@ -2591,7 +2593,8 @@ async def tool_gcal_rsvp(chat_id: int, args: Dict) -> Dict:
 def tool_add_auto_rule(chat_id: int, args: Dict) -> Dict:
     rule_kind = args.get("rule_kind")
     cond = args.get("condition") or {}
-    if rule_kind not in ("gmail_auto_add_event", "gcal_auto_rsvp", "gcal_auto_decline"):
+    if rule_kind not in ("gmail_auto_add_event", "gcal_auto_rsvp",
+                            "gcal_auto_decline", "meeting_auto_negotiate"):
         return {"ok": False, "error": f"unsupported rule_kind {rule_kind}"}
     rid = db.add_auto_rule(chat_id, rule_kind, cond)
     return {"ok": True, "rule_id": rid}
@@ -6127,6 +6130,117 @@ async def cmd_write_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await update.message.reply_text(f"✓ writing #{cur['id']} 완료")
 
 
+# ---------------- v12 W6: /plan_trip /trips ----------------
+
+
+async def cmd_plan_trip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/plan_trip <목적지> <YYYY-MM-DD> <YYYY-MM-DD> [인원] [예산만]`"""
+    chat_id = update.effective_chat.id
+    args = list(context.args or [])
+    if len(args) < 3:
+        await update.message.reply_text(
+            "사용: /plan_trip <목적지> <시작> <끝> [인원] [예산만]\n"
+            "예: /plan_trip 발리 2026-12-20 2026-12-23 2 800")
+        return
+    destination = args[0]
+    start_date = args[1]
+    end_date = args[2]
+    try:
+        datetime.fromisoformat(start_date)
+        datetime.fromisoformat(end_date)
+    except ValueError:
+        await update.message.reply_text("날짜는 YYYY-MM-DD")
+        return
+    party_size = int(args[3]) if len(args) > 3 else 1
+    budget_total = None
+    if len(args) > 4:
+        try:
+            budget_total = int(args[4]) * 10000
+        except ValueError:
+            pass
+    tid = trip_planner.start_trip(
+        chat_id, destination, start_date, end_date,
+        party_size=party_size, budget_total=budget_total)
+    trip = db.get_trip(tid)
+    mid = trip["mission_id"]
+    scheduler.trigger_mission_tick_now(mid)
+    await update.message.reply_text(
+        f"🛫 trip #{tid} mission #{mid} 시작\n"
+        f"  • {destination} {start_date}~{end_date} {party_size}인\n"
+        f"  • 5분마다 진행. 완료 시 itinerary 알려줄게.")
+
+
+async def cmd_trips(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    rows = db.list_trips(chat_id)
+    if not rows:
+        await update.message.reply_text("trip 없음. /plan_trip 시작.")
+        return
+    lines = ["🛫 trips"]
+    for r in rows[:10]:
+        status_emoji = {"planning": "🟡", "done": "✓", "cancelled": "✗"}.get(
+            r["status"], "·")
+        lines.append(
+            f"  {status_emoji} #{r['id']} {r['destination']} "
+            f"{r['start_date']}~{r['end_date']}")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ---------------- v12 W1: /negotiate /negotiations ----------------
+
+
+async def cmd_negotiate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/negotiate <email> <주제>` 수동 협상 시작 — 봇이 빈 시간 3개 메일."""
+    chat_id = update.effective_chat.id
+    args = list(context.args or [])
+    if len(args) < 2:
+        await update.message.reply_text(
+            "사용: /negotiate <email> <주제>\n예: /negotiate kim@x.com Q3 리뷰")
+        return
+    email = args[0]
+    topic = " ".join(args[1:])
+    slots = negotiator.find_free_slots(chat_id, duration_min=60, max_slots=3)
+    if not slots:
+        await update.message.reply_text("⚠ 향후 2주에 빈 시간 없음")
+        return
+    subject, body = negotiator.format_offer_email("", topic, slots)
+    nid = db.create_negotiation(chat_id, email, topic)
+    db.update_negotiation(nid, state="awaiting",
+                            history_json=json.dumps([{
+                                "kind": "bot_offer",
+                                "slots": slots,
+                                "at": datetime.now(timezone.utc).isoformat(),
+                            }]))
+    # Gmail 전송
+    if not db.get_oauth_token(chat_id, "google"):
+        await update.message.reply_text(
+            f"⚠ Gmail 미연결. 메일 초안 below — 수동 전송:\n\n"
+            f"To: {email}\nSubject: {subject}\n\n{body}")
+        return
+    try:
+        await gmail_mod.send_message(chat_id, email, subject, body)
+        await update.message.reply_text(
+            f"📨 negotiation #{nid} → {email}\n"
+            f"  • 제안 시간: {', '.join(slots)}")
+    except Exception as e:
+        await update.message.reply_text(f"⚠ 메일 전송 실패: {e}")
+
+
+async def cmd_negotiations(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    rows = db.list_negotiations(chat_id)
+    if not rows:
+        await update.message.reply_text("협상 없음. /negotiate 시작.")
+        return
+    lines = ["📨 negotiations"]
+    for r in rows[:10]:
+        emoji = {"proposed": "🟡", "awaiting": "⏳", "agreed": "✓",
+                 "abandoned": "✗"}.get(r["state"], "·")
+        lines.append(
+            f"  {emoji} #{r['id']} {r['counterparty_email']} — {r['topic'][:40]}")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     pending_gcal = [r for r in db.list_pending_gcal_sync() if r["chat_id"] == chat_id]
@@ -6949,6 +7063,10 @@ def main() -> None:
     app.add_handler(CommandHandler("write", cmd_write))
     app.add_handler(CommandHandler("write_continue", cmd_write_continue))
     app.add_handler(CommandHandler("write_done", cmd_write_done))
+    app.add_handler(CommandHandler("plan_trip", cmd_plan_trip))
+    app.add_handler(CommandHandler("trips", cmd_trips))
+    app.add_handler(CommandHandler("negotiate", cmd_negotiate))
+    app.add_handler(CommandHandler("negotiations", cmd_negotiations))
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("week", cmd_week))
     app.add_handler(CommandHandler("agenda", cmd_agenda))
