@@ -934,6 +934,11 @@ TOOLS: List[Dict] = [
                             "required": ["label", "date_local"],
                         },
                     },
+                    "preferred_language": {
+                        "type": "string",
+                        "enum": ["ko", "en", "ja", "zh"],
+                        "description": "Person이 모국어로 쓰는 언어. 외국인이면 'en'/'ja'/'zh' — 봇이 메일 도착 시 자동 한국어 요약하고 답장 시 자동 통역.",
+                    },
                 },
                 "required": ["name"],
             },

@@ -37,6 +37,7 @@ import oauth_server
 import routines
 import scheduler
 import transcribe
+import translator
 import weather as weather_mod
 from llm import TOOLS, USER_TZ, chat_completion, parse_tool_calls
 
@@ -2154,6 +2155,7 @@ def tool_add_person(chat_id: int, args: Dict) -> Dict:
         role=args.get("role"),
         notes=args.get("notes"),
         important_dates=args.get("important_dates") or [],
+        preferred_language=args.get("preferred_language"),
     )
     return {"ok": True, "person_id": pid, "name": name}
 
@@ -3513,6 +3515,41 @@ def _user_was_active(chat_id: int, hours: int = 48) -> bool:
             "SELECT 1 FROM chat_log WHERE chat_id=? AND role='user' AND created_at>=? LIMIT 1",
             (chat_id, cutoff)).fetchone()
         return row is not None
+
+
+# v12 W3: 짧은 메시지를 가까운 일정과 연결
+_CONTEXT_ACTION_KEYWORDS = ("도착", "출발", "끝남", "끝났", "왔어", "갔어",
+                              "감", "늦", "지각", "안 갔", "안갔", "출근",
+                              "퇴근", "들어옴", "나감")
+
+
+def _infer_short_message_context(chat_id: int, message: str) -> str:
+    """짧은 메시지(≤12자) + 액션 키워드면 ±2시간 가장 가까운 일정을 한 줄
+    [현재 가까운 일정 …]로 반환. user_text 앞에 prepend 돼 LLM 답변에 사용됨.
+    매칭 안 되면 빈 문자열 — 일반 답변 흐름."""
+    msg = (message or "").strip()
+    if len(msg) > 12 or len(msg) < 1:
+        return ""
+    if not any(k in msg for k in _CONTEXT_ACTION_KEYWORDS):
+        return ""
+    now = datetime.now(timezone.utc)
+    try:
+        items = db.list_events(
+            chat_id, now - timedelta(hours=2), now + timedelta(hours=2))
+    except Exception:
+        return ""
+    if not items:
+        return ""
+    nearest = min(items,
+                   key=lambda e: abs(datetime.fromisoformat(e["when_utc"]) - now))
+    try:
+        when_local = datetime.fromisoformat(nearest["when_utc"]).astimezone(TZ)
+    except Exception:
+        return ""
+    title = (nearest["title"] or "")[:40]
+    loc = nearest["location"] if "location" in nearest.keys() and nearest["location"] else ""
+    loc_str = f" @{loc}" if loc else ""
+    return f"[현재 가까운 일정 — id={nearest['id']}, {when_local.strftime('%H:%M')} {title}{loc_str}]"
 
 
 # event_id → utc timestamp when the leave-by fired; consumed by run_late_check.
@@ -5790,6 +5827,35 @@ async def cmd_now(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("\n".join(lines))
 
 
+async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/translate <텍스트>` 또는 `/translate en <텍스트>` — 한국어↔외국어 통역.
+    target 미지정 시 입력 언어 감지 → 반대 방향 (외국어→한국어 또는 한국어→영어)."""
+    chat_id = update.effective_chat.id
+    args = list(context.args or [])
+    if not args:
+        await update.message.reply_text(
+            "사용: /translate <텍스트>\n"
+            "     /translate en|ja|zh|ko <텍스트>")
+        return
+    target = None
+    if args[0].lower() in ("ko", "en", "ja", "zh"):
+        target = args[0].lower()
+        text = " ".join(args[1:]).strip()
+    else:
+        text = " ".join(args).strip()
+    if not text:
+        await update.message.reply_text("텍스트 없음.")
+        return
+    if not target:
+        src = await translator.detect_language(text)
+        target = "ko" if src != "ko" else "en"
+    result = await translator.translate(text, target)
+    if not result:
+        await update.message.reply_text("⚠ 통역 실패")
+        return
+    await update.message.reply_text(result)
+
+
 async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     pending_gcal = [r for r in db.list_pending_gcal_sync() if r["chat_id"] == chat_id]
@@ -6291,6 +6357,14 @@ async def _process_user_text(
     """Shared agent dispatch used by text, voice, and photo handlers."""
     chat_id = update.effective_chat.id
     db.log_chat(chat_id, "user", f"{log_prefix}{user_text}")
+    # v12 W3: 짧은 메시지 + 액션 키워드면 가까운 일정을 컨텍스트로 prepend
+    if not _toggle_off_local(chat_id, "context_inference_enabled"):
+        try:
+            ctx_note = _infer_short_message_context(chat_id, user_text)
+            if ctx_note:
+                user_text = f"{ctx_note}\n{user_text}"
+        except Exception:
+            logger.exception("context inference failed (non-fatal)")
     # If we asked for a reflection today and haven't captured it yet, this
     # message is the response (best-effort heuristic — works for short replies).
     try:
@@ -6594,6 +6668,8 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("now", cmd_now))
+    # v12: 메뉴 등록 X — 직접 타이핑만
+    app.add_handler(CommandHandler("translate", cmd_translate))
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("week", cmd_week))
     app.add_handler(CommandHandler("agenda", cmd_agenda))

@@ -35,6 +35,8 @@ KIND_TO_TIER: Dict[str, str] = {
     "bday_draft":        HAIKU,
     "bank_sms_parse":    HAIKU,
     "relation_extract":  HAIKU,
+    "translate":         HAIKU,
+    "context_infer":     HAIKU,
     "compaction":        HAIKU,
     # everyday assistant
     "chat":              SONNET,

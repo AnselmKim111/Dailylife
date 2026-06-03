@@ -461,6 +461,8 @@ _MIGRATIONS: List[Tuple[str, str, str]] = [
     ("daily_state", "learning_question_key", "TEXT"),  # what fact/person we asked about
     # v8: live mission UI — the Telegram message_id we keep editing for progress.
     ("missions", "progress_message_id", "INTEGER"),
+    # v12 W8: person 모국어 (ko/en/ja/zh, default ko) — 메일 자동 통역에 사용
+    ("people", "preferred_language", "TEXT NOT NULL DEFAULT 'ko'"),
 ]
 
 
@@ -1232,6 +1234,7 @@ def add_person(
     role: Optional[str] = None,
     notes: Optional[str] = None,
     important_dates: Optional[List[Dict]] = None,
+    preferred_language: Optional[str] = None,
 ) -> int:
     """Insert a new person. Updates if (chat_id, name) already exists — merge aliases."""
     with _conn() as c:
@@ -1250,19 +1253,21 @@ def add_person(
                     cur_dates.append(d)
             c.execute(
                 "UPDATE people SET aliases_json=?, role=COALESCE(?, role), "
-                "notes=COALESCE(?, notes), important_dates_json=? WHERE id=?",
+                "notes=COALESCE(?, notes), important_dates_json=?, "
+                "preferred_language=COALESCE(?, preferred_language) WHERE id=?",
                 (_json.dumps(sorted(cur_aliases), ensure_ascii=False), role, notes,
-                 _json.dumps(cur_dates, ensure_ascii=False), existing["id"]),
+                 _json.dumps(cur_dates, ensure_ascii=False), preferred_language, existing["id"]),
             )
             return existing["id"]
         cur = c.execute(
-            "INSERT INTO people (chat_id, name, aliases_json, role, notes, important_dates_json) "
-            "VALUES (?,?,?,?,?,?)",
+            "INSERT INTO people (chat_id, name, aliases_json, role, notes, important_dates_json, "
+            "preferred_language) VALUES (?,?,?,?,?,?,?)",
             (
                 chat_id, name.strip(),
                 _json.dumps(aliases or [], ensure_ascii=False),
                 role, notes,
                 _json.dumps(important_dates or [], ensure_ascii=False),
+                preferred_language or "ko",
             ),
         )
         return cur.lastrowid
