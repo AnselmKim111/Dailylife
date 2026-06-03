@@ -623,6 +623,68 @@ TOOLS: List[Dict] = [
     {
         "type": "function",
         "function": {
+            "name": "place_phone_call",
+            "description": (
+                "Place an outbound voice call on the user's behalf. Twilio "
+                "speaks the `purpose` in Korean → records the recipient's "
+                "response → hangs up. Transcript + summary auto-sent to user "
+                "afterward. Use for: 식당 예약, 진료 예약 변경, 영업시간 확인, "
+                "고객센터 문의. Always ask the user to confirm to_number first."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "to_number": {"type": "string", "description": "+82 prefix recommended (e.g., '+82212345678')."},
+                    "purpose": {"type": "string", "description": "한국어 한 문장, 봇이 그대로 말함."},
+                },
+                "required": ["to_number", "purpose"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_scrape",
+            "description": (
+                "JS-rendered headless browser fetch. Use INSTEAD of fetch_url when "
+                "the target page needs Javascript to render (SPA, infinite scroll, "
+                "lazy-loaded content) or the user wants a specific selector waited "
+                "for. Returns text content."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "wait_for_selector": {"type": "string", "description": "Optional CSS selector to wait for."},
+                    "max_chars": {"type": "integer", "description": "Default 6000."},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_screenshot",
+            "description": (
+                "Take a screenshot of a webpage and send it to the user as a "
+                "Telegram photo. Use when visual confirmation matters (booking "
+                "confirmation, comparison table, status page)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string"},
+                    "purpose": {"type": "string", "description": "Short caption."},
+                    "full_page": {"type": "boolean"},
+                },
+                "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "add_watch",
             "description": (
                 "Register a long-running watch task. Bot will periodically check "

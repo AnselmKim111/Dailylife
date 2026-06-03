@@ -28,9 +28,11 @@ import db
 import external
 import gcal
 import gmail as gmail_mod
+import browser as browser_mod
 import korean_calendar
 import lifelog
 import lunar
+import voice_call
 import oauth_server
 import routines
 import scheduler
@@ -1233,6 +1235,191 @@ async def tool_lifelog_search_async(chat_id: int, args: Dict) -> Dict:
         logger.exception("lifelog_search failed")
         return {"ok": False, "error": str(e)}
     return {"ok": True, "results": results}
+
+
+# ---------------- v11: voice call (Twilio) ----------------
+
+
+async def cmd_call(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/call <번호> <목적>` 봇이 한국어로 outbound call. 봇이 instruction
+    말하고 → 응답 녹음 → 종료 → transcript + 요약 자동 보고."""
+    chat_id = update.effective_chat.id
+    args = list(context.args or [])
+    if not args:
+        rows = db.list_voice_calls(chat_id)
+        if not rows:
+            await update.message.reply_text(
+                "/call 02-555-1234 강남 라멘집 오늘 8시 4명 예약\n"
+                "(Twilio + PUBLIC_BASE_URL 환경변수 필요)"
+            )
+            return
+        lines = ["📞 통화 기록"]
+        for r in rows[:10]:
+            mark = {"queued": "⏳", "active": "📞", "done": "✓",
+                    "failed": "✗", "cancelled": "×"}.get(r["status"], "·")
+            lines.append(f"  {mark} #{r['id']} {r['to_number']} — {r['purpose'][:40]}")
+        await update.message.reply_text("\n".join(lines))
+        return
+    if not voice_call.is_configured():
+        await update.message.reply_text(
+            "⚠ Twilio 미설정. Railway env에 TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN / "
+            "TWILIO_NUMBER / PUBLIC_BASE_URL 등록 필요.")
+        return
+    if len(args) < 2:
+        await update.message.reply_text("/call <번호> <한 줄 instruction>")
+        return
+    # 비용 가드
+    try:
+        cap = float(_fact_value_local(chat_id, "call_daily_cost_limit_usd") or "5.0")
+    except ValueError:
+        cap = 5.0
+    spent = db.voice_call_cost_today(chat_id)
+    if spent >= cap:
+        await update.message.reply_text(
+            f"⚠ 일 통화 비용 한도 도달 (${spent:.4f}/${cap:.2f}). "
+            "`remember_fact call_daily_cost_limit_usd 10` 로 올리거나 내일.")
+        return
+    to_number = args[0]
+    purpose = " ".join(args[1:]).strip()
+    call_id = db.create_voice_call(chat_id, to_number, purpose)
+    res = await voice_call.place_call(to_number, purpose, call_id)
+    if not res.get("ok"):
+        db.update_voice_call(call_id, status="failed")
+        await update.message.reply_text(f"⚠ 통화 실패: {res.get('error')}")
+        return
+    db.update_voice_call(call_id, twilio_call_sid=res["twilio_call_sid"])
+    await update.message.reply_text(
+        f"📞 #{call_id} 통화 시작 → {to_number}\n"
+        f"  목적: {purpose[:80]}\n"
+        f"  종료 후 transcript + 요약 자동 보고")
+
+
+async def cmd_cancel_call(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    if not context.args:
+        await update.message.reply_text("/cancel_call <id>")
+        return
+    try:
+        cid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("id는 숫자")
+        return
+    row = db.get_voice_call(cid)
+    if not row or row["chat_id"] != chat_id:
+        await update.message.reply_text("없는 통화")
+        return
+    if row["twilio_call_sid"]:
+        ok = await voice_call.cancel_call(row["twilio_call_sid"])
+        db.update_voice_call(cid, status="cancelled")
+        await update.message.reply_text("⏹ 중단" if ok else "⚠ 이미 종료됨")
+    else:
+        await update.message.reply_text("Twilio SID 없음")
+
+
+async def tool_place_phone_call(chat_id: int, args: Dict) -> Dict:
+    to_number = (args.get("to_number") or "").strip()
+    purpose = (args.get("purpose") or "").strip()
+    if not to_number or not purpose:
+        return {"ok": False, "error": "to_number + purpose required"}
+    if not voice_call.is_configured():
+        return {"ok": False, "error": "twilio not configured"}
+    try:
+        cap = float(_fact_value_local(chat_id, "call_daily_cost_limit_usd") or "5.0")
+    except ValueError:
+        cap = 5.0
+    if db.voice_call_cost_today(chat_id) >= cap:
+        return {"ok": False, "error": "daily call cost cap reached"}
+    call_id = db.create_voice_call(chat_id, to_number, purpose)
+    res = await voice_call.place_call(to_number, purpose, call_id)
+    if not res.get("ok"):
+        db.update_voice_call(call_id, status="failed")
+        return {"ok": False, "error": res.get("error")}
+    db.update_voice_call(call_id, twilio_call_sid=res["twilio_call_sid"])
+    return {"ok": True, "call_id": call_id, "twilio_sid": res["twilio_call_sid"]}
+
+
+# ---------------- v11: browser automation + vault ----------------
+
+
+def _get_vault_passphrase(chat_id: int) -> Optional[str]:
+    return _fact_value_local(chat_id, "vault_passphrase")
+
+
+async def cmd_vault(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/vault add <site> <user> <pass>` · `/vault list` · `/vault remove <site>`.
+
+    비밀번호는 fact `vault_passphrase`로 AES-GCM 암호화. 사용자가
+    /facts에 passphrase 먼저 등록 필요."""
+    chat_id = update.effective_chat.id
+    args = list(context.args or [])
+    pw = _get_vault_passphrase(chat_id)
+    if not args:
+        rows = db.list_web_credentials(chat_id)
+        if not rows:
+            txt = ("🗝 vault 비어 있음.\n"
+                   "1) `remember_fact vault_passphrase 길고복잡한문자열`\n"
+                   "2) /vault add catchtable my@mail mypassword")
+        else:
+            lines = ["🗝 등록 사이트"]
+            for r in rows[:20]:
+                lines.append(f"  • {r['site_label']} ({r['username']})")
+            txt = "\n".join(lines)
+        await update.message.reply_text(txt)
+        return
+    op = args[0].lower()
+    if op == "add" and len(args) >= 4:
+        if not pw:
+            await update.message.reply_text(
+                "⚠ vault_passphrase fact 없음 — `remember_fact vault_passphrase <문구>` 먼저")
+            return
+        site, user = args[1].lower(), args[2]
+        password = " ".join(args[3:])
+        enc = browser_mod.encrypt_password(password, pw)
+        if not enc:
+            await update.message.reply_text("⚠ 암호화 라이브러리 누락")
+            return
+        wid = db.add_web_credential(
+            chat_id, site, user, enc["ciphertext"], enc["nonce"])
+        await update.message.reply_text(f"🗝 #{wid} {site} 저장 ({user}) — 비밀번호 암호화됨")
+        # 사용자가 비밀번호를 chat에 노출했으니 그 메시지 삭제 권장
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        return
+    if op == "remove" and len(args) >= 2:
+        ok = db.delete_web_credential(chat_id, args[1])
+        await update.message.reply_text("🗑 제거" if ok else "없음")
+        return
+    await update.message.reply_text("사용: /vault | /vault add <site> <user> <pass> | /vault remove <site>")
+
+
+async def tool_web_scrape(chat_id: int, args: Dict) -> Dict:
+    url = (args.get("url") or "").strip()
+    if not url:
+        return {"ok": False, "error": "url required"}
+    res = await browser_mod.scrape_url(
+        url, wait_for_selector=args.get("wait_for_selector"),
+        max_chars=int(args.get("max_chars") or 6000),
+    )
+    return res
+
+
+async def tool_web_screenshot(chat_id: int, args: Dict) -> Dict:
+    url = (args.get("url") or "").strip()
+    if not url:
+        return {"ok": False, "error": "url required"}
+    res = await browser_mod.screenshot_url(url, full_page=bool(args.get("full_page", True)))
+    if res.get("ok") and _app and _app.bot:
+        try:
+            await _app.bot.send_photo(
+                chat_id=chat_id, photo=res["png"],
+                caption=(args.get("purpose") or url)[:120],
+            )
+        except Exception:
+            logger.exception("screenshot send failed")
+    res.pop("png", None)  # don't leak bytes to LLM
+    return res
 
 
 # ---------------- v11: watch_tasks (장기 trigger) ----------------
@@ -4828,6 +5015,9 @@ async def tool_generate_image(chat_id: int, args: Dict) -> Dict:
 ASYNC_HANDLERS["generate_image"] = tool_generate_image
 ASYNC_HANDLERS["analyze_document"] = tool_analyze_document
 ASYNC_HANDLERS["lifelog_search"] = tool_lifelog_search_async
+ASYNC_HANDLERS["web_scrape"] = tool_web_scrape
+ASYNC_HANDLERS["web_screenshot"] = tool_web_screenshot
+ASYNC_HANDLERS["place_phone_call"] = tool_place_phone_call
 
 
 async def cmd_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6435,6 +6625,10 @@ def main() -> None:
     app.add_handler(CommandHandler("watch", cmd_watch))
     app.add_handler(CommandHandler("watches", cmd_watch))  # alias
     app.add_handler(CommandHandler("watch_cancel", cmd_watch_cancel))
+    app.add_handler(CommandHandler("vault", cmd_vault))
+    app.add_handler(CommandHandler("call", cmd_call))
+    app.add_handler(CommandHandler("calls", cmd_call))  # alias
+    app.add_handler(CommandHandler("cancel_call", cmd_cancel_call))
     app.add_handler(CommandHandler("improvements", cmd_improvements))
     app.add_handler(CommandHandler("rules", cmd_rules))
     app.add_handler(CommandHandler("persona", cmd_persona))

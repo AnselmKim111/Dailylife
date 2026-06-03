@@ -1,0 +1,16 @@
+# Nixpacks config for Dailylife bot on Railway.
+# v11 adds Chromium for Playwright browser automation (Wave 2).
+#
+# Notes:
+#   - chromium binary comes from nixpkgs (~150MB), Playwright reuses it via
+#     PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH so we don't re-download in postInstall.
+#   - voice (Wave 1) and Playwright tools degrade gracefully if the binaries
+#     or env vars aren't present — the rest of the bot keeps working.
+
+[phases.setup]
+nixPkgs = ["python311", "chromium"]
+aptPkgs = ["libnss3", "libatk-bridge2.0-0", "libgtk-3-0", "libxss1", "libasound2", "libpangocairo-1.0-0"]
+
+[variables]
+PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1"
+PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH = "/nix/var/nix/profiles/default/bin/chromium"
