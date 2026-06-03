@@ -45,6 +45,9 @@ _self_improve_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _subscription_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = sub_id
 _inbox_triage_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = chat_id
 _experiment_followup_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = exp_id
+# v11 runners
+_lifelog_index_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = chat_id
+_watch_pump_runner: Optional[Callable[[], Awaitable[None]]] = None  # no args
 
 
 def init(
@@ -74,6 +77,8 @@ def init(
     subscription_runner: Optional[Callable[[int], Awaitable[None]]] = None,
     inbox_triage_runner: Optional[Callable[[int], Awaitable[None]]] = None,
     experiment_followup_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    lifelog_index_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    watch_pump_runner: Optional[Callable[[], Awaitable[None]]] = None,
 ) -> None:
     global _scheduler, _bot, _recurring_runner, _weekly_review_runner, _daily_imminent_runner
     global _morning_briefing_runner, _evening_reflection_runner
@@ -84,6 +89,7 @@ def init(
     global _budget_check_runner, _late_check_runner, _mission_tick_runner
     global _relation_extract_runner, _self_improve_runner, _subscription_runner
     global _inbox_triage_runner, _experiment_followup_runner
+    global _lifelog_index_runner, _watch_pump_runner
     _bot = bot
     _recurring_runner = recurring_runner
     _weekly_review_runner = weekly_review_runner
@@ -110,6 +116,8 @@ def init(
     _subscription_runner = subscription_runner
     _inbox_triage_runner = inbox_triage_runner
     _experiment_followup_runner = experiment_followup_runner
+    _lifelog_index_runner = lifelog_index_runner
+    _watch_pump_runner = watch_pump_runner
     # Re-arm any existing subscriptions on boot
     if _subscription_runner:
         try:
@@ -165,6 +173,15 @@ def init(
         replace_existing=True,
         misfire_grace_time=3600,
     )
+    # v11: watch_tasks pump every 10min (global, iterates active watches itself)
+    if watch_pump_runner is not None:
+        _scheduler.add_job(
+            _run_watch_pump,
+            CronTrigger(minute="*/10", timezone=TZ),
+            id="v11-watch-pump",
+            replace_existing=True,
+            misfire_grace_time=600,
+        )
     _scheduler.add_job(
         _run_v5_error_cleanup,
         CronTrigger(day_of_week="sun", hour=4, minute=30, timezone=TZ),
@@ -547,6 +564,16 @@ def ensure_daily_rhythm_for(chat_id: int) -> None:
             CronTrigger(day_of_week="sun", hour=10, minute=0, timezone=TZ),
             args=[chat_id],
             id=f"self-improve-{chat_id}",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
+    # v11: lifelog index — 매일 04:30 어제 entity embed
+    if _lifelog_index_runner and not _toggle_off(chat_id, "lifelog_indexing_enabled"):
+        _scheduler.add_job(
+            _run_lifelog_index,
+            CronTrigger(hour=4, minute=30, timezone=TZ),
+            args=[chat_id],
+            id=f"lifelog-index-{chat_id}",
             replace_existing=True,
             misfire_grace_time=3600,
         )
@@ -970,6 +997,24 @@ async def _run_self_improve(chat_id: int) -> None:
         await _self_improve_runner(chat_id)
     except Exception:
         logger.exception("self-improve failed for chat %s", chat_id)
+
+
+async def _run_lifelog_index(chat_id: int) -> None:
+    if _lifelog_index_runner is None or _toggle_off(chat_id, "lifelog_indexing_enabled"):
+        return
+    try:
+        await _lifelog_index_runner(chat_id)
+    except Exception:
+        logger.exception("lifelog index failed for chat %s", chat_id)
+
+
+async def _run_watch_pump() -> None:
+    if _watch_pump_runner is None:
+        return
+    try:
+        await _watch_pump_runner()
+    except Exception:
+        logger.exception("watch pump failed")
 
 
 async def _run_mission_pump() -> None:

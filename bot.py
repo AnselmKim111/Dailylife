@@ -29,6 +29,7 @@ import external
 import gcal
 import gmail as gmail_mod
 import korean_calendar
+import lifelog
 import lunar
 import oauth_server
 import routines
@@ -125,6 +126,8 @@ SYSTEM_PROMPT_TEMPLATE = (
     "/nudges for toggles instead of arguing.\n"
     "- Cross-entity recall (X 관련된 거 다, X에 대해 정리) → cross_recall FIRST instead of "
     "firing list_events/search_memory separately.\n"
+    "- 모호한 회상 ('그 영화 뭐였더라', '작년 그 카페', '그때 들었던 노래') → lifelog_search "
+    "(semantic). cross_recall은 정확한 이름·키워드 매칭만.\n"
     "- Outbound actions on the user's behalf are enabled: gmail_send_email / gmail_reply_to / "
     "gcal_rsvp work. Only fire them when the user explicitly asks ('메일 보내줘', "
     "'회의 수락해줘') OR an auto_rule matched (which the runner enforces, you don't gate). "
@@ -1081,6 +1084,413 @@ async def run_inbox_triage(chat_id: int) -> None:
 
 
 # ---------------- v9: habit experiments ----------------
+
+
+# v11: lifelog 매일 04:30 — 어제 entity embed
+
+
+async def run_lifelog_index(chat_id: int) -> None:
+    if _toggle_off_local(chat_id, "lifelog_indexing_enabled"):
+        return
+    try:
+        counts = await lifelog.index_yesterday(chat_id)
+        total = sum(counts.values())
+        if total:
+            logger.info("lifelog chat=%s indexed=%s", chat_id, counts)
+    except Exception:
+        logger.exception("lifelog index runner failed chat=%s", chat_id)
+
+
+# v11: watch_tasks pump (10분) — 별도 wave 3에서 검사 로직 구현
+async def run_watch_pump() -> None:
+    """매 10분 — active watch 중 due 항목 1-3개 체크."""
+    rows = db.watches_due()
+    if not rows:
+        return
+    for w in rows[:3]:
+        try:
+            await _check_watch(w)
+        except Exception:
+            logger.exception("watch check failed id=%s", w["id"])
+
+
+WATCH_CHECK_PROMPT = (
+    "사용자가 등록한 watch task의 조건이 충족됐는지 판단.\n"
+    "JSON 한 줄: {{\"matched\": true|false, \"evidence\": \"<≤120자 한국어 근거>\", \"new_state\": \"<≤200자 현재 상태 요약>\"}}\n\n"
+    "조건: {condition}\n"
+    "직전 상태: {last_state}\n"
+    "이번 체크 결과:\n{check_result}"
+)
+
+
+async def _check_watch(watch_row) -> None:
+    """단일 watch — check_kind에 따라 도구 실행 후 LLM이 조건 매칭 판단."""
+    chat_id = watch_row["chat_id"]
+    try:
+        args = json.loads(watch_row["check_args_json"] or "{}")
+    except Exception:
+        args = {}
+    # 1) Run the check tool
+    check_kind = watch_row["check_kind"]
+    result_text = ""
+    try:
+        if check_kind == "fetch_url":
+            r = await tool_fetch_url(chat_id, args)
+            result_text = json.dumps(r, ensure_ascii=False)[:3000]
+        elif check_kind == "web_search":
+            r = await tool_web_search(chat_id, args)
+            result_text = json.dumps(r, ensure_ascii=False)[:3000]
+        elif check_kind == "gmail_query":
+            r = await tool_gmail_search(chat_id, args)
+            result_text = json.dumps(r, ensure_ascii=False)[:3000]
+        elif check_kind == "web_scrape":
+            # Wave 2에서 추가; 없으면 fetch_url로 폴백
+            try:
+                import browser
+                r = await browser.scrape_url(args.get("url", ""),
+                                              wait_for_selector=args.get("wait_for_selector"))
+                result_text = (r or "")[:3000]
+            except Exception:
+                r = await tool_fetch_url(chat_id, {"url": args.get("url", "")})
+                result_text = json.dumps(r, ensure_ascii=False)[:3000]
+        else:
+            result_text = f"(unsupported check_kind={check_kind})"
+    except Exception as e:
+        logger.exception("watch %s check %s failed", watch_row["id"], check_kind)
+        result_text = f"(check error: {e})"
+    # 2) LLM judges match
+    prompt = WATCH_CHECK_PROMPT.format(
+        condition=watch_row["condition_md"],
+        last_state=(watch_row["last_state_json"] or "(first check)")[:600],
+        check_result=result_text,
+    )
+    try:
+        data = await chat_completion(
+            [{"role": "user", "content": prompt}],
+            tools=None, chat_id=chat_id, kind="classify_content", max_tokens=240,
+        )
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+    except Exception:
+        logger.exception("watch judge LLM failed id=%s", watch_row["id"])
+        return
+    import re as _re
+    m = _re.search(r"\{[\s\S]*\}", content)
+    if not m:
+        return
+    try:
+        parsed = json.loads(m.group(0))
+    except Exception:
+        return
+    new_state = (parsed.get("new_state") or "")[:300]
+    db.update_watch_check(watch_row["id"], json.dumps(parsed, ensure_ascii=False))
+    if parsed.get("matched") is True:
+        db.trigger_watch(watch_row["id"])
+        if _app and _app.bot:
+            txt = (f"🛎 watch #{watch_row['id']} 발사 — {watch_row['label']}\n"
+                   f"  • {parsed.get('evidence','')}\n"
+                   f"  • 다음 발사 안 함 (`/watch_cancel`로 정리, 재등록은 `/watch`)")
+            try:
+                await _app.bot.send_message(chat_id=chat_id, text=txt)
+            except Exception:
+                logger.exception("watch trigger send failed")
+            db.log_agent_action(
+                chat_id, "watch_trigger",
+                summary=f"watch {watch_row['label']} 발사",
+                payload={"watch_id": watch_row["id"], "evidence": parsed.get("evidence")},
+            )
+
+
+def tool_lifelog_search(chat_id: int, args: Dict) -> Dict:
+    """동기 시그니처지만 내부적으로 비동기 호출이 필요 — async wrapper 사용."""
+    q = (args.get("query") or "").strip()
+    if not q:
+        return {"ok": False, "error": "query required"}
+    k = max(1, min(int(args.get("k") or 8), 20))
+    # Sync wrapper around async — run on event loop if possible
+    import asyncio as _asyncio
+    try:
+        loop = _asyncio.get_event_loop()
+        if loop.is_running():
+            # called from within run_agent → wrap as task and wait
+            fut = _asyncio.ensure_future(lifelog.search(chat_id, q, k=k))
+            # Can't synchronously await — but tool handlers in run_agent are
+            # awaited if async. So we need to be async. Convert below.
+            return {"ok": False, "error": "use async tool_lifelog_search_async"}
+        results = loop.run_until_complete(lifelog.search(chat_id, q, k=k))
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "results": results}
+
+
+async def tool_lifelog_search_async(chat_id: int, args: Dict) -> Dict:
+    q = (args.get("query") or "").strip()
+    if not q:
+        return {"ok": False, "error": "query required"}
+    k = max(1, min(int(args.get("k") or 8), 20))
+    try:
+        results = await lifelog.search(chat_id, q, k=k)
+    except Exception as e:
+        logger.exception("lifelog_search failed")
+        return {"ok": False, "error": str(e)}
+    return {"ok": True, "results": results}
+
+
+# ---------------- v11: watch_tasks (장기 trigger) ----------------
+
+
+WATCH_PARSE_PROMPT = (
+    "사용자의 자연어 watch 요청을 다음 JSON으로 파싱:\n"
+    '{{"label": "<짧은 한국어 라벨 ≤30자>",\n'
+    ' "condition_md": "<원본 조건 정리>",\n'
+    ' "check_kind": "fetch_url"|"web_search"|"gmail_query",\n'
+    ' "check_args": {{... kind에 맞는 인자}},\n'
+    ' "check_interval_min": <int, 최소 30>}}\n\n'
+    "check_args 예시:\n"
+    '  fetch_url: {{"url": "https://..."}}\n'
+    '  web_search: {{"query": "DMC파크뷰자이 매물"}}\n'
+    '  gmail_query: {{"query": "from:no-reply@delta.com"}}\n\n'
+    "원본 자연어: {raw}"
+)
+
+
+async def cmd_watch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/watch <자연어 조건>` 등록 · `/watches` 목록 · `/watch_cancel <id>`."""
+    chat_id = update.effective_chat.id
+    args = list(context.args or [])
+    if not args:
+        rows = db.list_watches(chat_id)
+        if not rows:
+            await update.message.reply_text(
+                "/watch DMC파크뷰자이 매매가 11억 이하 매주 — 자연어로 등록"
+            )
+            return
+        lines = ["🛎 watches"]
+        for r in rows[:10]:
+            mark = {"active": "•", "triggered": "✓", "cancelled": "×"}.get(r["status"], "·")
+            lines.append(f"  {mark} #{r['id']} {r['label']} ({r['check_kind']}/{r['check_interval_min']}분)")
+        await update.message.reply_text("\n".join(lines))
+        return
+    raw = " ".join(args).strip()
+    await update.message.reply_text("🛎 파싱 중…")
+    try:
+        data = await chat_completion(
+            [{"role": "user", "content": WATCH_PARSE_PROMPT.format(raw=raw)}],
+            tools=None, chat_id=chat_id, kind="classify_content", max_tokens=400,
+        )
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+    except Exception as e:
+        await update.message.reply_text(f"⚠ {e}")
+        return
+    import re as _re
+    m = _re.search(r"\{[\s\S]*\}", content)
+    if not m:
+        await update.message.reply_text(f"⚠ 파싱 실패\n{content[:200]}")
+        return
+    try:
+        p = json.loads(m.group(0))
+    except Exception:
+        await update.message.reply_text(f"⚠ JSON 오류")
+        return
+    # active watch cap 10
+    active = db.list_watches(chat_id, status="active")
+    if len(active) >= 10:
+        await update.message.reply_text("⚠ 활성 watch 10개 초과 — 먼저 정리")
+        return
+    wid = db.add_watch(
+        chat_id,
+        label=p.get("label", raw[:30]),
+        condition_md=p.get("condition_md", raw),
+        check_kind=p.get("check_kind", "web_search"),
+        check_args=p.get("check_args") or {"query": raw},
+        check_interval_min=int(p.get("check_interval_min") or 60),
+    )
+    await update.message.reply_text(
+        f"🛎 watch #{wid} 등록 — {p.get('label', raw[:30])} ({p.get('check_kind')}/{p.get('check_interval_min', 60)}분)"
+    )
+
+
+async def cmd_watch_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    if not context.args:
+        await update.message.reply_text("/watch_cancel <id>")
+        return
+    try:
+        wid = int(context.args[0])
+    except ValueError:
+        await update.message.reply_text("id는 숫자")
+        return
+    ok = db.cancel_watch(chat_id, wid)
+    await update.message.reply_text(f"🗑 #{wid} 정리" if ok else "없음")
+
+
+def tool_add_watch(chat_id: int, args: Dict) -> Dict:
+    """agent도 호출 가능 — 사용자 자연어 요청을 받았을 때."""
+    label = (args.get("label") or "").strip()
+    cond = (args.get("condition_md") or label).strip()
+    if not label or not cond:
+        return {"ok": False, "error": "label + condition_md required"}
+    active = db.list_watches(chat_id, status="active")
+    if len(active) >= 10:
+        return {"ok": False, "error": "active watch cap (10)"}
+    wid = db.add_watch(
+        chat_id, label=label, condition_md=cond,
+        check_kind=(args.get("check_kind") or "web_search"),
+        check_args=args.get("check_args") or {"query": label},
+        check_interval_min=int(args.get("check_interval_min") or 60),
+    )
+    return {"ok": True, "watch_id": wid}
+
+
+def tool_list_watches(chat_id: int, args: Dict) -> Dict:
+    rows = db.list_watches(chat_id, status=args.get("status"))
+    return {"ok": True, "watches": [
+        {"id": r["id"], "label": r["label"], "status": r["status"],
+         "check_kind": r["check_kind"], "interval_min": r["check_interval_min"],
+         "last_check_utc": r["last_check_utc"]}
+        for r in rows]}
+
+
+# ---------------- v11: decision simulation ----------------
+
+
+DECIDE_KICKOFF_PROMPT = (
+    "사용자가 큰 결정을 봇에게 가져왔다. 옵션과 핵심 factor를 분리하고 "
+    "사용자에게 추가로 필요한 정보 3-5개를 짧은 질문 리스트로 받아내자.\n"
+    'JSON: {{"options": ["A","B",...], "factors_needed": ["월세 차이","통근 시간",...], '
+    '"clarify_questions": ["월세 차이 얼마?", "통근 거리?", ...]}}\n\n'
+    "결정 주제: {title}"
+)
+
+
+DECIDE_SIMULATE_PROMPT = (
+    "사용자가 결정해야 하는 옵션과 factor가 모였다. 각 옵션을 6/12/24개월 후 "
+    "시나리오로 시뮬레이션해 추천 1개 + 이유 + 위험 + 대안 1개. 한국어 마크다운, "
+    "≤600자.\n"
+    "주제: {title}\n"
+    "옵션: {options}\n"
+    "factors: {factors}\n"
+    "persona 요약: {persona}"
+)
+
+
+async def cmd_decide(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/decide <상황>` 결정 시작 · `/decide list` 목록 · `/decide <id>` 결과 보기."""
+    chat_id = update.effective_chat.id
+    args = list(context.args or [])
+    if not args:
+        rows = db.list_decisions(chat_id)
+        if not rows:
+            await update.message.reply_text(
+                "/decide 강남 vs 합정 이사  ← 결정 시작\n"
+                "/decide <id>  ← 결과 보기"
+            )
+            return
+        lines = ["🎯 최근 결정"]
+        for r in rows[:10]:
+            emoji = {"pending": "⏳", "decided": "✓", "abandoned": "×"}.get(r["status"], "·")
+            lines.append(f"  {emoji} #{r['id']} {r['title']}")
+        await update.message.reply_text("\n".join(lines))
+        return
+    if args[0].lower() == "list":
+        rows = db.list_decisions(chat_id)
+        for r in rows[:15]:
+            await update.message.reply_text(f"#{r['id']} [{r['status']}] {r['title']}")
+        return
+    if len(args) == 2 and args[0].isdigit() and args[1].lower() == "go":
+        did = int(args[0])
+        d = db.get_decision(did)
+        if not d or d["chat_id"] != chat_id:
+            await update.message.reply_text("없는 결정")
+            return
+        await update.message.reply_text("🎯 시뮬 중…")
+        sim = await _run_simulation(chat_id, did)
+        for i in range(0, len(sim), 4000):
+            await update.message.reply_text(sim[i:i + 4000])
+        return
+    if len(args) == 1 and args[0].isdigit():
+        d = db.get_decision(int(args[0]))
+        if not d or d["chat_id"] != chat_id:
+            await update.message.reply_text("없는 결정")
+            return
+        text = f"#{d['id']} [{d['status']}] {d['title']}"
+        if d["simulation_md"]:
+            text += "\n\n" + d["simulation_md"][:3500]
+        await update.message.reply_text(text)
+        return
+    # 새 결정 시작
+    title = " ".join(args).strip()
+    did = db.create_decision(chat_id, title)
+    await update.message.reply_text(f"🎯 결정 #{did} 시작 — '{title}'\n분석 중…")
+    try:
+        data = await chat_completion(
+            [{"role": "user", "content": DECIDE_KICKOFF_PROMPT.format(title=title)}],
+            tools=None, chat_id=chat_id, kind="ask", max_tokens=400,
+        )
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+    except Exception as e:
+        await update.message.reply_text(f"⚠ {e}")
+        return
+    import re as _re
+    m = _re.search(r"\{[\s\S]*\}", content)
+    if not m:
+        await update.message.reply_text(f"⚠ 분석 실패\n{content[:300]}")
+        return
+    try:
+        parsed = json.loads(m.group(0))
+    except Exception:
+        await update.message.reply_text(f"⚠ JSON 파싱 실패\n{content[:300]}")
+        return
+    options = parsed.get("options") or []
+    factors = parsed.get("factors_needed") or []
+    questions = parsed.get("clarify_questions") or []
+    db.update_decision(
+        did,
+        options_json=json.dumps(options, ensure_ascii=False),
+        factors_json=json.dumps({"needed": factors, "answers": {}}, ensure_ascii=False),
+        questions_asked=len(questions),
+    )
+    msg = f"옵션: {' vs '.join(options) if options else '(미정)'}\n\n"
+    if questions:
+        msg += "다음 정보 필요 — 메시지로 그냥 답하면 돼:\n"
+        for q in questions[:5]:
+            msg += f"  • {q}\n"
+        msg += f"\n답 다 모이면 `/decide {did} go` 로 시뮬레이션."
+    await update.message.reply_text(msg)
+
+
+async def _maybe_finalize_decision(chat_id: int) -> Optional[Dict]:
+    """대화 중에 pending decision이 있고 사용자가 'go' / 'simulate' 같은 신호
+    주면 시뮬레이션 실행. 호출자는 메시지 응답 결정."""
+    pending = db.get_pending_decision(chat_id)
+    if not pending:
+        return None
+    return {"id": pending["id"], "title": pending["title"]}
+
+
+async def _run_simulation(chat_id: int, decision_id: int) -> str:
+    """factors_json + persona로 LLM이 시뮬레이션 작성."""
+    d = db.get_decision(decision_id)
+    if not d:
+        return "없는 결정"
+    persona = db.get_latest_persona(chat_id)
+    persona_md = (persona["content_md"][:600] if persona else "(없음)")
+    try:
+        data = await chat_completion(
+            [{"role": "user", "content": DECIDE_SIMULATE_PROMPT.format(
+                title=d["title"],
+                options=d["options_json"],
+                factors=d["factors_json"],
+                persona=persona_md,
+            )}],
+            tools=None, chat_id=chat_id, kind="ask", max_tokens=1200,
+        )
+        sim = (data["choices"][0]["message"].get("content") or "").strip()
+    except Exception as e:
+        return f"⚠ 시뮬 실패: {e}"
+    db.update_decision(
+        decision_id, simulation_md=sim, status="decided",
+    )
+    return sim
 
 
 async def run_experiment_followup(exp_id: int) -> None:
@@ -4417,6 +4827,7 @@ async def tool_generate_image(chat_id: int, args: Dict) -> Dict:
 
 ASYNC_HANDLERS["generate_image"] = tool_generate_image
 ASYNC_HANDLERS["analyze_document"] = tool_analyze_document
+ASYNC_HANDLERS["lifelog_search"] = tool_lifelog_search_async
 
 
 async def cmd_image(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4757,6 +5168,8 @@ SYNC_HANDLERS.update({
     "add_relation": tool_add_relation,
     "find_duplicates": tool_find_duplicates,
     "merge_people": tool_merge_people,
+    "add_watch": tool_add_watch,
+    "list_watches": tool_list_watches,
 })
 
 
@@ -5961,6 +6374,8 @@ async def post_init(app: Application) -> None:
         subscription_runner=run_subscription,
         inbox_triage_runner=run_inbox_triage,
         experiment_followup_runner=run_experiment_followup,
+        lifelog_index_runner=run_lifelog_index,
+        watch_pump_runner=run_watch_pump,
     )
     # Register the slash-command menu so Telegram clients show autocomplete.
     # Failure is non-fatal (the bot still works without the menu).
@@ -6016,6 +6431,10 @@ def main() -> None:
     app.add_handler(CommandHandler("quiet", cmd_quiet))
     app.add_handler(CommandHandler("travel", cmd_travel))
     app.add_handler(CommandHandler("experiment", cmd_experiment))
+    app.add_handler(CommandHandler("decide", cmd_decide))
+    app.add_handler(CommandHandler("watch", cmd_watch))
+    app.add_handler(CommandHandler("watches", cmd_watch))  # alias
+    app.add_handler(CommandHandler("watch_cancel", cmd_watch_cancel))
     app.add_handler(CommandHandler("improvements", cmd_improvements))
     app.add_handler(CommandHandler("rules", cmd_rules))
     app.add_handler(CommandHandler("persona", cmd_persona))

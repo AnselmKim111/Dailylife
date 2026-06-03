@@ -623,6 +623,66 @@ TOOLS: List[Dict] = [
     {
         "type": "function",
         "function": {
+            "name": "add_watch",
+            "description": (
+                "Register a long-running watch task. Bot will periodically check "
+                "the condition (every check_interval_min, min 30) and fire ONCE "
+                "when matched. Use when user says '~되면 알려줘', '~뜨면', "
+                "'~떨어지면', '~매진 풀리면'. check_kind: 'web_search' for general "
+                "queries, 'fetch_url' for a specific page, 'gmail_query' for "
+                "Gmail search syntax."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string", "description": "Short Korean label ≤30자."},
+                    "condition_md": {"type": "string"},
+                    "check_kind": {"type": "string", "enum": ["fetch_url", "web_search", "gmail_query"]},
+                    "check_args": {"type": "object"},
+                    "check_interval_min": {"type": "integer", "description": "min 30, default 60."},
+                },
+                "required": ["label", "condition_md", "check_kind", "check_args"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_watches",
+            "description": "List the user's watch tasks (active/triggered/cancelled).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["active", "triggered", "cancelled"]},
+                },
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "lifelog_search",
+            "description": (
+                "Semantic search across the user's chat history, notes, events, "
+                "and reflections via embeddings. USE FIRST when the user asks "
+                "vaguely about something past ('그 영화 뭐였더라', '작년에 산 책', "
+                "'그때 그 카페'). Returns top-k matches with similarity scores. "
+                "Better than cross_recall for fuzzy recall — cross_recall is "
+                "literal substring matching."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "k": {"type": "integer", "description": "Top-k results (1-20, default 8)."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "analyze_document",
             "description": (
                 "Deep-read a document (contract / 계약서 / 약관 / 이력서 / 보고서) that "

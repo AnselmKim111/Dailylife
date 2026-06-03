@@ -176,6 +176,47 @@ async def classify_content(text: str, hint: Optional[str] = None) -> dict:
 
 OPENAI_TTS_URL = "https://api.openai.com/v1/audio/speech"
 OPENAI_IMAGE_URL = "https://api.openai.com/v1/images/generations"
+OPENAI_EMBEDDINGS_URL = "https://api.openai.com/v1/embeddings"
+
+
+async def embed_text(text: str, model: str = "text-embedding-3-small") -> bytes:
+    """OpenAI Embeddings — text → float32 array bytes (1536 dims, ~6KB).
+
+    Cost: \\$0.02 / 1M tokens. lifelog cron이 매일 약 10K tokens 사용 = \\$0.0002/일."""
+    if not OPENAI_API_KEY:
+        raise TranscribeUnavailable("OPENAI_API_KEY not configured")
+    text = (text or "").strip()
+    if not text:
+        raise ValueError("empty text for embedding")
+    if len(text) > 8000:
+        text = text[:8000]
+    payload = {"model": model, "input": text}
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=30.0) as c:
+        r = await c.post(OPENAI_EMBEDDINGS_URL, json=payload, headers=headers)
+        if r.status_code >= 400:
+            logger.error("embed %s: %s", r.status_code, r.text[:300])
+            r.raise_for_status()
+        data = r.json()
+    vec = data["data"][0]["embedding"]
+    import struct
+    return struct.pack(f"{len(vec)}f", *vec)
+
+
+def cosine_similarity(a_bytes: bytes, b_bytes: bytes) -> float:
+    import struct
+    n = len(a_bytes) // 4
+    a = struct.unpack(f"{n}f", a_bytes)
+    b = struct.unpack(f"{n}f", b_bytes)
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    if na == 0 or nb == 0:
+        return 0.0
+    return dot / (na * nb)
 
 
 async def generate_image(

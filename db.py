@@ -357,6 +357,81 @@ CREATE TABLE IF NOT EXISTS error_log (
 );
 CREATE INDEX IF NOT EXISTS idx_error_log_ts ON error_log(ts_utc DESC);
 CREATE INDEX IF NOT EXISTS idx_error_log_source ON error_log(source, ts_utc DESC);
+
+-- v11 tables --
+
+CREATE TABLE IF NOT EXISTS vector_store (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    entity_kind TEXT NOT NULL,        -- 'chat_log'|'note'|'event'|'reflection'|'goal'
+    entity_id INTEGER NOT NULL,
+    content_text TEXT NOT NULL,
+    embedding_blob BLOB NOT NULL,     -- float32 array, 1536 dims = 6144 bytes
+    dimensions INTEGER NOT NULL DEFAULT 1536,
+    generated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(chat_id, entity_kind, entity_id)
+);
+CREATE INDEX IF NOT EXISTS idx_vector_chat_kind ON vector_store(chat_id, entity_kind);
+
+CREATE TABLE IF NOT EXISTS decisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    options_json TEXT NOT NULL DEFAULT '[]',
+    factors_json TEXT NOT NULL DEFAULT '{}',
+    questions_asked INTEGER NOT NULL DEFAULT 0,
+    simulation_md TEXT,
+    recommendation TEXT,
+    status TEXT NOT NULL DEFAULT 'pending',  -- pending|decided|abandoned
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_decisions_chat ON decisions(chat_id, status);
+
+CREATE TABLE IF NOT EXISTS watch_tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    label TEXT NOT NULL,
+    condition_md TEXT NOT NULL,         -- 자연어 조건
+    check_kind TEXT NOT NULL,           -- 'web_scrape'|'web_search'|'gmail_query'|'fetch_url'
+    check_args_json TEXT NOT NULL DEFAULT '{}',
+    check_interval_min INTEGER NOT NULL DEFAULT 60,
+    last_check_utc TEXT,
+    last_state_json TEXT,
+    triggered_at TEXT,
+    status TEXT NOT NULL DEFAULT 'active',  -- active|triggered|cancelled
+    action_md TEXT,                      -- 발사 시 실행할 action (선택)
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_watches_chat_status ON watch_tasks(chat_id, status);
+
+CREATE TABLE IF NOT EXISTS web_credentials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    site_label TEXT NOT NULL,
+    username TEXT NOT NULL,
+    password_enc BLOB NOT NULL,         -- AES-GCM encrypted with vault_passphrase
+    nonce BLOB NOT NULL,
+    last_used_utc TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(chat_id, site_label)
+);
+
+CREATE TABLE IF NOT EXISTS voice_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    to_number TEXT NOT NULL,
+    purpose TEXT NOT NULL,
+    twilio_call_sid TEXT,
+    status TEXT NOT NULL DEFAULT 'queued',  -- queued|active|done|failed|cancelled
+    transcript_md TEXT,
+    summary_md TEXT,
+    cost_usd REAL NOT NULL DEFAULT 0,
+    duration_sec INTEGER,
+    started_at TEXT,
+    ended_at TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_calls_chat ON voice_calls(chat_id, status);
 """
 
 _lock = threading.Lock()
@@ -2067,6 +2142,301 @@ def all_active_experiments() -> List[sqlite3.Row]:
         return list(c.execute(
             "SELECT * FROM habit_experiments WHERE status='active' "
             "AND end_date_local <= date('now','+1 day')"))
+
+
+# ---------------- v11: vector_store (lifelog RAG) ----------------
+
+
+def upsert_embedding(
+    chat_id: int, entity_kind: str, entity_id: int,
+    content_text: str, embedding_blob: bytes, dimensions: int = 1536,
+) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO vector_store (chat_id, entity_kind, entity_id, content_text, "
+            "embedding_blob, dimensions) VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(chat_id, entity_kind, entity_id) DO UPDATE SET "
+            "content_text=excluded.content_text, embedding_blob=excluded.embedding_blob, "
+            "generated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')",
+            (chat_id, entity_kind, entity_id, content_text[:4000],
+             embedding_blob, dimensions))
+        return cur.lastrowid
+
+
+def list_all_embeddings(chat_id: int) -> List[sqlite3.Row]:
+    with _conn() as c:
+        return list(c.execute(
+            "SELECT id, entity_kind, entity_id, content_text, embedding_blob, dimensions "
+            "FROM vector_store WHERE chat_id=?", (chat_id,)))
+
+
+def already_embedded(chat_id: int, entity_kind: str, entity_id: int) -> bool:
+    with _conn() as c:
+        row = c.execute(
+            "SELECT 1 FROM vector_store WHERE chat_id=? AND entity_kind=? AND entity_id=?",
+            (chat_id, entity_kind, entity_id)).fetchone()
+        return row is not None
+
+
+def yesterdays_new_entities(chat_id: int) -> Dict[str, List[Dict]]:
+    """어제(KST) 새로 추가된 chat_log/notes/events/reflections — lifelog cron이 사용."""
+    cutoff_start = (datetime.now(timezone.utc) - timedelta(hours=36)).isoformat()
+    cutoff_end = datetime.now(timezone.utc).isoformat()
+    out: Dict[str, List[Dict]] = {"chat_log": [], "note": [], "event": [], "reflection": []}
+    with _conn() as c:
+        for r in c.execute(
+            "SELECT id, content FROM chat_log WHERE chat_id=? AND role='user' "
+            "AND created_at BETWEEN ? AND ? AND length(content) > 20",
+            (chat_id, cutoff_start, cutoff_end)):
+            out["chat_log"].append({"id": r["id"], "content": r["content"]})
+        for r in c.execute(
+            "SELECT id, content FROM notes WHERE chat_id=? AND created_at BETWEEN ? AND ?",
+            (chat_id, cutoff_start, cutoff_end)):
+            out["note"].append({"id": r["id"], "content": r["content"]})
+        for r in c.execute(
+            "SELECT id, title, notes FROM events WHERE chat_id=? AND created_at BETWEEN ? AND ?",
+            (chat_id, cutoff_start, cutoff_end)):
+            txt = f"{r['title']} {r['notes'] or ''}".strip()
+            out["event"].append({"id": r["id"], "content": txt})
+        for r in c.execute(
+            "SELECT id, reflection_response, date_local FROM daily_state WHERE chat_id=? "
+            "AND reflection_response IS NOT NULL AND length(reflection_response) > 10 "
+            "AND date_local >= date(?,'-2 day')",
+            (chat_id, cutoff_end)):
+            out["reflection"].append(
+                {"id": r["id"], "content": f"{r['date_local']}: {r['reflection_response']}"})
+    return out
+
+
+def all_chat_ids_active(days: int = 30) -> List[int]:
+    """최근 N일 이내 활동한 chat_ids — cron iteration용."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    with _conn() as c:
+        return [r["chat_id"] for r in c.execute(
+            "SELECT DISTINCT chat_id FROM chat_log WHERE created_at>=?", (cutoff,))]
+
+
+# ---------------- v11: decisions ----------------
+
+
+def create_decision(chat_id: int, title: str) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO decisions (chat_id, title) VALUES (?,?)",
+            (chat_id, title.strip()))
+        return cur.lastrowid
+
+
+def get_decision(decision_id: int) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM decisions WHERE id=?", (decision_id,)).fetchone()
+
+
+def list_decisions(chat_id: int, status: Optional[str] = None) -> List[sqlite3.Row]:
+    with _conn() as c:
+        if status:
+            return list(c.execute(
+                "SELECT * FROM decisions WHERE chat_id=? AND status=? "
+                "ORDER BY created_at DESC", (chat_id, status)))
+        return list(c.execute(
+            "SELECT * FROM decisions WHERE chat_id=? ORDER BY created_at DESC LIMIT 20",
+            (chat_id,)))
+
+
+def get_pending_decision(chat_id: int) -> Optional[sqlite3.Row]:
+    """현재 진행 중인 결정 1개 (가장 최근, status=pending)."""
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM decisions WHERE chat_id=? AND status='pending' "
+            "ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone()
+
+
+def update_decision(decision_id: int, **fields) -> bool:
+    if not fields:
+        return False
+    cols = ", ".join(f"{k}=?" for k in fields)
+    with _conn() as c:
+        cur = c.execute(
+            f"UPDATE decisions SET {cols} WHERE id=?",
+            list(fields.values()) + [decision_id])
+        return cur.rowcount > 0
+
+
+# ---------------- v11: watch_tasks ----------------
+
+
+def add_watch(
+    chat_id: int, label: str, condition_md: str,
+    check_kind: str, check_args: Dict, check_interval_min: int = 60,
+    action_md: Optional[str] = None,
+) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO watch_tasks (chat_id, label, condition_md, check_kind, "
+            "check_args_json, check_interval_min, action_md) VALUES (?,?,?,?,?,?,?)",
+            (chat_id, label.strip(), condition_md.strip(), check_kind,
+             _json.dumps(check_args, ensure_ascii=False),
+             max(30, check_interval_min), action_md))
+        return cur.lastrowid
+
+
+def list_watches(chat_id: int, status: Optional[str] = None) -> List[sqlite3.Row]:
+    with _conn() as c:
+        if status:
+            return list(c.execute(
+                "SELECT * FROM watch_tasks WHERE chat_id=? AND status=? "
+                "ORDER BY id DESC", (chat_id, status)))
+        return list(c.execute(
+            "SELECT * FROM watch_tasks WHERE chat_id=? ORDER BY id DESC LIMIT 20",
+            (chat_id,)))
+
+
+def get_watch(watch_id: int) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM watch_tasks WHERE id=?", (watch_id,)).fetchone()
+
+
+def cancel_watch(chat_id: int, watch_id: int) -> bool:
+    with _conn() as c:
+        cur = c.execute(
+            "UPDATE watch_tasks SET status='cancelled' WHERE chat_id=? AND id=?",
+            (chat_id, watch_id))
+        return cur.rowcount > 0
+
+
+def watches_due(now_utc: Optional[datetime] = None) -> List[sqlite3.Row]:
+    """status=active + 마지막 체크 이후 interval 지남."""
+    now_utc = now_utc or datetime.now(timezone.utc)
+    with _conn() as c:
+        rows = list(c.execute(
+            "SELECT * FROM watch_tasks WHERE status='active' ORDER BY last_check_utc ASC NULLS FIRST"))
+    out = []
+    for r in rows:
+        if r["last_check_utc"]:
+            try:
+                last = datetime.fromisoformat(r["last_check_utc"])
+                if (now_utc - last).total_seconds() < r["check_interval_min"] * 60:
+                    continue
+            except Exception:
+                pass
+        out.append(r)
+    return out
+
+
+def update_watch_check(watch_id: int, state_json: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "UPDATE watch_tasks SET last_check_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now'), "
+            "last_state_json=? WHERE id=?", (state_json, watch_id))
+
+
+def trigger_watch(watch_id: int) -> None:
+    with _conn() as c:
+        c.execute(
+            "UPDATE watch_tasks SET status='triggered', "
+            "triggered_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?",
+            (watch_id,))
+
+
+# ---------------- v11: web_credentials (encrypted vault) ----------------
+
+
+def add_web_credential(
+    chat_id: int, site_label: str, username: str,
+    password_enc: bytes, nonce: bytes,
+) -> int:
+    with _conn() as c:
+        try:
+            cur = c.execute(
+                "INSERT INTO web_credentials (chat_id, site_label, username, password_enc, nonce) "
+                "VALUES (?,?,?,?,?)",
+                (chat_id, site_label.strip().lower(), username.strip(), password_enc, nonce))
+            return cur.lastrowid
+        except sqlite3.IntegrityError:
+            # upsert
+            c.execute(
+                "UPDATE web_credentials SET username=?, password_enc=?, nonce=?, "
+                "created_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                "WHERE chat_id=? AND site_label=?",
+                (username.strip(), password_enc, nonce, chat_id, site_label.strip().lower()))
+            return c.execute(
+                "SELECT id FROM web_credentials WHERE chat_id=? AND site_label=?",
+                (chat_id, site_label.strip().lower())).fetchone()["id"]
+
+
+def get_web_credential(chat_id: int, site_label: str) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM web_credentials WHERE chat_id=? AND site_label=?",
+            (chat_id, site_label.strip().lower())).fetchone()
+
+
+def list_web_credentials(chat_id: int) -> List[sqlite3.Row]:
+    with _conn() as c:
+        return list(c.execute(
+            "SELECT id, site_label, username, last_used_utc FROM web_credentials "
+            "WHERE chat_id=? ORDER BY site_label", (chat_id,)))
+
+
+def delete_web_credential(chat_id: int, site_label: str) -> bool:
+    with _conn() as c:
+        cur = c.execute(
+            "DELETE FROM web_credentials WHERE chat_id=? AND site_label=?",
+            (chat_id, site_label.strip().lower()))
+        return cur.rowcount > 0
+
+
+def touch_web_credential(chat_id: int, site_label: str) -> None:
+    with _conn() as c:
+        c.execute(
+            "UPDATE web_credentials SET last_used_utc=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+            "WHERE chat_id=? AND site_label=?", (chat_id, site_label.strip().lower()))
+
+
+# ---------------- v11: voice_calls ----------------
+
+
+def create_voice_call(chat_id: int, to_number: str, purpose: str) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO voice_calls (chat_id, to_number, purpose) VALUES (?,?,?)",
+            (chat_id, to_number.strip(), purpose.strip()))
+        return cur.lastrowid
+
+
+def update_voice_call(call_id: int, **fields) -> bool:
+    if not fields:
+        return False
+    cols = ", ".join(f"{k}=?" for k in fields)
+    with _conn() as c:
+        cur = c.execute(
+            f"UPDATE voice_calls SET {cols} WHERE id=?",
+            list(fields.values()) + [call_id])
+        return cur.rowcount > 0
+
+
+def get_voice_call(call_id: int) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM voice_calls WHERE id=?", (call_id,)).fetchone()
+
+
+def list_voice_calls(chat_id: int) -> List[sqlite3.Row]:
+    with _conn() as c:
+        return list(c.execute(
+            "SELECT * FROM voice_calls WHERE chat_id=? ORDER BY created_at DESC LIMIT 20",
+            (chat_id,)))
+
+
+def voice_call_cost_today(chat_id: int) -> float:
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=24)).isoformat()
+    with _conn() as c:
+        r = c.execute(
+            "SELECT COALESCE(SUM(cost_usd),0) AS s FROM voice_calls "
+            "WHERE chat_id=? AND created_at>=?", (chat_id, cutoff)).fetchone()
+        return float(r["s"] or 0.0)
 
 
 def find_duplicate_people(chat_id: int) -> List[Dict]:
