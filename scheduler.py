@@ -48,6 +48,7 @@ _experiment_followup_runner: Optional[Callable[[int], Awaitable[None]]] = None  
 # v11 runners
 _lifelog_index_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = chat_id
 _watch_pump_runner: Optional[Callable[[], Awaitable[None]]] = None  # no args
+_relationship_pulse_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = chat_id
 
 
 def init(
@@ -79,6 +80,7 @@ def init(
     experiment_followup_runner: Optional[Callable[[int], Awaitable[None]]] = None,
     lifelog_index_runner: Optional[Callable[[int], Awaitable[None]]] = None,
     watch_pump_runner: Optional[Callable[[], Awaitable[None]]] = None,
+    relationship_pulse_runner: Optional[Callable[[int], Awaitable[None]]] = None,
 ) -> None:
     global _scheduler, _bot, _recurring_runner, _weekly_review_runner, _daily_imminent_runner
     global _morning_briefing_runner, _evening_reflection_runner
@@ -89,7 +91,7 @@ def init(
     global _budget_check_runner, _late_check_runner, _mission_tick_runner
     global _relation_extract_runner, _self_improve_runner, _subscription_runner
     global _inbox_triage_runner, _experiment_followup_runner
-    global _lifelog_index_runner, _watch_pump_runner
+    global _lifelog_index_runner, _watch_pump_runner, _relationship_pulse_runner
     _bot = bot
     _recurring_runner = recurring_runner
     _weekly_review_runner = weekly_review_runner
@@ -118,6 +120,7 @@ def init(
     _experiment_followup_runner = experiment_followup_runner
     _lifelog_index_runner = lifelog_index_runner
     _watch_pump_runner = watch_pump_runner
+    _relationship_pulse_runner = relationship_pulse_runner
     # Re-arm any existing subscriptions on boot
     if _subscription_runner:
         try:
@@ -577,6 +580,16 @@ def ensure_daily_rhythm_for(chat_id: int) -> None:
             replace_existing=True,
             misfire_grace_time=3600,
         )
+    # v12 W5: 매주 일요일 09:00 — relationship pulse (opt-in via crm_pulse_enabled)
+    if _relationship_pulse_runner and _toggle_on(chat_id, "crm_pulse_enabled"):
+        _scheduler.add_job(
+            _run_relationship_pulse,
+            CronTrigger(day_of_week="sun", hour=9, minute=0, timezone=TZ),
+            args=[chat_id],
+            id=f"relationship-pulse-{chat_id}",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
     logger.info("daily rhythm armed for chat %s", chat_id)
 
 
@@ -1006,6 +1019,15 @@ async def _run_lifelog_index(chat_id: int) -> None:
         await _lifelog_index_runner(chat_id)
     except Exception:
         logger.exception("lifelog index failed for chat %s", chat_id)
+
+
+async def _run_relationship_pulse(chat_id: int) -> None:
+    if _relationship_pulse_runner is None:
+        return
+    try:
+        await _relationship_pulse_runner(chat_id)
+    except Exception:
+        logger.exception("relationship pulse failed for chat %s", chat_id)
 
 
 async def _run_watch_pump() -> None:

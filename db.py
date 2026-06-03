@@ -432,6 +432,96 @@ CREATE TABLE IF NOT EXISTS voice_calls (
     created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_calls_chat ON voice_calls(chat_id, status);
+
+-- v12 tables --
+
+CREATE TABLE IF NOT EXISTS relationship_pulse (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    person_id INTEGER NOT NULL,
+    week_iso TEXT NOT NULL,            -- '2026-W23' format
+    meeting_count INTEGER NOT NULL DEFAULT 0,
+    message_count INTEGER NOT NULL DEFAULT 0,
+    sentiment_avg REAL,
+    score REAL NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(chat_id, person_id, week_iso)
+);
+CREATE INDEX IF NOT EXISTS idx_pulse_chat_person ON relationship_pulse(chat_id, person_id, week_iso DESC);
+
+CREATE TABLE IF NOT EXISTS expert_sessions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    domain TEXT NOT NULL,              -- legal|finance|design|engineering|marketing|medical|career
+    topic TEXT,
+    persona_md TEXT NOT NULL,
+    history_json TEXT NOT NULL DEFAULT '[]',
+    status TEXT NOT NULL DEFAULT 'active',  -- active|ended
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    ended_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_expert_chat_status ON expert_sessions(chat_id, status);
+
+CREATE TABLE IF NOT EXISTS recurring_charges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    merchant TEXT NOT NULL,
+    amount_won INTEGER NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'KRW',
+    period TEXT NOT NULL DEFAULT 'monthly',  -- monthly|yearly
+    last_charge_date TEXT,
+    source TEXT NOT NULL DEFAULT 'manual',   -- gmail|sms|manual
+    status TEXT NOT NULL DEFAULT 'active',   -- active|cancelled
+    anomaly_threshold_pct INTEGER NOT NULL DEFAULT 10,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(chat_id, merchant)
+);
+
+CREATE TABLE IF NOT EXISTS writings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    purpose TEXT NOT NULL,
+    audience TEXT,
+    length_target INTEGER,
+    outline_md TEXT,
+    draft_md TEXT,
+    current_section INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'drafting',  -- drafting|done
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_writings_chat ON writings(chat_id, status);
+
+CREATE TABLE IF NOT EXISTS trips (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    destination TEXT NOT NULL,
+    start_date TEXT NOT NULL,
+    end_date TEXT NOT NULL,
+    party_size INTEGER NOT NULL DEFAULT 1,
+    budget_total INTEGER,
+    itinerary_md TEXT,
+    gcal_event_ids_json TEXT NOT NULL DEFAULT '[]',
+    mission_id INTEGER,
+    status TEXT NOT NULL DEFAULT 'planning',  -- planning|done|cancelled
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_trips_chat ON trips(chat_id, status);
+
+CREATE TABLE IF NOT EXISTS negotiations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    counterparty_email TEXT NOT NULL,
+    counterparty_name TEXT,
+    topic TEXT NOT NULL,
+    state TEXT NOT NULL DEFAULT 'proposed',  -- proposed|awaiting|agreed|abandoned
+    history_json TEXT NOT NULL DEFAULT '[]',
+    target_event_id INTEGER,
+    last_message_id TEXT,                    -- gmail message_id of latest exchange
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    last_action_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_negot_chat_state ON negotiations(chat_id, state);
 """
 
 _lock = threading.Lock()
@@ -2442,6 +2532,291 @@ def voice_call_cost_today(chat_id: int) -> float:
             "SELECT COALESCE(SUM(cost_usd),0) AS s FROM voice_calls "
             "WHERE chat_id=? AND created_at>=?", (chat_id, cutoff)).fetchone()
         return float(r["s"] or 0.0)
+
+
+# ---------------- v12 W5: relationship_pulse ----------------
+
+
+def upsert_relationship_pulse(
+    chat_id: int, person_id: int, week_iso: str,
+    meeting_count: int, message_count: int,
+    sentiment_avg: Optional[float], score: float,
+) -> None:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO relationship_pulse (chat_id, person_id, week_iso, "
+            "meeting_count, message_count, sentiment_avg, score) VALUES (?,?,?,?,?,?,?) "
+            "ON CONFLICT(chat_id, person_id, week_iso) DO UPDATE SET "
+            "meeting_count=excluded.meeting_count, message_count=excluded.message_count, "
+            "sentiment_avg=excluded.sentiment_avg, score=excluded.score",
+            (chat_id, person_id, week_iso, meeting_count, message_count,
+             sentiment_avg, score))
+
+
+def get_relationship_pulses(chat_id: int, person_id: int,
+                              weeks: int = 12) -> List[sqlite3.Row]:
+    with _conn() as c:
+        return list(c.execute(
+            "SELECT * FROM relationship_pulse WHERE chat_id=? AND person_id=? "
+            "ORDER BY week_iso DESC LIMIT ?", (chat_id, person_id, weeks)))
+
+
+def top_relationships(chat_id: int, week_iso: str, limit: int = 10) -> List[sqlite3.Row]:
+    with _conn() as c:
+        return list(c.execute(
+            "SELECT rp.*, p.name, p.role FROM relationship_pulse rp "
+            "JOIN people p ON rp.person_id = p.id "
+            "WHERE rp.chat_id=? AND rp.week_iso=? "
+            "ORDER BY rp.score DESC LIMIT ?",
+            (chat_id, week_iso, limit)))
+
+
+def fading_relationships(chat_id: int, threshold_pct: float = 0.5) -> List[Dict]:
+    """3개월 평균 대비 최근 4주 평균이 threshold_pct 이하 사람 — briefing surface 대상.
+    score 0 사람·새로운 사람은 제외. 사용자가 *위축감* 안 받게 1-2명만."""
+    out = []
+    people = list_people(chat_id)
+    for p in people:
+        recent = get_relationship_pulses(chat_id, p["id"], weeks=4)
+        baseline = get_relationship_pulses(chat_id, p["id"], weeks=12)
+        if len(baseline) < 6:  # 신규 사람
+            continue
+        recent_avg = sum(r["score"] for r in recent) / max(len(recent), 1)
+        base_avg = sum(r["score"] for r in baseline) / len(baseline)
+        if base_avg < 1.0:
+            continue
+        if recent_avg <= base_avg * threshold_pct:
+            out.append({
+                "person_id": p["id"], "name": p["name"], "role": p["role"],
+                "recent_avg": recent_avg, "baseline_avg": base_avg,
+            })
+    out.sort(key=lambda x: x["recent_avg"] - x["baseline_avg"])
+    return out[:2]  # 최대 2명만 — chief-of-staff 톤
+
+
+def last_contact_days_ago(chat_id: int, person_id: int) -> Optional[int]:
+    """person.last_contact_utc 기준 며칠 전. None이면 None."""
+    with _conn() as c:
+        row = c.execute(
+            "SELECT last_contact_utc FROM people WHERE id=? AND chat_id=?",
+            (person_id, chat_id)).fetchone()
+    if not row or not row["last_contact_utc"]:
+        return None
+    try:
+        last = datetime.fromisoformat(row["last_contact_utc"])
+        return (datetime.now(timezone.utc) - last).days
+    except Exception:
+        return None
+
+
+# ---------------- v12 W7: expert_sessions ----------------
+
+
+def create_expert_session(chat_id: int, domain: str, persona_md: str,
+                             topic: Optional[str] = None) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO expert_sessions (chat_id, domain, topic, persona_md) "
+            "VALUES (?,?,?,?)",
+            (chat_id, domain.lower().strip(), topic, persona_md))
+        return cur.lastrowid
+
+
+def active_expert_session(chat_id: int) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM expert_sessions WHERE chat_id=? AND status='active' "
+            "ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone()
+
+
+def end_expert_session(chat_id: int, session_id: Optional[int] = None) -> bool:
+    with _conn() as c:
+        if session_id:
+            cur = c.execute(
+                "UPDATE expert_sessions SET status='ended', "
+                "ended_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                "WHERE chat_id=? AND id=? AND status='active'",
+                (chat_id, session_id))
+        else:
+            cur = c.execute(
+                "UPDATE expert_sessions SET status='ended', "
+                "ended_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+                "WHERE chat_id=? AND status='active'", (chat_id,))
+        return cur.rowcount > 0
+
+
+# ---------------- v12 W2: recurring_charges ----------------
+
+
+def upsert_recurring_charge(
+    chat_id: int, merchant: str, amount_won: int,
+    period: str = "monthly", source: str = "manual",
+    last_charge_date: Optional[str] = None,
+) -> int:
+    with _conn() as c:
+        c.execute(
+            "INSERT INTO recurring_charges (chat_id, merchant, amount_won, period, source, "
+            "last_charge_date) VALUES (?,?,?,?,?,?) "
+            "ON CONFLICT(chat_id, merchant) DO UPDATE SET "
+            "amount_won=excluded.amount_won, period=excluded.period, "
+            "last_charge_date=COALESCE(excluded.last_charge_date, last_charge_date)",
+            (chat_id, merchant.strip(), amount_won, period, source, last_charge_date))
+        row = c.execute(
+            "SELECT id FROM recurring_charges WHERE chat_id=? AND merchant=?",
+            (chat_id, merchant.strip())).fetchone()
+        return row["id"] if row else 0
+
+
+def list_recurring_charges(chat_id: int, status: str = "active") -> List[sqlite3.Row]:
+    with _conn() as c:
+        return list(c.execute(
+            "SELECT * FROM recurring_charges WHERE chat_id=? AND status=? "
+            "ORDER BY amount_won DESC", (chat_id, status)))
+
+
+def cancel_recurring_charge(chat_id: int, charge_id: int) -> bool:
+    with _conn() as c:
+        cur = c.execute(
+            "UPDATE recurring_charges SET status='cancelled' "
+            "WHERE chat_id=? AND id=?", (chat_id, charge_id))
+        return cur.rowcount > 0
+
+
+def get_recurring_charge(charge_id: int) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM recurring_charges WHERE id=?", (charge_id,)).fetchone()
+
+
+# ---------------- v12 W4: writings ----------------
+
+
+def create_writing(chat_id: int, purpose: str,
+                     audience: Optional[str] = None,
+                     length_target: Optional[int] = None) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO writings (chat_id, purpose, audience, length_target) "
+            "VALUES (?,?,?,?)",
+            (chat_id, purpose.strip(), audience, length_target))
+        return cur.lastrowid
+
+
+def get_writing(writing_id: int) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM writings WHERE id=?", (writing_id,)).fetchone()
+
+
+def current_writing(chat_id: int) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM writings WHERE chat_id=? AND status='drafting' "
+            "ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone()
+
+
+def update_writing(writing_id: int, **fields) -> bool:
+    if not fields:
+        return False
+    fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+    cols = ", ".join(f"{k}=?" for k in fields)
+    with _conn() as c:
+        cur = c.execute(
+            f"UPDATE writings SET {cols} WHERE id=?",
+            list(fields.values()) + [writing_id])
+        return cur.rowcount > 0
+
+
+# ---------------- v12 W6: trips ----------------
+
+
+def create_trip(chat_id: int, destination: str, start_date: str, end_date: str,
+                  party_size: int = 1, budget_total: Optional[int] = None,
+                  mission_id: Optional[int] = None) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO trips (chat_id, destination, start_date, end_date, "
+            "party_size, budget_total, mission_id) VALUES (?,?,?,?,?,?,?)",
+            (chat_id, destination.strip(), start_date, end_date,
+             party_size, budget_total, mission_id))
+        return cur.lastrowid
+
+
+def get_trip(trip_id: int) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute("SELECT * FROM trips WHERE id=?", (trip_id,)).fetchone()
+
+
+def list_trips(chat_id: int, status: Optional[str] = None) -> List[sqlite3.Row]:
+    with _conn() as c:
+        if status:
+            return list(c.execute(
+                "SELECT * FROM trips WHERE chat_id=? AND status=? "
+                "ORDER BY start_date DESC LIMIT 20", (chat_id, status)))
+        return list(c.execute(
+            "SELECT * FROM trips WHERE chat_id=? ORDER BY start_date DESC LIMIT 20",
+            (chat_id,)))
+
+
+def update_trip(trip_id: int, **fields) -> bool:
+    if not fields:
+        return False
+    cols = ", ".join(f"{k}=?" for k in fields)
+    with _conn() as c:
+        cur = c.execute(
+            f"UPDATE trips SET {cols} WHERE id=?",
+            list(fields.values()) + [trip_id])
+        return cur.rowcount > 0
+
+
+# ---------------- v12 W1: negotiations ----------------
+
+
+def create_negotiation(chat_id: int, counterparty_email: str,
+                          topic: str,
+                          counterparty_name: Optional[str] = None) -> int:
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO negotiations (chat_id, counterparty_email, counterparty_name, topic) "
+            "VALUES (?,?,?,?)",
+            (chat_id, counterparty_email.lower().strip(), counterparty_name, topic.strip()))
+        return cur.lastrowid
+
+
+def list_negotiations(chat_id: int, state: Optional[str] = None) -> List[sqlite3.Row]:
+    with _conn() as c:
+        if state:
+            return list(c.execute(
+                "SELECT * FROM negotiations WHERE chat_id=? AND state=? "
+                "ORDER BY last_action_at DESC LIMIT 20", (chat_id, state)))
+        return list(c.execute(
+            "SELECT * FROM negotiations WHERE chat_id=? "
+            "ORDER BY last_action_at DESC LIMIT 20", (chat_id,)))
+
+
+def get_negotiation(negotiation_id: int) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute(
+            "SELECT * FROM negotiations WHERE id=?", (negotiation_id,)).fetchone()
+
+
+def update_negotiation(negotiation_id: int, **fields) -> bool:
+    if not fields:
+        return False
+    fields["last_action_at"] = datetime.now(timezone.utc).isoformat()
+    cols = ", ".join(f"{k}=?" for k in fields)
+    with _conn() as c:
+        cur = c.execute(
+            f"UPDATE negotiations SET {cols} WHERE id=?",
+            list(fields.values()) + [negotiation_id])
+        return cur.rowcount > 0
+
+
+def awaiting_negotiations() -> List[sqlite3.Row]:
+    """모든 chat에 걸친 awaiting state — negotiation_pump cron이 사용."""
+    with _conn() as c:
+        return list(c.execute(
+            "SELECT * FROM negotiations WHERE state='awaiting'"))
 
 
 def find_duplicate_people(chat_id: int) -> List[Dict]:

@@ -38,6 +38,8 @@ import routines
 import scheduler
 import transcribe
 import translator
+import experts
+import crm
 import weather as weather_mod
 from llm import TOOLS, USER_TZ, chat_completion, parse_tool_calls
 
@@ -366,6 +368,25 @@ def _system_message(chat_id: int, recent_user_text: str = "") -> Dict:
         people_ctx = _people_context_for_text(chat_id, recent_user_text)
         if people_ctx:
             base = base + "\n\n" + people_ctx
+    # v12 W7: active expert session — 도메인 persona 시스템 프롬프트 최상단 주입
+    expert = db.active_expert_session(chat_id)
+    if expert:
+        base = (
+            f"🎓 EXPERT MODE [{expert['domain']}] — session #{expert['id']}.\n"
+            f"{expert['persona_md']}\n\n"
+            + base
+        )
+    # v12 W4: 활성 writing session 컨텍스트
+    writing = db.current_writing(chat_id)
+    if writing:
+        base = (
+            f"✍️ WRITING MODE — session #{writing['id']}, "
+            f"section {writing['current_section']}/{(writing['outline_md'] or '').count(chr(10))+1}. "
+            f"Purpose: {writing['purpose']}. Audience: {writing['audience'] or '미지정'}.\n"
+            "사용자 톤 학습 후 multi-pass 협업. 사용자가 redline 주면 그대로 반영, "
+            "다음 섹션 자동 진행 X — 사용자 OK 기다림.\n\n"
+            + base
+        )
     return {"role": "system", "content": base}
 
 
@@ -1102,6 +1123,17 @@ async def run_lifelog_index(chat_id: int) -> None:
             logger.info("lifelog chat=%s indexed=%s", chat_id, counts)
     except Exception:
         logger.exception("lifelog index runner failed chat=%s", chat_id)
+
+
+# v12 W5: 매주 일요일 09:00 — 모든 사람 relationship_pulse 계산
+async def run_relationship_pulse(chat_id: int) -> None:
+    if not _toggle_on_local(chat_id, "crm_pulse_enabled"):
+        return
+    try:
+        out = crm.compute_pulse_for_week(chat_id)
+        logger.info("relationship_pulse chat=%s people=%d", chat_id, len(out))
+    except Exception:
+        logger.exception("relationship_pulse failed chat=%s", chat_id)
 
 
 # v11: watch_tasks pump (10분) — 별도 wave 3에서 검사 로직 구현
@@ -2967,6 +2999,14 @@ async def run_morning_briefing(chat_id: int) -> None:
     for g in goals_imminent[:3]:
         d = _days_until(g["target_date_local"])
         lines.append(f"🎯 {g['title']} D-{d}")
+    # v12 W5: 식어가는 관계 1줄 (opt-in via crm_pulse_enabled)
+    if _toggle_on_local(chat_id, "crm_pulse_enabled"):
+        try:
+            crm_line = crm.briefing_line(chat_id)
+            if crm_line:
+                lines.append(crm_line)
+        except Exception:
+            logger.exception("crm briefing line failed (non-fatal)")
 
     while lines and not lines[-1]:
         lines.pop()
@@ -5856,6 +5896,167 @@ async def cmd_translate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(result)
 
 
+# ---------------- v12 W7: /expert ----------------
+
+
+async def cmd_expert(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/expert <도메인> [주제]` 시작 · `/expert end` 종료 · `/expert` 상태."""
+    chat_id = update.effective_chat.id
+    args = list(context.args or [])
+    active = db.active_expert_session(chat_id)
+    if not args:
+        if active:
+            await update.message.reply_text(
+                f"🎓 활성: [{active['domain']}] {active['topic'] or ''}\n"
+                "종료: /expert end")
+        else:
+            domains = ", ".join(experts.PERSONAS.keys())
+            await update.message.reply_text(
+                f"도메인: {domains}\n"
+                "사용: /expert <도메인> [주제]\n예: /expert legal 임대 계약서 점검")
+        return
+    if args[0].lower() in ("end", "exit", "끝", "종료"):
+        if active:
+            db.end_expert_session(chat_id, active["id"])
+            await update.message.reply_text("✓ 일반 모드로 복귀")
+        else:
+            await update.message.reply_text("활성 세션 없음")
+        return
+    domain = experts.resolve_domain(args[0])
+    if not domain:
+        await update.message.reply_text(
+            f"모르는 도메인. 가능: {', '.join(experts.PERSONAS.keys())}")
+        return
+    persona = experts.get_persona(domain)
+    topic = " ".join(args[1:]).strip() or None
+    if active:
+        db.end_expert_session(chat_id, active["id"])
+    sid = db.create_expert_session(chat_id, domain, persona["system"], topic)
+    msg = f"{persona['disclaimer']}\n— session #{sid}"
+    if topic:
+        msg += f" · {topic}"
+    await update.message.reply_text(msg)
+
+
+# ---------------- v12 W5: /relationships ----------------
+
+
+async def cmd_relationships(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/relationships` 이번 주 top + 식어가는 사람. 점수 비공개."""
+    chat_id = update.effective_chat.id
+    now = datetime.now(timezone.utc)
+    week_iso = crm._week_iso(now - timedelta(days=3))
+    top = db.top_relationships(chat_id, week_iso, limit=10)
+    fading = db.fading_relationships(chat_id, threshold_pct=0.5)
+    lines = []
+    if top:
+        lines.append("이번 주 자주 본 사람")
+        for r in top[:6]:
+            if r["meeting_count"] == 0 and r["message_count"] == 0:
+                continue
+            sig = []
+            if r["meeting_count"]:
+                sig.append(f"만남 {r['meeting_count']}")
+            if r["message_count"]:
+                sig.append(f"언급 {r['message_count']}")
+            lines.append(f"  • {r['name']} — {' · '.join(sig) or '활동 없음'}")
+    if fading:
+        lines.append("")
+        lines.append("식어가는 듯")
+        for f in fading[:2]:
+            days = db.last_contact_days_ago(chat_id, f["person_id"])
+            day_str = f"{days}일째" if days is not None else "?"
+            lines.append(f"  • {f['name']} — {day_str}")
+    if not lines:
+        lines.append("(이번 주 데이터 부족)")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ---------------- v12 W2: /charges ----------------
+
+
+async def cmd_charges(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/charges` 등록 구독 + 다음 결제."""
+    chat_id = update.effective_chat.id
+    rows = db.list_recurring_charges(chat_id)
+    if not rows:
+        await update.message.reply_text(
+            "등록 구독 없음.\n"
+            "Gmail 연결 + finance_scan_enabled=true 시 자동 식별.\n"
+            "수동: 봇한테 '넷플릭스 17000 매월 구독 등록해줘'")
+        return
+    lines = ["💳 활성 구독"]
+    total = 0
+    for r in rows:
+        total += r["amount_won"]
+        period_mark = "/월" if r["period"] == "monthly" else "/년"
+        lines.append(f"  • {r['merchant']}: ₩{r['amount_won']:,}{period_mark}")
+    lines.append("")
+    lines.append(f"월 합계 ≈ ₩{total:,}")
+    await update.message.reply_text("\n".join(lines))
+
+
+# ---------------- v12 W4: /write ----------------
+
+
+async def cmd_write(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """`/write <목적>` 시작 · `/write_continue` 다음 · `/write_done` 종료."""
+    chat_id = update.effective_chat.id
+    args = list(context.args or [])
+    cur = db.current_writing(chat_id)
+    if not args:
+        if cur:
+            await update.message.reply_text(
+                f"✍️ 활성: #{cur['id']} {cur['purpose']}\n"
+                "다음: /write_continue · 종료: /write_done")
+        else:
+            await update.message.reply_text(
+                "사용: /write <목적> [— 청중 — 글자수]\n"
+                "예: /write 분기보고서 — 임원진 — 1500자")
+        return
+    purpose = " ".join(args).strip()
+    # 가벼운 파싱: '—' 또는 '-' 구분자
+    parts = [p.strip() for p in purpose.replace("—", "-").split("-")]
+    audience = parts[1] if len(parts) > 1 else None
+    length_str = parts[2] if len(parts) > 2 else None
+    length_target = None
+    if length_str:
+        import re as _re
+        m = _re.search(r"(\d+)", length_str)
+        if m:
+            length_target = int(m.group(1))
+    wid = db.create_writing(chat_id, parts[0], audience=audience,
+                              length_target=length_target)
+    await update.message.reply_text(
+        f"✍️ writing #{wid} 시작\n"
+        f"  • 목적: {parts[0]}\n"
+        + (f"  • 청중: {audience}\n" if audience else "")
+        + (f"  • 길이: {length_target}자\n" if length_target else "")
+        + "\n다음 메시지에 *개요 초안* 줄게. 수정 redline으로 답해.")
+
+
+async def cmd_write_continue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    cur = db.current_writing(chat_id)
+    if not cur:
+        await update.message.reply_text("활성 writing 없음.")
+        return
+    next_section = (cur["current_section"] or 0) + 1
+    db.update_writing(cur["id"], current_section=next_section)
+    await update.message.reply_text(
+        f"섹션 {next_section} 진행. 다음 메시지에 초안 줘.")
+
+
+async def cmd_write_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.effective_chat.id
+    cur = db.current_writing(chat_id)
+    if not cur:
+        await update.message.reply_text("활성 writing 없음.")
+        return
+    db.update_writing(cur["id"], status="done")
+    await update.message.reply_text(f"✓ writing #{cur['id']} 완료")
+
+
 async def cmd_diag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     pending_gcal = [r for r in db.list_pending_gcal_sync() if r["chat_id"] == chat_id]
@@ -6640,6 +6841,7 @@ async def post_init(app: Application) -> None:
         experiment_followup_runner=run_experiment_followup,
         lifelog_index_runner=run_lifelog_index,
         watch_pump_runner=run_watch_pump,
+        relationship_pulse_runner=run_relationship_pulse,
     )
     # Register the slash-command menu so Telegram clients show autocomplete.
     # Failure is non-fatal (the bot still works without the menu).
@@ -6670,6 +6872,12 @@ def main() -> None:
     app.add_handler(CommandHandler("now", cmd_now))
     # v12: 메뉴 등록 X — 직접 타이핑만
     app.add_handler(CommandHandler("translate", cmd_translate))
+    app.add_handler(CommandHandler("expert", cmd_expert))
+    app.add_handler(CommandHandler("relationships", cmd_relationships))
+    app.add_handler(CommandHandler("charges", cmd_charges))
+    app.add_handler(CommandHandler("write", cmd_write))
+    app.add_handler(CommandHandler("write_continue", cmd_write_continue))
+    app.add_handler(CommandHandler("write_done", cmd_write_done))
     app.add_handler(CommandHandler("today", cmd_today))
     app.add_handler(CommandHandler("week", cmd_week))
     app.add_handler(CommandHandler("agenda", cmd_agenda))
