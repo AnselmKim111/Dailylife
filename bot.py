@@ -85,69 +85,100 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 HISTORY_LIMIT = int(os.environ.get("HISTORY_LIMIT", "16"))
 TZ = ZoneInfo(USER_TZ)
 
+# v14 W2: 시스템 프롬프트 슬림화 — 코어 톤만 항상 주입. tool routing은
+# intent별로 조건부 (TOOL_ROUTING_BY_INTENT). capability rule은 키워드 매칭 시만.
+# 결과: 평균 system message ~4KB → ~1.8KB (45%로 감소).
 SYSTEM_PROMPT_TEMPLATE = (
-    "You are the user's chief of staff — not a cheerleader, not a coach, not a "
-    "tracker. Job #1: ABSORB DECISIONS so the user makes fewer.\n\n"
-    "TONE RULES (override anything below if conflict):\n"
-    "1. Brevity is respect. Match user message length. 5 단어면 5 단어로 답.\n"
-    "2. Decisions: 추천 1개 + 이유 1줄. 옵션 나열 금지. 사용자가 명시적으로 "
-    "'대안 알려줘' 했을 때만 1개 alternative + trade-off 1줄.\n"
-    "3. Never score the user. 점수·%·streak·'잘하고 있어'·'이번 주 어땠어' 금지. "
-    "🔥·💪·✅ emoji는 performance mark로 쓰지 마. 데이터는 조용히 추적, 사용자는 "
-    "결과만 받음.\n"
-    "4. 사용자 기분·컨디션 질문 금지. 사용자가 먼저 말하지 않으면 묻지 않음.\n"
-    "5. 모르면 '모름' — guess 금지. 추측이면 '추측이지만' 접두.\n"
-    "6. Persona (위에) = source of truth. 사용자의 평소 패턴을 자연스럽게 회상 "
-    "('너 평소 화/목 운동이지', '그거 경서랑 약속한 거 아니야?'). DB가 아니라 "
-    "사람처럼 기억해. Persona에 없는 디테일은 만들지 마.\n"
-    "7. 한국어 기본. 사용자가 다른 언어로 쓰면 그 언어로.\n\n"
-    "All datetimes the user mentions are in {tz} timezone. Convert relative times "
-    "('내일 3시', 'in 2 hours', '다음 주 월요일') against current_time below.\n"
-    "current_time: {now} ({tz})\n\n"
-    "Tool routing:\n"
-    "- Stable identity facts (집 주소, 자대 위치, 가족 이름, 선호도) → remember_fact.\n"
-    "- Free-form short notes the user wants saved (점심 약속 메모, 책 추천, 선물 후보) → save_note.\n"
-    "- 'What did I say about X' / '지난주에 X 얘기 어땠지' style recall → search_memory.\n"
-    "- Time-bound appointment with a clock time → add_event AND, if user has connected Google Calendar, also gcal_create_event for cross-device sync.\n"
-    "- Daily recurring briefing ('매일 X시에 …') → add_recurring_task.\n"
-    "- Live data (영업시간, 길찾기, 운항정보, 시간표) → use web_search / kakao_local_search / "
-    "  fetch_url / kakao_directions_drive — don't guess.\n"
-    "- Google Calendar specifically (구글 캘린더 / Google Calendar 키워드) → use gcal_* tools.\n"
-    "- Gmail / 이메일 / 메일 키워드 (메일 왔어, 항공권 확인 메일, 어제 받은 메일 등) → use gmail_* tools.\n"
-    "  If a single message clearly contains a date/time/place (flight, dinner reservation), call gmail_get_message to read the body, then add_event (+ gcal_create_event if linked).\n"
-    "- A named person introduced or referenced by the user (약혼녀 경서, 동기 관현, 동료 김철수 등): "
-    "if new, call add_person; if known, use the 'Mentioned people in this turn' context block "
-    "the system injects, and call recall_person / log_contact_with as needed. "
-    "Birthdays/anniversaries → important_dates with recurring_yearly=true. "
-    "양가 어른 생신 등 음력 날짜는 is_lunar=true로 저장하면 매년 양력 자동 변환.\n"
-    "- Document/image attachments arrive as text starting with '[pdf 첨부 · …]' or "
-    "'[image 첨부 · …]' or '[사진 첨부 · …]'. The header includes classified=<kind> hint: "
-    "use it as a strong prior. receipt → log_expense, business_card → add_person, "
-    "event/poster → add_event (+ gcal_create_event), document_text → save_note. "
-    "Always extract the concrete details (date, place, name, amount) and call the right save tool — "
-    "don't just acknowledge the upload.\n"
-    "- Forwarded messages arrive with '[forwarded from <sender>]' header — treat as "
-    "third-party content to summarize/extract/file (save_note + people if a new name appears), "
-    "not as the user's own speech. If a long contract/약관/이력서 PDF text is in there and the "
-    "user asks to 'read carefully' or 'check risks', call analyze_document.\n"
-    "- Spending mention with a price ('스벅 6500원') → log_expense. Habit mention "
-    "('운동 1시간', '책 30분') → log_habit. Both have inline-undo if mis-categorized.\n"
-    "- Pre-emptive nudges (메일→일정 자동 카드, 출발 알림(leave-by), 골 D-30/14/3/1, 점심 안부 체크인) "
-    "are armed by per-chat crons. If the user says '시끄러워' / '꺼' / '알림 줄여' point them to "
-    "/nudges for toggles instead of arguing.\n"
-    "- Cross-entity recall (X 관련된 거 다, X에 대해 정리) → cross_recall FIRST instead of "
-    "firing list_events/search_memory separately.\n"
-    "- 모호한 회상 ('그 영화 뭐였더라', '작년 그 카페', '그때 들었던 노래') → lifelog_search "
-    "(semantic). cross_recall은 정확한 이름·키워드 매칭만.\n"
-    "- Outbound actions on the user's behalf are enabled: gmail_send_email / gmail_reply_to / "
-    "gcal_rsvp work. Only fire them when the user explicitly asks ('메일 보내줘', "
-    "'회의 수락해줘') OR an auto_rule matched (which the runner enforces, you don't gate). "
-    "Otherwise PROPOSE the draft and ask.\n"
-    "- Capability questions ('뭐 할 수 있어?', '이거 가능?', '도와줄래?'): "
-    "answer in natural Korean, list categories not command names. User should NEVER need "
-    "to memorize commands — they can ask anything in Korean and you route to the right tool.\n"
-    "Known facts about this user:\n{facts_block}"
+    "당신은 사용자의 chief of staff — *결정을 흡수해* 사용자가 결정 부담을 덜게 만듦.\n\n"
+    "톤 규칙 (절대):\n"
+    "1. Brevity — 사용자 메시지 길이에 맞춰. 짧게 물으면 짧게 답.\n"
+    "2. 결정: 추천 1개 + 이유 1줄. 옵션 나열·점수·%·streak·🔥💪✅ 금지. "
+    "'이번 주 어땠어' 같은 기분 질문 금지.\n"
+    "3. 모르면 '모름' — 추측 시 '추측이지만' 접두.\n"
+    "4. Persona·facts 위에 있으면 *자연 회상* (DB가 아니라 사람처럼). "
+    "없는 디테일 만들지 마.\n"
+    "5. 한국어 기본.\n\n"
+    "현재 시각: {now} ({tz})\n\n"
+    "Known facts:\n{facts_block}"
 )
+
+# v14 W2: intent별 tool routing — 분류된 intent에만 해당 가이드 주입.
+TOOL_ROUTING_BY_INTENT: Dict[str, str] = {
+    "schedule": (
+        "Schedule routing: 시각 있는 약속 → add_event (+ gcal_create_event "
+        "if 구글 연결). 매일 반복 → add_recurring_task. 'X 일정 보여줘' → "
+        "list_events / gcal_list_events. 길찾기 → kakao_directions_drive. "
+        "음력 생신 → is_lunar=true로 important_dates."
+    ),
+    "memory": (
+        "Memory routing: 안정 fact (집 주소·가족 등) → remember_fact. 자유 메모 "
+        "→ save_note. 'X 얘기 어땠지' → search_memory. 'X 관련된 거 다' → "
+        "cross_recall. '그 영화/카페/노래' 모호한 회상 → lifelog_search (semantic). "
+        "사람 → add_person·recall_person·log_contact_with. 그래프 → graph_query."
+    ),
+    "decision": (
+        "Decision routing: 옵션 비교 → 추천 1개. 큰 결정 multi-factor 필요 "
+        "(이직·이사·결혼) → simulate_decision. 외부 사실 필요 → web_search·fetch_url. "
+        "전문가 시점 → 사용자에게 /expert 안내."
+    ),
+    "external_action": (
+        "Outbound: 메일·RSVP·전화는 사용자 명시 요청('메일 보내', '수락해줘') 또는 "
+        "auto_rule 통과 시만 자동. 그 외 *초안 제안*. gmail_send_email / "
+        "gmail_reply_to / gcal_rsvp / place_phone_call."
+    ),
+    "negotiate": (
+        "Negotiate routing: 회의 시간 조율 메일 → 캘린더 확인 후 *후보 3개* 답장. "
+        "agreed time 파싱 → add_event + gcal_create_event 양쪽."
+    ),
+    "trip": (
+        "Trip routing: 통합 여행 → start_mission (max_hops=40, 항공/숙소/동선/식당/"
+        "예산/위험). 가격 인용 시 [출처](url) inline."
+    ),
+    "expert": (
+        "Expert routing: 도메인 시점 (변호사·회계·디자인·엔지니어 등). 매 답 "
+        "출처 인용 + 자문 대체 불가 disclaimer 유지."
+    ),
+    "translate": (
+        "Translate routing: 외국어 메일 → 한국어 1줄 요약 + 답장 시 자동 통역. "
+        "사용자 confirmation 카드 후만 발송."
+    ),
+    "charges": (
+        "Charges routing: 구독·반복 결제. 신규 후보 *카드 확인* 후 등록. "
+        "가격 변동 ≥ 10% briefing 1줄."
+    ),
+    "watch": (
+        "Watch routing: 장기 trigger ('X 되면 알려줘') → add_watch. 조건 1회 "
+        "충족 시만 발사."
+    ),
+    "lifelog": (
+        "Lifelog routing: 모호한 회상 → lifelog_search FIRST (semantic). cross_recall은 "
+        "정확 이름·키워드 매칭만."
+    ),
+    "relationship": (
+        "Relationship routing: 관계 강도 자연어 (점수 노출 X). 식어가는 사람 1명만 "
+        "surface, '관리해야' 톤 X."
+    ),
+    "habit": (
+        "Habit routing: '운동 1시간', '책 30분' → log_habit. summarize_habits / "
+        "get_habit_streaks 회수 — streak 숫자만, 🔥 X."
+    ),
+    "expense": (
+        "Expense routing: '스벅 6500원' → log_expense (inline-undo). summarize_expenses 회수."
+    ),
+    "write": (
+        "Write routing: long-form → /write 명령 안내. multi-pass, 사용자 톤 학습 "
+        "(lifelog)."
+    ),
+}
+
+# v14 W2: capability question 매칭 정규식 — 능력 질문 시만 capability rule 주입
+_CAPABILITY_QUESTION_RE = (
+    r"(?:뭐\s*할\s*수|뭐\s*가능|이거\s*가능|할\s*수\s*있|도와줄\s*수|"
+    r"기능\s*뭐|어떤\s*거|능력|뭘\s*해|what\s*can|capabilities)"
+)
+
+# v14 W2: tone-relevant 첨부 헤더 매칭 — 첨부 있을 때만 그 라우팅 주입
+_ATTACHMENT_RE = r"\[(?:pdf|image|사진|forwarded)"
 
 # Per-chat in-memory short-term history (raw tool turns retained).
 chat_history: Dict[int, List[Dict]] = {}
@@ -239,11 +270,27 @@ def _trim_history(chat_id: int) -> None:
         chat_history[chat_id] = h[-HISTORY_LIMIT * 2 :]
 
 
+# v14 W2: facts cache — DB rarely changes between turns. 60s TTL per chat.
+_facts_cache: Dict[int, Tuple[float, str]] = {}
+_FACTS_TTL = 60.0
+
+
 def _facts_block(chat_id: int) -> str:
+    import time
+    cached = _facts_cache.get(chat_id)
+    now = time.monotonic()
+    if cached and (now - cached[0]) < _FACTS_TTL:
+        return cached[1]
     rows = db.list_facts(chat_id)
-    if not rows:
-        return "  (none yet)"
-    return "\n".join(f"  - {r['key']}: {r['value']}" for r in rows)
+    block = "  (none yet)" if not rows else "\n".join(
+        f"  - {r['key']}: {r['value']}" for r in rows
+    )
+    _facts_cache[chat_id] = (now, block)
+    return block
+
+
+def _invalidate_facts_cache(chat_id: int) -> None:
+    _facts_cache.pop(chat_id, None)
 
 
 def _solar_date_for(date_entry: Dict, this_year: int) -> Optional[Tuple[int, int, int]]:
@@ -338,12 +385,41 @@ def _people_context_for_text(chat_id: int, text: str) -> str:
     return "Mentioned people in this turn:\n" + "\n".join(lines)
 
 
-def _system_message(chat_id: int, recent_user_text: str = "") -> Dict:
+def _system_message(
+    chat_id: int,
+    recent_user_text: str = "",
+    intent: Optional[str] = None,
+) -> Dict:
+    """v14 W2: 슬림화된 시스템 메시지.
+    - 코어 톤만 항상. tool routing은 intent 매칭 시만 1줄.
+    - capability rule은 능력 질문 시만, attachment rule은 첨부 시만.
+    - mode 블록은 단 1개 (우선순위: expert > writing > travel).
+    - facts는 60s 캐시.
+    """
     now_local = datetime.now(TZ).strftime("%Y-%m-%d %H:%M (%a)")
     base = SYSTEM_PROMPT_TEMPLATE.format(
         tz=USER_TZ, now=now_local, facts_block=_facts_block(chat_id)
     )
-    # v4: inject the latest persona doc as the most up-to-date model of the user.
+
+    # intent-conditional tool routing (1 line max)
+    if intent and intent in TOOL_ROUTING_BY_INTENT:
+        base += "\n\n" + TOOL_ROUTING_BY_INTENT[intent]
+
+    # capability rule — only when user asks "what can you do"
+    if recent_user_text and re.search(_CAPABILITY_QUESTION_RE, recent_user_text):
+        base += (
+            "\n\nCapability questions: 카테고리별 1줄 요약 + `/can <카테고리>` "
+            "상세 안내. 메모리/일정/결정/외부 행동/글쓰기/재정/능동/미션."
+        )
+
+    # attachment routing — only when there's an attachment marker
+    if recent_user_text and re.search(_ATTACHMENT_RE, recent_user_text):
+        base += (
+            "\n\nAttachment: PDF/이미지/forwarded 메일은 사용자가 *액션 요청*하기 "
+            "전까지 *내용 요약 + 다음 액션 1개 제안*만."
+        )
+
+    # v4: persona — keep always (정체성의 핵심)
     persona = db.get_latest_persona(chat_id)
     if persona:
         base = (
@@ -351,51 +427,49 @@ def _system_message(chat_id: int, recent_user_text: str = "") -> Dict:
             f"{persona['generated_at'][:10]}):\n{persona['content_md']}\n\n"
             + base
         )
-    # v5: self-improving overrides (tone, no-fly topics, etc.) — bot writes
-    # these to itself based on engagement signal.
+
+    # v5: self-improving overrides — keep always
     override = db.get_prompt_override(chat_id)
     if override:
         base = (
-            f"Bot self-tuning overrides (from observed engagement, "
-            "treat as supplementary not contradictory):\n"
-            f"{override}\n\n"
-            + base
+            f"Bot self-tuning overrides:\n{override}\n\n" + base
         )
-    # v9: travel mode — when user is currently on a trip, prefix the prompt so
-    # weather/leave-by/persona answers anchor to the destination, not home.
-    today_iso = datetime.now(TZ).date().isoformat()
-    travel = db.active_travel_for(chat_id, today_iso)
-    if travel:
-        base = (
-            f"🛫 TRAVEL MODE — User is currently in {travel['destination']} "
-            f"({travel['start_date_local']} → {travel['end_date_local']}). "
-            "Anchor weather/transport/leave-by to the destination unless asked "
-            "otherwise. Tone slightly more 'travelling' (less routine nudges).\n\n"
-            + base
+
+    # v14 W2: mode block — priority expert > writing > travel (only 1)
+    mode_prefix = None
+    expert = db.active_expert_session(chat_id)
+    if expert:
+        mode_prefix = (
+            f"🎓 EXPERT MODE [{expert['domain']}] — session #{expert['id']}.\n"
+            f"{expert['persona_md']}"
         )
+    else:
+        writing = db.current_writing(chat_id)
+        if writing:
+            mode_prefix = (
+                f"✍️ WRITING MODE — session #{writing['id']}, "
+                f"section {writing['current_section']}. "
+                f"Purpose: {writing['purpose']}.\n"
+                "Multi-pass. 사용자 redline 그대로 반영, 자동 진행 X."
+            )
+        else:
+            today_iso = datetime.now(TZ).date().isoformat()
+            travel = db.active_travel_for(chat_id, today_iso)
+            if travel:
+                mode_prefix = (
+                    f"🛫 TRAVEL MODE — {travel['destination']} "
+                    f"({travel['start_date_local']} → {travel['end_date_local']}). "
+                    "weather/transport는 destination 기준."
+                )
+    if mode_prefix:
+        base = mode_prefix + "\n\n" + base
+
+    # people context — only on text mentioning known people
     if recent_user_text:
         people_ctx = _people_context_for_text(chat_id, recent_user_text)
         if people_ctx:
             base = base + "\n\n" + people_ctx
-    # v12 W7: active expert session — 도메인 persona 시스템 프롬프트 최상단 주입
-    expert = db.active_expert_session(chat_id)
-    if expert:
-        base = (
-            f"🎓 EXPERT MODE [{expert['domain']}] — session #{expert['id']}.\n"
-            f"{expert['persona_md']}\n\n"
-            + base
-        )
-    # v12 W4: 활성 writing session 컨텍스트
-    writing = db.current_writing(chat_id)
-    if writing:
-        base = (
-            f"✍️ WRITING MODE — session #{writing['id']}, "
-            f"section {writing['current_section']}/{(writing['outline_md'] or '').count(chr(10))+1}. "
-            f"Purpose: {writing['purpose']}. Audience: {writing['audience'] or '미지정'}.\n"
-            "사용자 톤 학습 후 multi-pass 협업. 사용자가 redline 주면 그대로 반영, "
-            "다음 섹션 자동 진행 X — 사용자 OK 기다림.\n\n"
-            + base
-        )
+
     return {"role": "system", "content": base}
 
 
@@ -2774,7 +2848,7 @@ async def run_agent(chat_id: int, user_text: str, history: Optional[List[Dict]] 
 
     final_text = ""
     for hop in range(max_hops):
-        messages = [_system_message(chat_id, recent_user_text=user_text), *history]
+        messages = [_system_message(chat_id, recent_user_text=user_text, intent=intent), *history]
         data = await chat_completion(messages, tools=tools_for_loop, chat_id=chat_id, kind=kind)
         msg = data["choices"][0]["message"]
         history.append(
@@ -3636,8 +3710,7 @@ TOOLS_BY_INTENT: Dict[str, List[str]] = {
         "gmail_search", "gmail_get_message",
     ],
     "charges": [
-        "log_expense", "summarize_expenses", "list_recurring_charges"
-        if False else "summarize_expenses",  # filter to existing names
+        "log_expense", "summarize_expenses",
     ],
     "watch": [
         "add_watch", "list_watches", "web_search", "fetch_url",
@@ -7267,9 +7340,38 @@ BOT_COMMANDS: List[BotCommand] = [
 ]
 
 
+def _validate_tool_intents() -> None:
+    """v14 W3: TOOLS_BY_INTENT의 tool name이 실제 TOOLS schema에 존재하는지
+    부팅 시점에 검증. 잘못된 이름 (오타·삭제된 도구) 즉시 RuntimeError."""
+    all_names = {t["function"]["name"] for t in TOOLS}
+    invalid_by_intent: Dict[str, List[str]] = {}
+    for intent, names in TOOLS_BY_INTENT.items():
+        bad = [n for n in names if n not in all_names]
+        if bad:
+            invalid_by_intent[intent] = bad
+    if invalid_by_intent:
+        raise RuntimeError(
+            f"TOOLS_BY_INTENT references unknown tools: {invalid_by_intent}")
+
+
+def _validate_command_handlers(app) -> None:
+    """v14 W3: BOT_COMMANDS의 모든 메뉴 항목이 CommandHandler로 실제 등록됐는지
+    검증. 등록 안 된 메뉴는 사용자가 클릭하면 봇이 무응답이라 즉시 감지."""
+    registered = set()
+    for h in app.handlers.get(0, []):
+        if hasattr(h, "commands") and h.commands:
+            registered.update(h.commands)
+    missing = [c.command for c in BOT_COMMANDS if c.command not in registered]
+    if missing:
+        raise RuntimeError(f"BOT_COMMANDS missing handlers: {missing}")
+
+
 async def post_init(app: Application) -> None:
     global _app
     _app = app
+    # v14 W3: 부팅 시 schema 무결성 검증 (런타임 실패 방지)
+    _validate_tool_intents()
+    _validate_command_handlers(app)
     db.init_db()
     scheduler.init(
         app.bot,
@@ -7319,6 +7421,66 @@ async def post_init(app: Application) -> None:
         logger.exception("oauth server failed to start (bot continues without it)")
 
 
+# v14 W3: command name → handler 매핑. 같은 핸들러 여러 alias도 한 dict에서
+# 명시 (alias가 같은 콜백 가리킴). dict 키 충돌 시 Python이 즉시 경고.
+COMMAND_HANDLERS = {
+    # Core / 메뉴 17개
+    "start": "cmd_start", "help": "cmd_start",
+    "now": "cmd_now",
+    "today": "cmd_today", "week": "cmd_week", "agenda": "cmd_agenda",
+    "notes": "cmd_notes", "facts": "cmd_facts", "people": "cmd_people",
+    "goals": "cmd_goals", "spending": "cmd_spending", "habits": "cmd_habits",
+    "mission": "cmd_mission", "dashboard": "cmd_dashboard",
+    "nudges": "cmd_nudges", "rules": "cmd_rules", "setup": "cmd_setup",
+    "connect_gcal": "cmd_connect_gcal",
+    # 직접 타이핑 (메뉴 등록 X)
+    "can": "cmd_can",
+    "translate": "cmd_translate",
+    "expert": "cmd_expert",
+    "relationships": "cmd_relationships",
+    "charges": "cmd_charges",
+    "write": "cmd_write", "write_continue": "cmd_write_continue",
+    "write_done": "cmd_write_done",
+    "plan_trip": "cmd_plan_trip", "trips": "cmd_trips",
+    "negotiate": "cmd_negotiate", "negotiations": "cmd_negotiations",
+    "review": "cmd_review", "tasks": "cmd_tasks", "reset": "cmd_reset",
+    "cost": "cmd_cost",
+    "briefing": "cmd_briefing", "reflect": "cmd_reflect",
+    "models": "cmd_models", "metrics": "cmd_metrics",
+    "cleanup": "cmd_cleanup", "macro": "cmd_macro",
+    "subscribe": "cmd_subscribe", "unsubscribe": "cmd_unsubscribe",
+    "quiet": "cmd_quiet", "travel": "cmd_travel",
+    "experiment": "cmd_experiment", "decide": "cmd_decide",
+    "watch": "cmd_watch", "watches": "cmd_watch", "watch_cancel": "cmd_watch_cancel",
+    "vault": "cmd_vault",
+    "call": "cmd_call", "calls": "cmd_call", "cancel_call": "cmd_cancel_call",
+    "improvements": "cmd_improvements",
+    "persona": "cmd_persona", "recall": "cmd_recall",
+    "scorecard": "cmd_scorecard",
+    "agent": "cmd_agent", "ask": "cmd_ask",
+    "missions": "cmd_missions",
+    "bank_sms": "cmd_bank_sms",
+    "image": "cmd_image", "voice": "cmd_voice", "say": "cmd_say",
+    "diag": "cmd_diag", "export": "cmd_export",
+    "gcal_status": "cmd_gcal_status",
+    "disconnect_gcal": "cmd_disconnect_gcal",
+}
+# 문자열 → 실제 함수 참조로 변환 (런타임에 main() 진입 시점)
+def _resolve_command_handlers() -> Dict[str, callable]:
+    g = globals()
+    resolved = {}
+    missing: List[str] = []
+    for name, fn_name in COMMAND_HANDLERS.items():
+        fn = g.get(fn_name)
+        if fn is None:
+            missing.append(f"{name}→{fn_name}")
+        else:
+            resolved[name] = fn
+    if missing:
+        raise RuntimeError(f"COMMAND_HANDLERS references undefined functions: {missing}")
+    return resolved
+
+
 def main() -> None:
     logger.info("Starting Dailylife bot")
     app = (
@@ -7327,75 +7489,9 @@ def main() -> None:
         .post_init(post_init)
         .build()
     )
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_start))
-    app.add_handler(CommandHandler("now", cmd_now))
-    # v12: 메뉴 등록 X — 직접 타이핑만
-    app.add_handler(CommandHandler("can", cmd_can))
-    app.add_handler(CommandHandler("translate", cmd_translate))
-    app.add_handler(CommandHandler("expert", cmd_expert))
-    app.add_handler(CommandHandler("relationships", cmd_relationships))
-    app.add_handler(CommandHandler("charges", cmd_charges))
-    app.add_handler(CommandHandler("write", cmd_write))
-    app.add_handler(CommandHandler("write_continue", cmd_write_continue))
-    app.add_handler(CommandHandler("write_done", cmd_write_done))
-    app.add_handler(CommandHandler("plan_trip", cmd_plan_trip))
-    app.add_handler(CommandHandler("trips", cmd_trips))
-    app.add_handler(CommandHandler("negotiate", cmd_negotiate))
-    app.add_handler(CommandHandler("negotiations", cmd_negotiations))
-    app.add_handler(CommandHandler("today", cmd_today))
-    app.add_handler(CommandHandler("week", cmd_week))
-    app.add_handler(CommandHandler("agenda", cmd_agenda))
-    app.add_handler(CommandHandler("facts", cmd_facts))
-    app.add_handler(CommandHandler("people", cmd_people))
-    app.add_handler(CommandHandler("goals", cmd_goals))
-    app.add_handler(CommandHandler("review", cmd_review))
-    app.add_handler(CommandHandler("notes", cmd_notes))
-    app.add_handler(CommandHandler("tasks", cmd_tasks))
-    app.add_handler(CommandHandler("reset", cmd_reset))
-    app.add_handler(CommandHandler("cost", cmd_cost))
-    app.add_handler(CommandHandler("setup", cmd_setup))
-    app.add_handler(CommandHandler("briefing", cmd_briefing))
-    app.add_handler(CommandHandler("reflect", cmd_reflect))
-    app.add_handler(CommandHandler("spending", cmd_spending))
-    app.add_handler(CommandHandler("habits", cmd_habits))
-    app.add_handler(CommandHandler("nudges", cmd_nudges))
-    app.add_handler(CommandHandler("models", cmd_models))
-    app.add_handler(CommandHandler("metrics", cmd_metrics))
-    app.add_handler(CommandHandler("dashboard", cmd_dashboard))
-    app.add_handler(CommandHandler("cleanup", cmd_cleanup))
-    app.add_handler(CommandHandler("macro", cmd_macro))
-    app.add_handler(CommandHandler("subscribe", cmd_subscribe))
-    app.add_handler(CommandHandler("unsubscribe", cmd_unsubscribe))
-    app.add_handler(CommandHandler("quiet", cmd_quiet))
-    app.add_handler(CommandHandler("travel", cmd_travel))
-    app.add_handler(CommandHandler("experiment", cmd_experiment))
-    app.add_handler(CommandHandler("decide", cmd_decide))
-    app.add_handler(CommandHandler("watch", cmd_watch))
-    app.add_handler(CommandHandler("watches", cmd_watch))  # alias
-    app.add_handler(CommandHandler("watch_cancel", cmd_watch_cancel))
-    app.add_handler(CommandHandler("vault", cmd_vault))
-    app.add_handler(CommandHandler("call", cmd_call))
-    app.add_handler(CommandHandler("calls", cmd_call))  # alias
-    app.add_handler(CommandHandler("cancel_call", cmd_cancel_call))
-    app.add_handler(CommandHandler("improvements", cmd_improvements))
-    app.add_handler(CommandHandler("rules", cmd_rules))
-    app.add_handler(CommandHandler("persona", cmd_persona))
-    app.add_handler(CommandHandler("recall", cmd_recall))
-    app.add_handler(CommandHandler("scorecard", cmd_scorecard))
-    app.add_handler(CommandHandler("agent", cmd_agent))
-    app.add_handler(CommandHandler("ask", cmd_ask))
-    app.add_handler(CommandHandler("mission", cmd_mission))
-    app.add_handler(CommandHandler("missions", cmd_missions))
-    app.add_handler(CommandHandler("bank_sms", cmd_bank_sms))
-    app.add_handler(CommandHandler("image", cmd_image))
-    app.add_handler(CommandHandler("voice", cmd_voice))
-    app.add_handler(CommandHandler("say", cmd_say))
-    app.add_handler(CommandHandler("diag", cmd_diag))
-    app.add_handler(CommandHandler("export", cmd_export))
-    app.add_handler(CommandHandler("connect_gcal", cmd_connect_gcal))
-    app.add_handler(CommandHandler("gcal_status", cmd_gcal_status))
-    app.add_handler(CommandHandler("disconnect_gcal", cmd_disconnect_gcal))
+    # v14 W3: COMMAND_HANDLERS dict — 명령 추가 시 한 줄. 중복 자동 검출.
+    for name, handler in _resolve_command_handlers().items():
+        app.add_handler(CommandHandler(name, handler))
     app.add_handler(CallbackQueryHandler(on_callback_undo, pattern=r"^undo:"))
     app.add_handler(CallbackQueryHandler(on_callback_action, pattern=r"^act:"))
     app.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, on_voice))
