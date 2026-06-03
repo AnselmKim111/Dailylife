@@ -49,6 +49,7 @@ _experiment_followup_runner: Optional[Callable[[int], Awaitable[None]]] = None  
 _lifelog_index_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = chat_id
 _watch_pump_runner: Optional[Callable[[], Awaitable[None]]] = None  # no args
 _relationship_pulse_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = chat_id
+_finance_scan_runner: Optional[Callable[[int], Awaitable[None]]] = None  # arg = chat_id
 
 
 def init(
@@ -81,6 +82,7 @@ def init(
     lifelog_index_runner: Optional[Callable[[int], Awaitable[None]]] = None,
     watch_pump_runner: Optional[Callable[[], Awaitable[None]]] = None,
     relationship_pulse_runner: Optional[Callable[[int], Awaitable[None]]] = None,
+    finance_scan_runner: Optional[Callable[[int], Awaitable[None]]] = None,
 ) -> None:
     global _scheduler, _bot, _recurring_runner, _weekly_review_runner, _daily_imminent_runner
     global _morning_briefing_runner, _evening_reflection_runner
@@ -92,6 +94,7 @@ def init(
     global _relation_extract_runner, _self_improve_runner, _subscription_runner
     global _inbox_triage_runner, _experiment_followup_runner
     global _lifelog_index_runner, _watch_pump_runner, _relationship_pulse_runner
+    global _finance_scan_runner
     _bot = bot
     _recurring_runner = recurring_runner
     _weekly_review_runner = weekly_review_runner
@@ -121,6 +124,7 @@ def init(
     _lifelog_index_runner = lifelog_index_runner
     _watch_pump_runner = watch_pump_runner
     _relationship_pulse_runner = relationship_pulse_runner
+    _finance_scan_runner = finance_scan_runner
     # Re-arm any existing subscriptions on boot
     if _subscription_runner:
         try:
@@ -590,6 +594,16 @@ def ensure_daily_rhythm_for(chat_id: int) -> None:
             replace_existing=True,
             misfire_grace_time=3600,
         )
+    # v12 W2: 매일 06:00 — finance scan (opt-in via finance_scan_enabled)
+    if _finance_scan_runner and _toggle_on(chat_id, "finance_scan_enabled"):
+        _scheduler.add_job(
+            _run_finance_scan,
+            CronTrigger(hour=6, minute=0, timezone=TZ),
+            args=[chat_id],
+            id=f"finance-scan-{chat_id}",
+            replace_existing=True,
+            misfire_grace_time=3600,
+        )
     logger.info("daily rhythm armed for chat %s", chat_id)
 
 
@@ -1028,6 +1042,15 @@ async def _run_relationship_pulse(chat_id: int) -> None:
         await _relationship_pulse_runner(chat_id)
     except Exception:
         logger.exception("relationship pulse failed for chat %s", chat_id)
+
+
+async def _run_finance_scan(chat_id: int) -> None:
+    if _finance_scan_runner is None:
+        return
+    try:
+        await _finance_scan_runner(chat_id)
+    except Exception:
+        logger.exception("finance scan failed for chat %s", chat_id)
 
 
 async def _run_watch_pump() -> None:

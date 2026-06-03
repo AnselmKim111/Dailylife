@@ -37,6 +37,7 @@ KIND_TO_TIER: Dict[str, str] = {
     "relation_extract":  HAIKU,
     "translate":         HAIKU,
     "context_infer":     HAIKU,
+    "finance_detect":    HAIKU,
     "compaction":        HAIKU,
     # everyday assistant
     "chat":              SONNET,
@@ -49,6 +50,7 @@ KIND_TO_TIER: Dict[str, str] = {
     "self_improve":      OPUS,
     "mission":           OPUS,
     "agent":             OPUS,
+    "writing":           OPUS,
     "ask":               OPUS,
 }
 

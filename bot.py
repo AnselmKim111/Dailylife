@@ -40,6 +40,8 @@ import transcribe
 import translator
 import experts
 import crm
+import finance
+import writing
 import weather as weather_mod
 from llm import TOOLS, USER_TZ, chat_completion, parse_tool_calls
 
@@ -1134,6 +1136,22 @@ async def run_relationship_pulse(chat_id: int) -> None:
         logger.info("relationship_pulse chat=%s people=%d", chat_id, len(out))
     except Exception:
         logger.exception("relationship_pulse failed chat=%s", chat_id)
+
+
+# v12 W2: 매일 06:00 — 신규 구독 후보 + 가격 변동 감지 (briefing 통합용)
+async def run_finance_scan(chat_id: int) -> None:
+    if not _toggle_on_local(chat_id, "finance_scan_enabled"):
+        return
+    try:
+        cands = await finance.detect_new_subscriptions(chat_id)
+        if cands and _app and _app.bot:
+            lines = ["💳 새 구독 후보"]
+            for c in cands:
+                lines.append(f"  • {c['merchant']}: ₩{c['amount_won']:,} ({c['occurrences']}회)")
+            lines.append("등록: 봇한테 '<이름> 구독 등록' / 무시: skip")
+            await _app.bot.send_message(chat_id=chat_id, text="\n".join(lines))
+    except Exception:
+        logger.exception("finance scan failed chat=%s", chat_id)
 
 
 # v11: watch_tasks pump (10분) — 별도 wave 3에서 검사 로직 구현
@@ -3007,6 +3025,13 @@ async def run_morning_briefing(chat_id: int) -> None:
                 lines.append(crm_line)
         except Exception:
             logger.exception("crm briefing line failed (non-fatal)")
+    # v12 W2: 구독 가격 변동 1-2줄 (opt-in via finance_scan_enabled)
+    if _toggle_on_local(chat_id, "finance_scan_enabled"):
+        try:
+            for fin_line in finance.briefing_lines(chat_id):
+                lines.append(fin_line)
+        except Exception:
+            logger.exception("finance briefing failed (non-fatal)")
 
     while lines and not lines[-1]:
         lines.pop()
@@ -5976,23 +6001,53 @@ async def cmd_relationships(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
 
 async def cmd_charges(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/charges` 등록 구독 + 다음 결제."""
+    """`/charges` 등록 구독 · `/charges cancel <id>` 해지 표시 ·
+    `/charges scan` 즉시 자동 후보 식별."""
     chat_id = update.effective_chat.id
+    args = list(context.args or [])
+    if args and args[0].lower() == "cancel" and len(args) >= 2:
+        try:
+            cid = int(args[1])
+        except ValueError:
+            await update.message.reply_text("id는 숫자.")
+            return
+        ok = db.cancel_recurring_charge(chat_id, cid)
+        await update.message.reply_text(
+            f"🗑 #{cid} 해지" if ok else "없거나 이미 해지")
+        return
+    if args and args[0].lower() == "scan":
+        await update.message.reply_text("스캔 중…")
+        try:
+            cands = await finance.detect_new_subscriptions(chat_id)
+        except Exception as e:
+            await update.message.reply_text(f"⚠ {e}")
+            return
+        if not cands:
+            await update.message.reply_text("새 구독 후보 없음.")
+            return
+        lines = ["새 구독 후보"]
+        for c in cands:
+            lines.append(f"  • {c['merchant']}: ₩{c['amount_won']:,} ({c['occurrences']}회)")
+        lines.append("")
+        lines.append("등록: 봇한테 '<merchant> 구독 등록해줘'")
+        await update.message.reply_text("\n".join(lines))
+        return
     rows = db.list_recurring_charges(chat_id)
     if not rows:
         await update.message.reply_text(
             "등록 구독 없음.\n"
-            "Gmail 연결 + finance_scan_enabled=true 시 자동 식별.\n"
-            "수동: 봇한테 '넷플릭스 17000 매월 구독 등록해줘'")
+            "자동 식별: /charges scan\n"
+            "수동 등록: 봇한테 '넷플릭스 17000 매월 구독 등록해줘'")
         return
     lines = ["💳 활성 구독"]
     total = 0
     for r in rows:
         total += r["amount_won"]
         period_mark = "/월" if r["period"] == "monthly" else "/년"
-        lines.append(f"  • {r['merchant']}: ₩{r['amount_won']:,}{period_mark}")
+        lines.append(f"  • #{r['id']} {r['merchant']}: ₩{r['amount_won']:,}{period_mark}")
     lines.append("")
     lines.append(f"월 합계 ≈ ₩{total:,}")
+    lines.append("해지: /charges cancel <id>")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -6028,11 +6083,18 @@ async def cmd_write(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     wid = db.create_writing(chat_id, parts[0], audience=audience,
                               length_target=length_target)
     await update.message.reply_text(
-        f"✍️ writing #{wid} 시작\n"
-        f"  • 목적: {parts[0]}\n"
-        + (f"  • 청중: {audience}\n" if audience else "")
-        + (f"  • 길이: {length_target}자\n" if length_target else "")
-        + "\n다음 메시지에 *개요 초안* 줄게. 수정 redline으로 답해.")
+        f"✍️ writing #{wid} — 톤 학습 + 개요 작성 중…")
+    try:
+        outline = await writing.build_outline(chat_id, wid)
+    except Exception as e:
+        await update.message.reply_text(f"⚠ {e}")
+        return
+    if not outline:
+        await update.message.reply_text("⚠ 개요 생성 실패")
+        return
+    await update.message.reply_text(
+        f"개요:\n\n{outline}\n\n"
+        "이대로 OK면 `/write_continue` — 수정은 redline 답장")
 
 
 async def cmd_write_continue(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6042,9 +6104,17 @@ async def cmd_write_continue(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("활성 writing 없음.")
         return
     next_section = (cur["current_section"] or 0) + 1
-    db.update_writing(cur["id"], current_section=next_section)
-    await update.message.reply_text(
-        f"섹션 {next_section} 진행. 다음 메시지에 초안 줘.")
+    await update.message.reply_text(f"섹션 {next_section} 작성 중…")
+    try:
+        text = await writing.build_section(chat_id, cur["id"], next_section)
+    except Exception as e:
+        await update.message.reply_text(f"⚠ {e}")
+        return
+    if not text:
+        await update.message.reply_text("⚠ 섹션 생성 실패")
+        return
+    for i in range(0, len(text), 4000):
+        await update.message.reply_text(text[i:i + 4000])
 
 
 async def cmd_write_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -6842,6 +6912,7 @@ async def post_init(app: Application) -> None:
         lifelog_index_runner=run_lifelog_index,
         watch_pump_runner=run_watch_pump,
         relationship_pulse_runner=run_relationship_pulse,
+        finance_scan_runner=run_finance_scan,
     )
     # Register the slash-command menu so Telegram clients show autocomplete.
     # Failure is non-fatal (the bot still works without the menu).
