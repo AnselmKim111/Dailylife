@@ -7257,6 +7257,37 @@ def _validate_command_handlers(app) -> None:
         raise RuntimeError(f"BOT_COMMANDS missing handlers: {missing}")
 
 
+_LLM_BRIEFING_PATTERNS = re.compile(
+    r"(?:아침\s*브리핑|굿모닝|모닝\s*브리핑|morning\s*briefing|"
+    r"오늘\s*(?:일정|뭐|챙길|할\s*일).*(?:브리핑|정리|알려))",
+    re.IGNORECASE,
+)
+
+
+def _disable_chatty_morning_recurring_tasks() -> List[Tuple[int, int, str]]:
+    """v17: 사용자가 등록한 LLM-prose 브리핑 recurring_task를 일괄 비활성화.
+    deterministic run_morning_briefing이 이미 같은 슬롯 커버 — 중복·길이 노이즈.
+    cron_kst 05:00-09:59 + prompt가 briefing keyword 매칭 시 enabled=0.
+    Returns: list of (task_id, chat_id, prompt) disabled."""
+    disabled: List[Tuple[int, int, str]] = []
+    for row in db.list_recurring_tasks():  # enabled=1 only
+        cron = (row["cron_kst"] or "").strip()
+        try:
+            hh = int(cron.split(":")[0])
+        except (ValueError, IndexError):
+            continue
+        if not (5 <= hh <= 9):
+            continue
+        prompt = row["prompt"] or ""
+        if not _LLM_BRIEFING_PATTERNS.search(prompt):
+            continue
+        if db.set_recurring_enabled(row["id"], row["chat_id"], False):
+            disabled.append((row["id"], row["chat_id"], prompt))
+            logger.info("v17: disabled chatty morning recurring_task #%s for chat %s: %r",
+                        row["id"], row["chat_id"], prompt[:80])
+    return disabled
+
+
 async def post_init(app: Application) -> None:
     global _app
     _app = app
@@ -7264,6 +7295,22 @@ async def post_init(app: Application) -> None:
     _validate_tool_intents()
     _validate_command_handlers(app)
     db.init_db()
+    # v17: 사용자 chatty morning recurring_task 일괄 OFF. deterministic briefing이 대체.
+    try:
+        disabled = _disable_chatty_morning_recurring_tasks()
+        for task_id, chat_id, prompt in disabled:
+            try:
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=(f"🔕 정기 작업 #{task_id} 자동 OFF (LLM-prose 아침 브리핑).\n"
+                          f"  ↳ {prompt[:120]}\n"
+                          "결정형 아침 브리핑(이벤트+별표 메일)이 대체. "
+                          "다시 켜려면 /tasks 후 해당 ID 재등록."),
+                )
+            except Exception:
+                logger.exception("notify disabled recurring failed (non-fatal)")
+    except Exception:
+        logger.exception("v17 chatty briefing cleanup failed (non-fatal)")
     scheduler.init(
         app.bot,
         run_recurring_task,
