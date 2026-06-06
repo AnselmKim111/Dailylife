@@ -3068,13 +3068,7 @@ async def run_morning_briefing(chat_id: int) -> None:
                 pass
     db.mark_birthdays_today(chat_id, today_iso, person_ids_today)
 
-    # 잊을 만한 거 (predictive)
-    blindspots: List[str] = []
-    if today_items and not _toggle_off_local(chat_id, "predictive_nudge_enabled"):
-        try:
-            blindspots = await _predict_blindspots(chat_id, today_items)
-        except Exception:
-            logger.exception("briefing predict failed (non-fatal)")
+    # v15: predictive cue block removed from briefing.
 
     # Inline inbox triage — Gmail 연결돼 있을 때만 (별도 cron 흡수)
     inbox_starred: List[Dict] = []
@@ -3089,27 +3083,20 @@ async def run_morning_briefing(chat_id: int) -> None:
     lines = [f"☀️ {today_local.strftime('%m월 %d일 (%a)')}", ""]
     if today_items:
         lines.append("오늘")
-        for it in today_items[:6]:
+        for it in today_items[:5]:
             when = it["when_utc"].astimezone(TZ).strftime("%H:%M")
             loc = f" @{it['location']}" if it.get("location") else ""
             lines.append(f"  • {when} {it['title']}{loc}")
         lines.append("")
-    if blindspots:
-        lines.append("잊을 만한 거")
-        for b in blindspots:
-            lines.append(f"  • {b}")
-        lines.append("")
-    if inbox_starred or inbox_archived:
+    if inbox_starred:
         lines.append("📬 메일")
         for m in inbox_starred[:5]:
             subj = (m.get("subject") or "")[:60]
             lines.append(f"  • ⭐ {subj}")
-        if inbox_archived:
-            lines.append(f"  • {inbox_archived}건 자동 정리")
         lines.append("")
-    for b in birthdays_today[:3]:
+    for b in birthdays_today[:2]:
         lines.append(f"🎂 {b}")
-    for g in goals_imminent[:3]:
+    for g in goals_imminent[:2]:
         d = _days_until(g["target_date_local"])
         lines.append(f"🎯 {g['title']} D-{d}")
     # v12 W5: 식어가는 관계 1줄 (opt-in via crm_pulse_enabled)
@@ -3130,8 +3117,8 @@ async def run_morning_briefing(chat_id: int) -> None:
 
     while lines and not lines[-1]:
         lines.pop()
-    # 신호 0건이면 침묵
-    if len(lines) <= 2:
+    # v15: silence rule 강화 — 헤더 외 신호 ≥2건일 때만 발송
+    if len(lines) <= 3:
         return
     await _app.bot.send_message(chat_id=chat_id, text="\n".join(lines))
     db.mark_briefing_sent(chat_id, today_iso)
@@ -3195,27 +3182,8 @@ def _toggle_off_local(chat_id: int, key: str) -> bool:
     return False
 
 
-REFLECTION_OPENERS = [
-    "오늘 어땠어? 한 줄로라도 좋아.",
-    "🌙 하루 어떻게 흘렀는지 한마디만.",
-    "오늘 가장 기억에 남는 순간은?",
-    "🌙 오늘 컨디션·기분 어땠어?",
-    "오늘 잘한 거 하나 + 아쉬운 거 하나만.",
-]
-
-
-async def run_evening_reflection(chat_id: int) -> None:
-    if _app is None or _app.bot is None:
-        return
-    today_local = datetime.now(TZ).date()
-    state = db.get_daily_state(chat_id, today_local.isoformat())
-    if state and state["reflection_prompted"]:
-        return  # already asked today
-    import random
-    opener = random.choice(REFLECTION_OPENERS)
-    await _app.bot.send_message(chat_id=chat_id, text=opener)
-    db.mark_reflection_prompted(chat_id, today_local.isoformat())
-    db.record_nudge(chat_id, "evening_reflection")
+# v15: run_evening_reflection cron + REFLECTION_OPENERS 삭제. v10 시스템 프롬프트의
+# "기분 질문 금지" 룰을 cron이 우회하던 문제 해소. /reflect 명령도 폐기.
 
 
 async def run_daily_imminent_check(chat_id: int) -> None:
@@ -4033,7 +4001,7 @@ async def run_leave_by_recompute(chat_id: int) -> None:
             logger.exception("leave-by recompute failed for event %s", row["id"])
 
 
-# ----- Evening preview (tomorrow's first event + weather + holiday, terse) -----
+# ----- Evening preview (tomorrow's first event + weather, terse) -----
 
 
 PREDICTIVE_PROMPT = (
@@ -4092,11 +4060,11 @@ async def _predict_blindspots(chat_id: int, items: list) -> list:
 
 
 async def run_evening_preview(chat_id: int) -> None:
-    """22:00 KST — single-line preview of tomorrow. Silent unless tomorrow has
-    if _is_quiet_now(chat_id):
-        return
-    an event, is a Korean holiday, or weather flags rain/snow > 30%."""
+    """22:00 KST — terse preview of tomorrow. v15: calendar markers dropped.
+    Silent unless tomorrow has an event, rain/snow ≥ 30%, or extreme temp."""
     if _app is None or _app.bot is None:
+        return
+    if _is_quiet_now(chat_id):
         return
     if _toggle_off_local(chat_id, "weather_preview_enabled"):
         return
@@ -4106,7 +4074,6 @@ async def run_evening_preview(chat_id: int) -> None:
     tomorrow_end = tomorrow_start + timedelta(days=1)
     items = await _merge_schedule(
         chat_id, tomorrow_start.astimezone(timezone.utc), tomorrow_end.astimezone(timezone.utc))
-    holiday = korean_calendar.is_holiday(tomorrow_local.isoformat())
 
     # Choose a weather location: first event with location, else default fact, else skip.
     loc = None
@@ -4141,24 +4108,18 @@ async def run_evening_preview(chat_id: int) -> None:
         except Exception:
             logger.exception("evening_preview: weather lookup failed")
 
-    # v6: also surface 24절기 (입추, 동지 etc.) if tomorrow is one.
-    solar_term = lunar.solar_term_on(tomorrow_local.isoformat())
+    # v15: korean calendar markers removed per user request.
     # Heat / cold extremes from weather_info: 30+℃ → polite warning, ≤-5℃ → 한파
     heat = bool(weather_info and (weather_info.get("tmax") or 0) >= 30)
     cold = bool(weather_info and weather_info.get("tmin") is not None and weather_info["tmin"] <= -5)
 
     # Silence rule — skip if no signal.
     has_event = bool(items)
-    is_holiday = holiday["is_holiday"]
     has_rain = bool(weather_info and (weather_info["rain_pct"] or 0) >= 30)
-    if not (has_event or is_holiday or has_rain or solar_term or heat or cold):
+    if not (has_event or has_rain or heat or cold):
         return
 
     parts = ["🌙 내일 미리보기"]
-    if is_holiday:
-        parts.append(f"  • 공휴일: {holiday['name']}")
-    if solar_term:
-        parts.append(f"  • 절기: {solar_term['name']}")
     if heat:
         parts.append("  • ⚠️ 폭염 — 물 자주 챙겨")
     if cold:
@@ -4989,27 +4950,7 @@ async def cmd_briefing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     scheduler.trigger_morning_briefing_now(chat_id)
 
 
-async def cmd_reflect(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """`/reflect` → force now; `/reflect on`/`off` → toggle; `/reflect 21:30` → time."""
-    chat_id = update.effective_chat.id
-    arg = (context.args[0] if context.args else "").strip().lower()
-    if arg in {"off", "0", "false"}:
-        db.remember_fact(chat_id, "reflection_enabled", "false")
-        scheduler.disable_daily_rhythm_for(chat_id)
-        scheduler.ensure_daily_rhythm_for(chat_id)
-        await update.message.reply_text("🌙 저녁 회고 OFF.")
-        return
-    if arg in {"on", "1", "true"}:
-        db.forget_fact(chat_id, "reflection_enabled")
-        scheduler.ensure_daily_rhythm_for(chat_id)
-        await update.message.reply_text("🌙 저녁 회고 ON (기본 21:30 KST).")
-        return
-    if re.fullmatch(r"\d{1,2}:\d{2}", arg):
-        db.remember_fact(chat_id, "reflection_time", arg)
-        scheduler.ensure_daily_rhythm_for(chat_id)
-        await update.message.reply_text(f"🌙 저녁 회고 시간을 {arg} KST 로 변경.")
-        return
-    scheduler.trigger_evening_reflection_now(chat_id)
+# v15: cmd_reflect 폐기.
 
 
 _NUDGE_KEYS = {
@@ -5028,8 +4969,6 @@ _NUDGE_KEYS = {
     "점심":       ("midday_checkin_enabled",            False, "점심 체크인"),
     "briefing":   ("briefing_enabled",                  True,  "아침 브리핑"),
     "브리핑":     ("briefing_enabled",                  True,  "아침 브리핑"),
-    "reflect":    ("reflection_enabled",                True,  "저녁 회고"),
-    "회고":       ("reflection_enabled",                True,  "저녁 회고"),
     # v4
     "persona":    ("persona_rebuild_enabled",           True,  "인물 요약 재생성"),
     "rules":      ("auto_rules_enabled",                True,  "자동 규칙 마스터"),
@@ -5072,8 +5011,6 @@ async def cmd_nudges(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
              _fact_value_local(chat_id, "midday_checkin_time") or "13:00", None),
             ("briefing_enabled",               True,  "아침 브리핑",
              _fact_value_local(chat_id, "briefing_time") or "07:30", None),
-            ("reflection_enabled",             True,  "저녁 회고",
-             _fact_value_local(chat_id, "reflection_time") or "21:30", None),
         ]
         for key, default_on, label, time_str, extra in rows:
             on = _nudge_status(chat_id, key, default_on)
@@ -5084,7 +5021,7 @@ async def cmd_nudges(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 bits.append(extra)
             lines.append(f"  • {label}: {' '.join(bits)}")
         lines.append("")
-        lines.append("끄기/켜기: /nudges off 메일 (또는 leaveby/preview/milestone/birthday/checkin/briefing/reflect)")
+        lines.append("끄기/켜기: /nudges off 메일 (또는 leaveby/preview/milestone/birthday/checkin/briefing)")
         lines.append("시간 변경: /nudges preview 22:30 / /nudges checkin 12:45")
         await update.message.reply_text("\n".join(lines))
         return
@@ -5111,7 +5048,6 @@ async def cmd_nudges(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 "birthday_alert_separate_enabled": "birthday_solo",
                 "midday_checkin_enabled": "midday_checkin",
                 "briefing_enabled": "morning_briefing",
-                "reflection_enabled": "evening_reflection",
             }.get(fact_key)
             if nudge_kind_guess:
                 db.react_to_recent_nudge(chat_id, nudge_kind_guess,
@@ -5132,7 +5068,6 @@ async def cmd_nudges(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "weather_preview_enabled": "weather_preview_time",
             "midday_checkin_enabled": "midday_checkin_time",
             "briefing_enabled": "briefing_time",
-            "reflection_enabled": "reflection_time",
         }
         if fact_key not in time_fact_map:
             await update.message.reply_text(f"{label} 은 시간 변경 미지원.")
@@ -5973,7 +5908,6 @@ _NUDGE_FACT_MAP = {
     "midday_checkin": "midday_checkin_enabled",
     "evening_preview": "weather_preview_enabled",
     "morning_briefing": "briefing_enabled",
-    "evening_reflection": "reflection_enabled",
     "gmail_event_scan": "gmail_event_scan_enabled",
     "goal_milestone": "goal_milestone_enabled",
     "birthday_solo": "birthday_alert_separate_enabled",
@@ -7080,17 +7014,7 @@ async def _process_user_text(
                 user_text = f"[모호한 referent 후보: {cand_str} — 명확하지 않으면 1줄 질문]\n{user_text}"
         except Exception:
             logger.exception("ambiguity detect failed (non-fatal)")
-    # If we asked for a reflection today and haven't captured it yet, this
-    # message is the response (best-effort heuristic — works for short replies).
-    try:
-        today_iso = datetime.now(TZ).date().isoformat()
-        state = db.get_daily_state(chat_id, today_iso)
-        if state and state["reflection_prompted"] and not state["reflection_response"]:
-            db.save_reflection_response(chat_id, today_iso, user_text)
-            # Fire-and-forget mood classifier (~$0.0002) — fills /scorecard mood bar.
-            asyncio.create_task(_classify_and_store_mood(chat_id, today_iso, user_text))
-    except Exception:
-        logger.exception("reflection capture failed (non-fatal)")
+    # v15: reflection capture 경로 제거 (cron 폐기로 reflection_prompted 절대 set 안 됨).
     # Opportunistic cleanup of idle chats (no extra cost — only sweeps every msg).
     _sweep_idle_chats()
     history = _history(chat_id)
@@ -7379,7 +7303,6 @@ async def post_init(app: Application) -> None:
         run_weekly_goal_review,
         run_daily_imminent_check,
         morning_briefing_runner=run_morning_briefing,
-        evening_reflection_runner=run_evening_reflection,
         gmail_event_scan_runner=run_gmail_event_scan,
         evening_preview_runner=run_evening_preview,
         birthday_solo_runner=run_birthday_solo,
@@ -7445,7 +7368,7 @@ COMMAND_HANDLERS = {
     "negotiate": "cmd_negotiate", "negotiations": "cmd_negotiations",
     "review": "cmd_review", "tasks": "cmd_tasks", "reset": "cmd_reset",
     "cost": "cmd_cost",
-    "briefing": "cmd_briefing", "reflect": "cmd_reflect",
+    "briefing": "cmd_briefing",
     "models": "cmd_models", "metrics": "cmd_metrics",
     "cleanup": "cmd_cleanup", "macro": "cmd_macro",
     "subscribe": "cmd_subscribe", "unsubscribe": "cmd_unsubscribe",

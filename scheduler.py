@@ -23,7 +23,6 @@ _recurring_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _weekly_review_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _daily_imminent_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _morning_briefing_runner: Optional[Callable[[int], Awaitable[None]]] = None
-_evening_reflection_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _gmail_event_scan_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _evening_preview_runner: Optional[Callable[[int], Awaitable[None]]] = None
 _birthday_solo_runner: Optional[Callable[[int], Awaitable[None]]] = None
@@ -58,7 +57,6 @@ def init(
     weekly_review_runner: Callable[[int], Awaitable[None]],
     daily_imminent_runner: Callable[[int], Awaitable[None]],
     morning_briefing_runner: Optional[Callable[[int], Awaitable[None]]] = None,
-    evening_reflection_runner: Optional[Callable[[int], Awaitable[None]]] = None,
     gmail_event_scan_runner: Optional[Callable[[int], Awaitable[None]]] = None,
     evening_preview_runner: Optional[Callable[[int], Awaitable[None]]] = None,
     birthday_solo_runner: Optional[Callable[[int], Awaitable[None]]] = None,
@@ -85,7 +83,7 @@ def init(
     finance_scan_runner: Optional[Callable[[int], Awaitable[None]]] = None,
 ) -> None:
     global _scheduler, _bot, _recurring_runner, _weekly_review_runner, _daily_imminent_runner
-    global _morning_briefing_runner, _evening_reflection_runner
+    global _morning_briefing_runner
     global _gmail_event_scan_runner, _evening_preview_runner, _birthday_solo_runner
     global _midday_checkin_runner, _leave_by_recompute_runner, _leave_by_runner
     global _persona_rebuild_runner, _gcal_invite_watch_runner, _agent_digest_runner
@@ -100,7 +98,6 @@ def init(
     _weekly_review_runner = weekly_review_runner
     _daily_imminent_runner = daily_imminent_runner
     _morning_briefing_runner = morning_briefing_runner
-    _evening_reflection_runner = evening_reflection_runner
     _gmail_event_scan_runner = gmail_event_scan_runner
     _evening_preview_runner = evening_preview_runner
     _birthday_solo_runner = birthday_solo_runner
@@ -409,17 +406,7 @@ def ensure_daily_rhythm_for(chat_id: int) -> None:
             replace_existing=True,
             misfire_grace_time=3600,
         )
-    if _evening_reflection_runner and not _toggle_off(chat_id, "reflection_enabled"):
-        t = _fact_value(chat_id, "reflection_time") or "21:30"
-        hour, minute = _parse_hhmm(t, 21, 30)
-        _scheduler.add_job(
-            _run_evening_reflection,
-            CronTrigger(hour=hour, minute=minute, timezone=TZ),
-            args=[chat_id],
-            id=f"evening-reflection-{chat_id}",
-            replace_existing=True,
-            misfire_grace_time=3600,
-        )
+    # v15: evening_reflection cron 폐기.
     # v10: morning_briefing absorbs evening preview / midday checkin / inbox
     # triage. All opt-in via `/nudges on <name>` — user gets ONE morning msg.
     if _evening_preview_runner and _toggle_on(chat_id, "weather_preview_enabled"):
@@ -643,15 +630,6 @@ async def _run_morning_briefing(chat_id: int) -> None:
         await _morning_briefing_runner(chat_id)
     except Exception:
         logger.exception("morning briefing failed for chat %s", chat_id)
-
-
-async def _run_evening_reflection(chat_id: int) -> None:
-    if _evening_reflection_runner is None or _toggle_off(chat_id, "reflection_enabled"):
-        return
-    try:
-        await _evening_reflection_runner(chat_id)
-    except Exception:
-        logger.exception("evening reflection failed for chat %s", chat_id)
 
 
 # ---------------- pre-emptive runners (gmail scan, previews, birthday, midday, leave-by) ----------------
@@ -1137,18 +1115,6 @@ def trigger_morning_briefing_now(chat_id: int) -> None:
         run_date=datetime.now(timezone.utc) + timedelta(seconds=2),
         args=[chat_id],
         id=f"morning-briefing-{chat_id}-once-{int(datetime.now(timezone.utc).timestamp())}",
-        misfire_grace_time=120,
-    )
-
-
-def trigger_evening_reflection_now(chat_id: int) -> None:
-    if _scheduler is None:
-        return
-    _scheduler.add_job(
-        _run_evening_reflection, "date",
-        run_date=datetime.now(timezone.utc) + timedelta(seconds=2),
-        args=[chat_id],
-        id=f"evening-reflection-{chat_id}-once-{int(datetime.now(timezone.utc).timestamp())}",
         misfire_grace_time=120,
     )
 
