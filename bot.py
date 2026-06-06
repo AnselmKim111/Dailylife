@@ -3045,41 +3045,28 @@ async def run_morning_briefing(chat_id: int) -> None:
     today_items = await _merge_schedule(
         chat_id, now_local.astimezone(timezone.utc), end_today.astimezone(timezone.utc))
 
-    # 임박 골 — v10 D-14 → D-3 (D-14는 noise)
-    goals_imminent = [
-        g for g in db.goals_due_within(chat_id, days=3)
-        if g["target_date_local"]
-    ]
-
-    # 오늘 important_date 매칭 (음력 인식)
-    birthdays_today: List[str] = []
+    # v16: birthday tracking 유지 (run_birthday_solo cron이 사용). 출력엔 미포함.
     person_ids_today: List[int] = []
     for p in db.list_people(chat_id):
         for d in json.loads(p["important_dates_json"] or "[]"):
             try:
                 if _date_matches_today(d, today_local):
-                    tag = " (음력)" if d.get("is_lunar") else ""
-                    role = f" {p['role']}" if p["role"] else ""
-                    label = d.get("label") or "기념일"
-                    birthdays_today.append(f"{p['name']}{role} {label}{tag}")
                     if p["id"] not in person_ids_today:
                         person_ids_today.append(p["id"])
             except Exception:
                 pass
     db.mark_birthdays_today(chat_id, today_iso, person_ids_today)
 
-    # v15: predictive cue block removed from briefing.
-
     # Inline inbox triage — Gmail 연결돼 있을 때만 (별도 cron 흡수)
     inbox_starred: List[Dict] = []
-    inbox_archived = 0
     if db.get_oauth_token(chat_id, "google"):
         try:
-            inbox_starred, inbox_archived = await _inline_inbox_triage(chat_id, cap=10)
+            inbox_starred, _ = await _inline_inbox_triage(chat_id, cap=10)
         except Exception:
             logger.exception("briefing inbox triage failed (non-fatal)")
 
-    # 결정형 텍스트 빌드 — 점수·응원·기분질문 0
+    # v16: briefing 추가 슬림 — 이벤트 + 별표 메일만. 생일/골/CRM/finance는
+    # 별도 cron·명령(/people /goals /spending)으로 분리. 인지 부하 감축.
     lines = [f"☀️ {today_local.strftime('%m월 %d일 (%a)')}", ""]
     if today_items:
         lines.append("오늘")
@@ -3090,35 +3077,15 @@ async def run_morning_briefing(chat_id: int) -> None:
         lines.append("")
     if inbox_starred:
         lines.append("📬 메일")
-        for m in inbox_starred[:5]:
+        for m in inbox_starred[:3]:
             subj = (m.get("subject") or "")[:60]
             lines.append(f"  • ⭐ {subj}")
         lines.append("")
-    for b in birthdays_today[:2]:
-        lines.append(f"🎂 {b}")
-    for g in goals_imminent[:2]:
-        d = _days_until(g["target_date_local"])
-        lines.append(f"🎯 {g['title']} D-{d}")
-    # v12 W5: 식어가는 관계 1줄 (opt-in via crm_pulse_enabled)
-    if _toggle_on_local(chat_id, "crm_pulse_enabled"):
-        try:
-            crm_line = crm.briefing_line(chat_id)
-            if crm_line:
-                lines.append(crm_line)
-        except Exception:
-            logger.exception("crm briefing line failed (non-fatal)")
-    # v12 W2: 구독 가격 변동 1-2줄 (opt-in via finance_scan_enabled)
-    if _toggle_on_local(chat_id, "finance_scan_enabled"):
-        try:
-            for fin_line in finance.briefing_lines(chat_id):
-                lines.append(fin_line)
-        except Exception:
-            logger.exception("finance briefing failed (non-fatal)")
 
     while lines and not lines[-1]:
         lines.pop()
-    # v15: silence rule 강화 — 헤더 외 신호 ≥2건일 때만 발송
-    if len(lines) <= 3:
+    # v16: silence rule — 헤더(2줄) 외 핵심 신호(이벤트·메일) ≥1건일 때만 발송.
+    if len(lines) <= 2:
         return
     await _app.bot.send_message(chat_id=chat_id, text="\n".join(lines))
     db.mark_briefing_sent(chat_id, today_iso)
