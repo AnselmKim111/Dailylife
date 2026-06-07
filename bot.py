@@ -97,7 +97,12 @@ SYSTEM_PROMPT_TEMPLATE = (
     "3. 모르면 '모름' — 추측 시 '추측이지만' 접두.\n"
     "4. Persona·facts 위에 있으면 *자연 회상* (DB가 아니라 사람처럼). "
     "없는 디테일 만들지 마.\n"
-    "5. 한국어 기본.\n\n"
+    "5. 한국어 기본.\n"
+    "6. **자율 미션·long-form·다단계 web_search 금지** — "
+    "start_mission / plan_trip / write 류 token-heavy 도구는 사용자가 "
+    "*명시적으로* 요청('미션 시작', '풀패키지 짜줘', '검색해줘', '리포트 써줘')"
+    "할 때만. 단순 일정·사실 언급('신혼여행 스위스 정해짐')은 *요청 아님* — "
+    "add_event/remember_fact 한 줄로 끝. 추가로 뭐 할지는 짧게 *물어*.\n\n"
     "현재 시각: {now} ({tz})\n\n"
     "Known facts:\n{facts_block}"
 )
@@ -131,8 +136,9 @@ TOOL_ROUTING_BY_INTENT: Dict[str, str] = {
         "agreed time 파싱 → add_event + gcal_create_event 양쪽."
     ),
     "trip": (
-        "Trip routing: 통합 여행 → start_mission (max_hops=40, 항공/숙소/동선/식당/"
-        "예산/위험). 가격 인용 시 [출처](url) inline."
+        "Trip routing: 여행 *언급*만으론 자동 start_mission 금지. "
+        "사용자가 '풀패키지'·'미션'·'다 짜줘' 명시 시만. 평소엔 add_event/"
+        "remember_fact 한 줄 + '어디 도와드릴까?' 짧게."
     ),
     "expert": (
         "Expert routing: 도메인 시점 (변호사·회계·디자인·엔지니어 등). 매 답 "
@@ -166,8 +172,7 @@ TOOL_ROUTING_BY_INTENT: Dict[str, str] = {
         "Expense routing: '스벅 6500원' → log_expense (inline-undo). summarize_expenses 회수."
     ),
     "write": (
-        "Write routing: long-form → /write 명령 안내. multi-pass, 사용자 톤 학습 "
-        "(lifelog)."
+        "Write routing: long-form 자동 시작 금지. 사용자가 /write 명시했을 때만."
     ),
 }
 
