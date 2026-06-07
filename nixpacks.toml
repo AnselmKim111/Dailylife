@@ -9,7 +9,8 @@
 
 [phases.setup]
 nixPkgs = ["python311", "chromium"]
-aptPkgs = ["libnss3", "libatk-bridge2.0-0", "libgtk-3-0", "libxss1", "libasound2", "libpangocairo-1.0-0"]
+# Ubuntu Noble (24.04) renamed libasound2 → libasound2t64 (t64 transition).
+aptPkgs = ["libnss3", "libatk-bridge2.0-0", "libgtk-3-0", "libxss1", "libasound2t64", "libpangocairo-1.0-0"]
 
 [variables]
 PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD = "1"
