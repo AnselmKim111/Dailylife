@@ -428,9 +428,10 @@ TOOLS: List[Dict] = [
         "function": {
             "name": "search_memory",
             "description": (
-                "Full-text search the user's saved notes AND past chat history (episodic). "
-                "Use for any 'what did I say about X', '내가 언제 X 얘기했지', "
-                "'지난주에 X 어땠어' style recall. Each query token ≥3 chars works best."
+                "Full-text search the user's saved notes AND past chat history AND uploaded "
+                "attachments (PDF/사진/음성). Use for any 'what did I say about X', "
+                "'내가 언제 X 얘기했지', '지난주에 X 어땠어' style recall. "
+                "v19: attachments도 'all'에 포함 — 별도 호출 필요 없음."
             ),
             "parameters": {
                 "type": "object",
@@ -438,12 +439,56 @@ TOOLS: List[Dict] = [
                     "query": {"type": "string"},
                     "kind": {
                         "type": "string",
-                        "enum": ["notes", "chat", "all"],
-                        "description": "notes (saved notes only) | chat (past chat only) | all (default)",
+                        "enum": ["notes", "chat", "attachments", "all"],
+                        "description": "notes | chat | attachments | all (default)",
                     },
                     "limit": {"type": "integer", "description": "Max hits per source (default 5)."},
                 },
                 "required": ["query"],
+            },
+        },
+    },
+    # ---- v19 attachments: 사용자가 보낸 파일 직접 검색 + 원본 재전송 ----
+    {
+        "type": "function",
+        "function": {
+            "name": "search_attachments",
+            "description": (
+                "사용자가 보낸 PDF/사진/음성 파일 검색. PNR·예약번호·항공편·confirmation·"
+                "티켓·영수증·문서 등 *raw 추출 텍스트* 매칭. 사용자가 '내 항공권', "
+                "'그 PDF', '예약번호', '5월에 보낸 사진' 류 언급 시 *항상 먼저* 호출. "
+                "Each query token ≥3 chars works best."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "file_kind": {
+                        "type": "string",
+                        "enum": ["pdf", "image", "voice", "doc_other"],
+                        "description": "Optional: restrict to one kind.",
+                    },
+                    "limit": {"type": "integer", "description": "Max hits (default 5)."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "resend_attachment",
+            "description": (
+                "사용자가 명시적으로 *원본 파일 재전송* 요청 시. '그 PDF 다시 보내줘', "
+                "'#3 파일 줘', '5월에 보낸 사진 다시' 같은 표현. "
+                "먼저 search_attachments로 attachment_id 찾고, 그 다음 이 도구 호출."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "attachment_id": {"type": "integer"},
+                },
+                "required": ["attachment_id"],
             },
         },
     },

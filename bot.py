@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -113,13 +114,18 @@ TOOL_ROUTING_BY_INTENT: Dict[str, str] = {
         "Schedule routing: 시각 있는 약속 → add_event (+ gcal_create_event "
         "if 구글 연결). 매일 반복 → add_recurring_task. 'X 일정 보여줘' → "
         "list_events / gcal_list_events. 길찾기 → kakao_directions_drive. "
-        "음력 생신 → is_lunar=true로 important_dates."
+        "음력 생신 → is_lunar=true로 important_dates. "
+        "**첨부·PDF·티켓·예약번호·PNR·항공편 언급 → search_attachments FIRST. "
+        "'그 PDF 다시 보내줘' → resend_attachment.**"
     ),
     "memory": (
         "Memory routing: 안정 fact (집 주소·가족 등) → remember_fact. 자유 메모 "
-        "→ save_note. 'X 얘기 어땠지' → search_memory. 'X 관련된 거 다' → "
-        "cross_recall. '그 영화/카페/노래' 모호한 회상 → lifelog_search (semantic). "
-        "사람 → add_person·recall_person·log_contact_with. 그래프 → graph_query."
+        "→ save_note. 'X 얘기 어땠지' → search_memory (notes+chat+첨부 동시). "
+        "'X 관련된 거 다' → cross_recall. '그 영화/카페/노래' 모호한 회상 → "
+        "lifelog_search (semantic). 사람 → add_person·recall_person·log_contact_with. "
+        "그래프 → graph_query. "
+        "**첨부·PDF·티켓·예약번호·PNR 언급 → search_attachments FIRST. "
+        "'그 PDF/사진 다시 보내줘' → resend_attachment.**"
     ),
     "decision": (
         "Decision routing: 옵션 비교 → 추천 1개. 큰 결정 multi-factor 필요 "
@@ -2413,7 +2419,63 @@ def tool_search_memory(chat_id: int, args: Dict) -> Dict:
         out["notes"] = db.search_notes(chat_id, query, limit)
     if kind in ("chat", "all"):
         out["chat_history"] = db.search_chat_log(chat_id, query, limit)
+    # v19: attachments는 보조 메모리의 핵심 — default kind='all'에 포함
+    if kind in ("attachments", "all"):
+        out["attachments"] = db.search_attachments(chat_id, query, limit)
     return out
+
+
+def tool_search_attachments(chat_id: int, args: Dict) -> Dict:
+    """v19: PDF/이미지/음성 파일 검색. PNR·예약번호·항공편 등 raw 추출 텍스트 매칭."""
+    query = (args.get("query") or "").strip()
+    if not query:
+        return {"ok": False, "error": "query required"}
+    rows = db.search_attachments(
+        chat_id, query,
+        limit=int(args.get("limit", 5)),
+        kind=args.get("file_kind") or None,
+    )
+    return {
+        "ok": True,
+        "query": query,
+        "matches": [
+            {
+                "id": r["id"],
+                "kind": r["kind"],
+                "filename": r.get("filename"),
+                "received_at": r["received_at"],
+                "snippet": r.get("snippet") or (r.get("extracted_text") or "")[:400],
+                "extraction_method": r.get("extraction_method"),
+                "has_structured": bool(r.get("structured_json")),
+            }
+            for r in rows
+        ],
+    }
+
+
+async def tool_resend_attachment(chat_id: int, args: Dict) -> Dict:
+    """v19: 사용자가 명시적으로 원본 파일 재전송 요청 시. tg_file_id로 즉시 재발송."""
+    try:
+        att_id = int(args["attachment_id"])
+    except (KeyError, ValueError, TypeError):
+        return {"ok": False, "error": "attachment_id required"}
+    row = db.get_attachment(att_id)
+    if not row or row["chat_id"] != chat_id:
+        return {"ok": False, "error": "not_found"}
+    if _app is None or _app.bot is None:
+        return {"ok": False, "error": "bot_unavailable"}
+    cap = f"📎 #{att_id} {row['filename'] or ''}".strip()
+    try:
+        if row["kind"] == "image":
+            await _app.bot.send_photo(chat_id=chat_id, photo=row["tg_file_id"], caption=cap)
+        elif row["kind"] == "voice":
+            await _app.bot.send_voice(chat_id=chat_id, voice=row["tg_file_id"], caption=cap)
+        else:
+            await _app.bot.send_document(chat_id=chat_id, document=row["tg_file_id"], caption=cap)
+        return {"ok": True, "attachment_id": att_id, "kind": row["kind"]}
+    except Exception as exc:
+        logger.exception("resend_attachment failed")
+        return {"ok": False, "error": f"send_failed:{exc}"}
 
 
 # ---------------- async external tool handlers ----------------
@@ -2799,12 +2861,15 @@ SYNC_HANDLERS = {
     "cross_recall": tool_cross_recall,
     "detect_routines": tool_detect_routines,
     "get_habit_streaks": tool_get_habit_streaks,
+    # v19: beautiful memory
+    "search_attachments": tool_search_attachments,
     # v5 tool handlers (start_mission/cancel_mission/list_missions) are
     # registered later via SYNC_HANDLERS.update(...) once their function
     # definitions exist, to avoid forward-reference NameErrors at import.
 }
 
 ASYNC_HANDLERS = {
+    "resend_attachment": tool_resend_attachment,
     "web_search": tool_web_search,
     "kakao_local_search": tool_kakao_local,
     "kakao_directions_drive": tool_kakao_drive,
@@ -3616,12 +3681,16 @@ TOOLS_BY_INTENT: Dict[str, List[str]] = {
         "gcal_delete_event", "gcal_rsvp", "korean_holiday_check",
         "solar_term_check", "weather", "kakao_directions_drive",
         "kakao_local_search",
+        # v19: 일정 질의 시 첨부 (e-ticket, 예약 확인서)도 검색
+        "search_attachments", "resend_attachment",
     ],
     "memory": [
         "remember_fact", "forget_fact", "save_note", "search_memory",
         "add_person", "update_person", "list_people", "recall_person",
         "log_contact_with", "cross_recall", "lifelog_search",
         "graph_query", "add_relation", "find_duplicates", "merge_people",
+        # v19: 보조 메모리 — 첨부 파일 검색 + 재전송
+        "search_attachments", "resend_attachment",
     ],
     "decision": [
         "list_goals", "add_goal", "update_goal", "list_events",
@@ -3641,6 +3710,8 @@ TOOLS_BY_INTENT: Dict[str, List[str]] = {
         "weather", "web_search", "fetch_url", "kakao_local_search",
         "kakao_directions_drive", "start_mission",
         "gcal_create_event", "add_event",
+        # v19: 여행 질의 시 e-ticket / 호텔 예약 PDF 즉시 검색
+        "search_attachments", "resend_attachment",
     ],
     "expert": [
         "analyze_document", "web_search", "fetch_url", "lifelog_search",
@@ -3657,7 +3728,7 @@ TOOLS_BY_INTENT: Dict[str, List[str]] = {
     ],
     "lifelog": [
         "lifelog_search", "cross_recall", "search_memory",
-        "recall_person",
+        "recall_person", "search_attachments", "resend_attachment",
     ],
     "relationship": [
         "list_people", "recall_person", "log_contact_with",
@@ -3685,6 +3756,54 @@ _INTENT_CLASSIFY_PROMPT = (
     "habit, expense, general\n\n"
     "메시지: {text}"
 )
+
+
+_STRUCTURED_EXTRACT_PROMPT = (
+    "다음 텍스트는 사용자가 봇에 보낸 첨부 파일에서 추출된 raw text야 "
+    "(PDF/사진/음성). 구조화된 정보를 한국어 JSON으로 추출:\n"
+    "{\n"
+    "  \"events\": [{\"title\":\"...\",\"when_iso\":\"YYYY-MM-DDTHH:MM\",\"location\":\"...\"}],\n"
+    "  \"bookings\": [{\"kind\":\"flight|hotel|train|...\",\"code\":\"PNR/예약번호\",\n"
+    "                  \"vendor\":\"항공사·호텔명\",\"route\":\"...\",\"date\":\"YYYY-MM-DD\"}],\n"
+    "  \"expenses\": [{\"amount\":12345,\"currency\":\"KRW\",\"vendor\":\"...\",\"date\":\"YYYY-MM-DD\"}],\n"
+    "  \"people\": [{\"name\":\"...\",\"role\":\"...\"}],\n"
+    "  \"dates\": [{\"label\":\"...\",\"date\":\"YYYY-MM-DD\"}]\n"
+    "}\n"
+    "발견 안 된 카테고리는 빈 배열. 추가 설명·markdown X. JSON만.\n\n"
+    "raw text:\n{text}"
+)
+
+
+async def _structured_extract_attachment(chat_id: int, att_id: int, raw_text: str) -> None:
+    """v19 Wave 2: 추출된 raw text → 구조화 JSON. attachments.structured_json에 저장.
+    raw text는 notes에도 백업해서 키워드 검색 belt-and-suspenders."""
+    if not raw_text or len(raw_text) < 30 or len(raw_text) > 50_000:
+        # 너무 짧거나 김 — skip 구조화. raw는 그대로 attachments에만.
+        return
+    # 1) raw text를 notes에도 복제 — FTS5 추가 색인
+    try:
+        db.add_note(chat_id, raw_text[:8000],
+                     tags=f"attachment:{att_id},auto,raw")
+    except Exception:
+        logger.exception("attachment->note backup failed (non-fatal)")
+    # 2) Haiku로 구조화
+    try:
+        data = await chat_completion(
+            [{"role": "user", "content": _STRUCTURED_EXTRACT_PROMPT.format(text=raw_text[:8000])}],
+            tools=None, chat_id=chat_id, kind="mail_extract", max_tokens=1500,
+        )
+        content = (data["choices"][0]["message"].get("content") or "").strip()
+        if content.startswith("```"):
+            content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content,
+                              flags=re.MULTILINE).strip()
+        parsed = json.loads(content)
+        db.attach_structured(att_id, json.dumps(parsed, ensure_ascii=False))
+        logger.info("attachment #%s structured: events=%d bookings=%d expenses=%d",
+                     att_id, len(parsed.get("events", [])),
+                     len(parsed.get("bookings", [])),
+                     len(parsed.get("expenses", [])))
+    except Exception:
+        logger.exception("structured extract failed (non-fatal)")
 
 
 async def _classify_intent(text: str, chat_id: int) -> str:
@@ -7050,30 +7169,55 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     voice = update.message.voice or update.message.audio
     mime = getattr(voice, "mime_type", "audio/ogg") or "audio/ogg"
-    logger.info("voice from %s: duration=%s mime=%s", chat_id, voice.duration, mime)
+    duration = getattr(voice, "duration", 0)
+    file_id = voice.file_id
+    file_unique_id = getattr(voice, "file_unique_id", None)
+    logger.info("voice from %s: duration=%s mime=%s", chat_id, duration, mime)
+
+    # v19: ALWAYS register attachment FIRST so binary is never lost.
+    att_id = db.insert_attachment(
+        chat_id, tg_file_id=file_id, kind="voice",
+        tg_file_unique_id=file_unique_id, mime_type=mime,
+        size_bytes=getattr(voice, "file_size", None),
+        caption=f"voice {duration}s",
+        extraction_method="pending",
+    )
 
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     try:
         tg_file = await voice.get_file()
         bio = await tg_file.download_as_bytearray()
         text = await transcribe.transcribe_voice(bytes(bio), mime)
+        db.update_attachment_extraction(att_id, text or "", "whisper")
     except transcribe.TranscribeUnavailable:
+        db.update_attachment_extraction(att_id, "", "failed", "no_openai_key")
         await update.message.reply_text(
-            "음성 인식이 아직 켜져 있지 않아요. OPENAI_API_KEY를 Railway에 추가하면 켜집니다."
+            "음성 파일은 보관됐어요 (#" + str(att_id) + "). "
+            "Whisper STT가 꺼져 있어 자동 전사는 못 했어요. "
+            "OPENAI_API_KEY 설정 후 다시 보내면 자동 처리돼요."
         )
         return
     except Exception as exc:
+        db.update_attachment_extraction(att_id, "", "failed", str(exc)[:200])
         logger.exception("transcribe failed")
-        await update.message.reply_text(f"⚠️ 음성 처리 실패: {exc}")
+        await update.message.reply_text(
+            f"⚠️ 음성 처리 실패 (파일은 #{att_id}로 보관됨): {exc}"
+        )
         return
 
     if not text:
-        await update.message.reply_text("음성에서 텍스트를 찾지 못했어요.")
+        await update.message.reply_text(
+            f"음성에서 텍스트를 찾지 못했어요. 파일은 #{att_id}로 보관됨."
+        )
         return
 
     logger.info("transcribed (%d chars): %r", len(text), text[:160])
     await update.message.reply_text(f"🎙️ 들었어요: {text[:300]}\n\n처리 중…")
-    await _process_user_text(update, context, text, log_prefix="[voice] ")
+    await _process_user_text(
+        update, context,
+        f"[voice 첨부 #{att_id} · {duration}s]\n{text}",
+        log_prefix="[voice] ",
+    )
 
 
 DOC_IMAGE_MIMES = {"image/jpeg", "image/jpg", "image/png", "image/webp", "image/gif"}
@@ -7081,8 +7225,8 @@ DOC_MAX_BYTES = 19 * 1024 * 1024  # Telegram bot file size cap is 20MB
 
 
 async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle PDF or image-as-document attachments. Extract content and feed
-    through the agent so it picks the right tool (save_note / add_event / ...)."""
+    """v19: ALWAYS persist attachment row first. Extract second.
+    Even if extraction fails, tg_file_id stays — user can ask 'PDF 다시 보여줘'."""
     if not update.message or not update.message.document:
         return
     chat_id = update.effective_chat.id
@@ -7091,6 +7235,8 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     fname = doc.file_name or "file"
     caption = (update.message.caption or "").strip()
     size = doc.file_size or 0
+    file_id = doc.file_id
+    file_unique_id = getattr(doc, "file_unique_id", None)
     logger.info("doc from %s: name=%r mime=%s size=%s caption=%r",
                 chat_id, fname, mime, size, caption[:80])
 
@@ -7101,46 +7247,100 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
+    is_pdf = mime == "application/pdf" or fname.lower().endswith(".pdf")
+    is_image = mime in DOC_IMAGE_MIMES or fname.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))
+    if is_pdf:
+        kind = "pdf"
+    elif is_image:
+        kind = "image"
+    else:
+        kind = "doc_other"
+
+    # v19: register attachment FIRST — binary preserved regardless of extraction outcome
+    att_id = db.insert_attachment(
+        chat_id, tg_file_id=file_id, kind=kind,
+        tg_file_unique_id=file_unique_id, filename=fname,
+        mime_type=mime or None, size_bytes=size or None,
+        caption=caption or None, extraction_method="pending",
+    )
+
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     try:
         tg_file = await doc.get_file()
         bio = await tg_file.download_as_bytearray()
     except Exception as exc:
+        db.update_attachment_extraction(att_id, "", "failed", f"download:{exc}"[:200])
         logger.exception("doc download failed")
-        await update.message.reply_text(f"⚠ 파일 받기 실패: {exc}")
+        await update.message.reply_text(
+            f"⚠ 파일 다운로드 실패 (#{att_id}로는 기록됨, 추출 못 함): {exc}"
+        )
         return
 
+    sha = hashlib.sha256(bytes(bio)).hexdigest()
+    with db._conn() as _c:  # noqa: SLF001 — minor metadata patch
+        _c.execute("UPDATE attachments SET sha256=? WHERE id=?", (sha, att_id))
+
     extracted = ""
-    extraction_kind = ""
+    method = "failed"
+    failure_reason: Optional[str] = None
 
-    if mime == "application/pdf" or fname.lower().endswith(".pdf"):
-        extraction_kind = "pdf"
-        extracted = transcribe.extract_pdf_text(bytes(bio))
-        if not extracted:
+    if kind == "pdf":
+        extracted, method, failure_reason = await transcribe.extract_pdf_with_vision_fallback(bytes(bio))
+        if method == "pypdf":
+            preview = extracted[:600] + ("…" if len(extracted) > 600 else "")
             await update.message.reply_text(
-                "📄 PDF에서 텍스트를 못 뽑았어요 (스캔본이거나 암호화된 듯). "
-                "필요하면 사진으로 다시 찍어 보내주세요 — 비전으로 읽어볼게요."
+                f"📄 #{att_id} PDF 텍스트 추출 ({len(extracted)}자):\n\n{preview}\n\n처리 중…"
             )
-            return
-        preview = extracted[:600] + ("…" if len(extracted) > 600 else "")
-        await update.message.reply_text(f"📄 PDF 텍스트 추출 ({len(extracted)}자):\n\n{preview}\n\n처리 중…")
+        elif method == "vision_pdf":
+            preview = extracted[:600] + ("…" if len(extracted) > 600 else "")
+            await update.message.reply_text(
+                f"📄 #{att_id} PDF 비전 추출 ({len(extracted)}자):\n\n{preview}\n\n처리 중…"
+            )
+        else:
+            await update.message.reply_text(
+                f"📄 #{att_id} PDF는 *파일은 영구 보관*했어요 (text 추출 실패: "
+                f"{failure_reason}). 나중에 '#{att_id} 다시 보내줘'로 원본 받기 가능."
+            )
 
-    elif mime in DOC_IMAGE_MIMES or fname.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
-        extraction_kind = "image"
+    elif kind == "image":
         try:
-            extracted = await transcribe.describe_image(bytes(bio), mime=mime or "image/jpeg",
-                                                         caption=caption or None)
+            extracted = await transcribe.describe_image(
+                bytes(bio), mime=mime or "image/jpeg", caption=caption or None
+            )
+            method = "vision_img"
         except Exception as exc:
+            failure_reason = str(exc)[:200]
             logger.exception("vision (doc) failed")
-            await update.message.reply_text(f"⚠ 이미지 처리 실패: {exc}")
-            return
-        preview = extracted[:1200]
-        await update.message.reply_text(f"🖼️ 이미지에서 추출:\n\n{preview}\n\n처리 중…")
+            await update.message.reply_text(
+                f"⚠ 이미지 처리 실패 (#{att_id}로 파일은 보관됨): {exc}"
+            )
+        if extracted:
+            preview = extracted[:1200]
+            await update.message.reply_text(
+                f"🖼️ #{att_id} 이미지에서 추출:\n\n{preview}\n\n처리 중…"
+            )
 
     else:
+        failure_reason = "unsupported_mime"
         await update.message.reply_text(
-            f"📎 {fname} ({mime or '알 수 없는 형식'}) — 아직 PDF랑 이미지만 읽을 수 있어요."
+            f"📎 #{att_id} {fname} ({mime or '알 수 없는 형식'}) — 파일은 보관됐어요. "
+            "텍스트 추출은 아직 PDF/이미지만 지원."
         )
+
+    # Persist extraction outcome (success or failure)
+    db.update_attachment_extraction(att_id, extracted or "", method, failure_reason)
+
+    # If we got nothing extractable, log a stub turn so the LLM at least knows
+    # the file exists and can later say "그때 #X PDF 받았어".
+    if not extracted:
+        stub = (
+            f"[첨부 #{att_id} · {kind} · {fname}] "
+            f"파일 보관됨 (text 추출 실패: {failure_reason or '미지원 형식'}). "
+            "검색·재전송은 가능."
+        )
+        if caption:
+            stub += f"\ncaption: {caption!r}"
+        await _process_user_text(update, context, stub, log_prefix=f"[{kind}] ")
         return
 
     # Cheap classifier hint to help the main agent pick the right tool fast.
@@ -7149,13 +7349,15 @@ async def on_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except Exception:
         cls = {"kind": "none", "confidence": 0.0, "summary": ""}
     user_text = (
-        f"[{extraction_kind} 첨부 · file={fname} · "
+        f"[첨부 #{att_id} · {kind} · file={fname} · method={method} · "
         f"classified={cls['kind']}({cls['confidence']:.1f})]\n"
         f"요약: {cls['summary']}\n"
         f"caption: {caption!r}\n\n"
         f"추출된 내용:\n{extracted}"
     )
-    await _process_user_text(update, context, user_text, log_prefix=f"[{extraction_kind}] ")
+    await _process_user_text(update, context, user_text, log_prefix=f"[{kind}] ")
+    # Fire-and-forget structured extraction (Wave 2)
+    asyncio.create_task(_structured_extract_attachment(chat_id, att_id, extracted))
 
 
 async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -7164,32 +7366,49 @@ async def on_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     chat_id = update.effective_chat.id
     caption = (update.message.caption or "").strip()
     photo = update.message.photo[-1]   # highest resolution
+    file_id = photo.file_id
+    file_unique_id = getattr(photo, "file_unique_id", None)
     logger.info("photo from %s: %sx%s caption=%r", chat_id, photo.width, photo.height, caption[:80])
+
+    # v19: register attachment first
+    att_id = db.insert_attachment(
+        chat_id, tg_file_id=file_id, kind="image",
+        tg_file_unique_id=file_unique_id,
+        mime_type="image/jpeg",
+        size_bytes=getattr(photo, "file_size", None),
+        caption=caption or None,
+        extraction_method="pending",
+    )
 
     await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
     try:
         tg_file = await photo.get_file()
         bio = await tg_file.download_as_bytearray()
         description = await transcribe.describe_image(bytes(bio), mime="image/jpeg", caption=caption or None)
+        db.update_attachment_extraction(att_id, description or "", "vision_img")
     except Exception as exc:
+        db.update_attachment_extraction(att_id, "", "failed", str(exc)[:200])
         logger.exception("vision failed")
-        await update.message.reply_text(f"⚠️ 사진 처리 실패: {exc}")
+        await update.message.reply_text(
+            f"⚠️ 사진 처리 실패 (#{att_id}로 파일은 보관됨): {exc}"
+        )
         return
 
     logger.info("vision (%d chars): %r", len(description), description[:160])
-    await update.message.reply_text(f"📷 사진에서 추출:\n\n{description[:1500]}\n\n처리 중…")
+    await update.message.reply_text(f"📷 #{att_id} 사진에서 추출:\n\n{description[:1500]}\n\n처리 중…")
 
     try:
         cls = await transcribe.classify_content(description, hint=caption or None)
     except Exception:
         cls = {"kind": "none", "confidence": 0.0, "summary": ""}
     user_text = (
-        f"[사진 첨부 · classified={cls['kind']}({cls['confidence']:.1f})]\n"
+        f"[첨부 #{att_id} · image · classified={cls['kind']}({cls['confidence']:.1f})]\n"
         f"요약: {cls['summary']}\n"
         f"caption: {caption!r}\n"
         f"추출된 정보:\n{description}"
     )
     await _process_user_text(update, context, user_text, log_prefix="[photo] ")
+    asyncio.create_task(_structured_extract_attachment(chat_id, att_id, description))
 
 
 async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

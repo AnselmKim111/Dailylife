@@ -327,3 +327,71 @@ def extract_pdf_text(file_bytes: bytes, max_pages: int = 30, max_chars: int = 12
             if total >= max_chars:
                 break
     return "\n\n".join(out)[:max_chars]
+
+
+PDF_VISION_PROMPT = (
+    "이 PDF는 사용자가 보낸 파일이야 (보통 e-ticket, 영수증, 명세서). "
+    "모든 페이지에서 *문자 그대로* 정보를 한국어로 추출해줘. 구조 그대로:\n"
+    "- 날짜·시간·장소·이름·번호·코드는 한 글자도 빼지 말고.\n"
+    "- 표는 항목별로 줄바꿈해서.\n"
+    "- 예약번호/PNR/confirmation code 등은 *명확히 라벨 붙여서*.\n"
+    "- 페이지 구분은 '--- page N ---'.\n"
+    "- 추가 설명·요약 X. 추출만."
+)
+
+
+async def extract_pdf_with_vision_fallback(
+    file_bytes: bytes,
+    *,
+    max_pages: int = 30,
+    max_chars: int = 12000,
+    max_vision_size: int = 5_000_000,
+) -> tuple[str, str, Optional[str]]:
+    """Try pypdf first; if extracted text < 40 chars (image-only PDF),
+    fall back to Haiku 4.5 vision via OpenRouter (Anthropic supports inline PDF).
+
+    Returns (text, method, failure_reason).
+      method ∈ {'pypdf', 'vision_pdf', 'failed'}.
+      failure_reason is None on success."""
+    pypdf_text = extract_pdf_text(file_bytes, max_pages=max_pages, max_chars=max_chars)
+    if len(pypdf_text.strip()) >= 40:
+        return (pypdf_text, "pypdf", None)
+    # vision fallback
+    if not OPENROUTER_API_KEY:
+        return ("", "failed", "no_openrouter_key")
+    if len(file_bytes) > max_vision_size:
+        return (pypdf_text, "failed", f"size_over_{max_vision_size}")
+    try:
+        b64 = base64.b64encode(file_bytes).decode("ascii")
+        payload = {
+            "model": OPENROUTER_VISION_MODEL,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": PDF_VISION_PROMPT},
+                    {"type": "file",
+                     "file": {"filename": "input.pdf",
+                              "file_data": f"data:application/pdf;base64,{b64}"}},
+                ],
+            }],
+            "max_tokens": 4000,
+        }
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://dailylife.bot",
+            "X-Title": "Dailylife PDF vision fallback",
+        }
+        async with httpx.AsyncClient(timeout=90.0) as c:
+            r = await c.post(OPENROUTER_URL, json=payload, headers=headers)
+            if r.status_code >= 400:
+                logger.warning("vision PDF fallback HTTP %s: %s", r.status_code, r.text[:300])
+                return (pypdf_text, "failed", f"http_{r.status_code}")
+            data = r.json()
+        text = (data.get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+        if len(text) < 20:
+            return (pypdf_text, "failed", "vision_empty_response")
+        return (text[:max_chars], "vision_pdf", None)
+    except Exception as e:
+        logger.exception("vision PDF fallback failed")
+        return (pypdf_text, "failed", f"exception:{e}")

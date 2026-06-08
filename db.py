@@ -522,6 +522,49 @@ CREATE TABLE IF NOT EXISTS negotiations (
     last_action_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE INDEX IF NOT EXISTS idx_negot_chat_state ON negotiations(chat_id, state);
+
+-- v19: 사용자가 보낸 모든 첨부의 영구 저장소. tg_file_id로 원본 재전송,
+-- extracted_text로 검색, structured_json으로 구조화 회상.
+CREATE TABLE IF NOT EXISTS attachments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    chat_id INTEGER NOT NULL,
+    tg_file_id TEXT NOT NULL,
+    tg_file_unique_id TEXT,
+    kind TEXT NOT NULL,                  -- 'pdf'|'image'|'voice'|'doc_other'
+    filename TEXT,
+    mime_type TEXT,
+    size_bytes INTEGER,
+    sha256 TEXT,
+    caption TEXT,
+    extracted_text TEXT NOT NULL DEFAULT '',
+    extraction_method TEXT,              -- 'pypdf'|'vision_pdf'|'vision_img'|'whisper'|'failed'|'pending'
+    failure_reason TEXT,
+    structured_json TEXT,
+    related_chat_log_id INTEGER,
+    received_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+    UNIQUE(chat_id, tg_file_unique_id)
+);
+CREATE INDEX IF NOT EXISTS idx_attachments_chat ON attachments(chat_id, received_at DESC);
+CREATE INDEX IF NOT EXISTS idx_attachments_sha ON attachments(sha256);
+
+CREATE VIRTUAL TABLE IF NOT EXISTS attachments_fts
+    USING fts5(filename, caption, extracted_text,
+               content='attachments', content_rowid='id', tokenize='trigram');
+
+CREATE TRIGGER IF NOT EXISTS attachments_ai AFTER INSERT ON attachments BEGIN
+    INSERT INTO attachments_fts(rowid, filename, caption, extracted_text)
+    VALUES (new.id, COALESCE(new.filename,''), COALESCE(new.caption,''), COALESCE(new.extracted_text,''));
+END;
+CREATE TRIGGER IF NOT EXISTS attachments_au AFTER UPDATE ON attachments BEGIN
+    INSERT INTO attachments_fts(attachments_fts, rowid, filename, caption, extracted_text)
+    VALUES('delete', old.id, COALESCE(old.filename,''), COALESCE(old.caption,''), COALESCE(old.extracted_text,''));
+    INSERT INTO attachments_fts(rowid, filename, caption, extracted_text)
+    VALUES (new.id, COALESCE(new.filename,''), COALESCE(new.caption,''), COALESCE(new.extracted_text,''));
+END;
+CREATE TRIGGER IF NOT EXISTS attachments_ad AFTER DELETE ON attachments BEGIN
+    INSERT INTO attachments_fts(attachments_fts, rowid, filename, caption, extracted_text)
+    VALUES('delete', old.id, COALESCE(old.filename,''), COALESCE(old.caption,''), COALESCE(old.extracted_text,''));
+END;
 """
 
 _lock = threading.Lock()
@@ -1149,15 +1192,150 @@ def search_notes(chat_id: int, query: str, limit: int = 5) -> List[Dict]:
     return list(seen.values())[:limit]
 
 
+# ---------------- attachments (v19 — raw file 영구 저장) ----------------
+
+
+def insert_attachment(
+    chat_id: int,
+    tg_file_id: str,
+    kind: str,
+    *,
+    tg_file_unique_id: Optional[str] = None,
+    filename: Optional[str] = None,
+    mime_type: Optional[str] = None,
+    size_bytes: Optional[int] = None,
+    sha256: Optional[str] = None,
+    caption: Optional[str] = None,
+    extraction_method: str = "pending",
+) -> int:
+    """Always called BEFORE extraction. Even if extraction later fails, the row
+    + tg_file_id stays so the binary is retrievable via Telegram CDN."""
+    with _conn() as c:
+        cur = c.execute(
+            "INSERT INTO attachments "
+            "(chat_id, tg_file_id, tg_file_unique_id, kind, filename, mime_type, "
+            " size_bytes, sha256, caption, extraction_method) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?) "
+            "ON CONFLICT(chat_id, tg_file_unique_id) DO UPDATE SET "
+            "  received_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') "
+            "RETURNING id",
+            (chat_id, tg_file_id, tg_file_unique_id, kind, filename, mime_type,
+             size_bytes, sha256, caption, extraction_method),
+        )
+        return cur.fetchone()[0]
+
+
+def update_attachment_extraction(
+    att_id: int,
+    extracted_text: str,
+    method: str,
+    failure_reason: Optional[str] = None,
+    related_chat_log_id: Optional[int] = None,
+) -> None:
+    with _conn() as c:
+        c.execute(
+            "UPDATE attachments SET extracted_text=?, extraction_method=?, "
+            "  failure_reason=?, related_chat_log_id=COALESCE(?, related_chat_log_id) "
+            "WHERE id=?",
+            (extracted_text or "", method, failure_reason, related_chat_log_id, att_id),
+        )
+
+
+def attach_structured(att_id: int, structured_json: str) -> None:
+    with _conn() as c:
+        c.execute("UPDATE attachments SET structured_json=? WHERE id=?",
+                  (structured_json, att_id))
+
+
+def get_attachment(att_id: int) -> Optional[sqlite3.Row]:
+    with _conn() as c:
+        return c.execute("SELECT * FROM attachments WHERE id=?", (att_id,)).fetchone()
+
+
+def list_recent_attachments(chat_id: int, days: int = 180, limit: int = 20) -> List[sqlite3.Row]:
+    with _conn() as c:
+        return list(c.execute(
+            "SELECT * FROM attachments WHERE chat_id=? "
+            "AND received_at >= datetime('now', ?) "
+            "ORDER BY received_at DESC LIMIT ?",
+            (chat_id, f"-{days} days", limit),
+        ))
+
+
+def search_attachments(chat_id: int, query: str, limit: int = 5,
+                        kind: Optional[str] = None) -> List[Dict]:
+    """FTS5 trigram + LIKE fallback on filename/caption/extracted_text.
+    Mirrors search_notes pattern."""
+    q = _fts_safe(query)
+    seen: Dict[int, Dict] = {}
+    with _conn() as c:
+        if q:
+            sql = (
+                "SELECT a.id, a.chat_id, a.tg_file_id, a.kind, a.filename, "
+                "  a.mime_type, a.received_at, a.extracted_text, "
+                "  a.structured_json, a.extraction_method, "
+                "  snippet(attachments_fts, 2, '«', '»', '…', 12) AS snippet "
+                "FROM attachments_fts JOIN attachments a ON a.id = attachments_fts.rowid "
+                "WHERE attachments_fts MATCH ? AND a.chat_id=? "
+            )
+            params: List = [q, chat_id]
+            if kind:
+                sql += "AND a.kind=? "
+                params.append(kind)
+            sql += "ORDER BY rank LIMIT ?"
+            params.append(limit)
+            for r in c.execute(sql, params).fetchall():
+                seen[r["id"]] = dict(r)
+        if len(seen) < limit:
+            like = f"%{query.strip()}%"
+            sql = ("SELECT * FROM attachments WHERE chat_id=? "
+                   "AND (filename LIKE ? OR caption LIKE ? OR extracted_text LIKE ?) ")
+            params2: List = [chat_id, like, like, like]
+            if kind:
+                sql += "AND kind=? "
+                params2.append(kind)
+            sql += "ORDER BY received_at DESC LIMIT ?"
+            params2.append(limit)
+            for r in c.execute(sql, params2).fetchall():
+                if r["id"] not in seen:
+                    d = dict(r)
+                    d["snippet"] = (d.get("extracted_text") or "")[:200]
+                    seen[r["id"]] = d
+                    if len(seen) >= limit:
+                        break
+    return list(seen.values())[:limit]
+
+
+def chat_log_attachment_orphans(chat_id: int, limit: int = 50) -> List[Dict]:
+    """v19 backfill: pre-v19 chat_log rows that referenced PDFs/images
+    but never got an attachments row. Used for one-time orphan notice."""
+    with _conn() as c:
+        rows = c.execute(
+            "SELECT id, content, created_at FROM chat_log "
+            "WHERE chat_id=? AND role='user' "
+            "AND (content LIKE '[pdf %' OR content LIKE '[image %' "
+            "     OR content LIKE '[사진 %' OR content LIKE '[첨부 %') "
+            "ORDER BY created_at DESC LIMIT ?",
+            (chat_id, limit),
+        ).fetchall()
+        existing = {r[0] for r in c.execute(
+            "SELECT DISTINCT related_chat_log_id FROM attachments "
+            "WHERE chat_id=? AND related_chat_log_id IS NOT NULL", (chat_id,)
+        )}
+    return [dict(r) for r in rows if r["id"] not in existing]
+
+
 # ---------------- chat log (episodic memory) ----------------
 
 
-def log_chat(chat_id: int, role: str, content: str) -> None:
+def log_chat(chat_id: int, role: str, content: str) -> Optional[int]:
+    """Returns the new chat_log row id (or None if content empty)."""
     if not content.strip():
-        return
+        return None
     with _conn() as c:
-        c.execute("INSERT INTO chat_log (chat_id, role, content) VALUES (?,?,?)",
+        cur = c.execute("INSERT INTO chat_log (chat_id, role, content) VALUES (?,?,?)",
                   (chat_id, role, content.strip()))
+        return cur.lastrowid
 
 
 def search_chat_log(chat_id: int, query: str, limit: int = 5) -> List[Dict]:
