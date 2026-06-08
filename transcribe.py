@@ -363,17 +363,26 @@ async def extract_pdf_with_vision_fallback(
         return (pypdf_text, "failed", f"size_over_{max_vision_size}")
     try:
         b64 = base64.b64encode(file_bytes).decode("ascii")
+        # OpenRouter unified PDF input format — works for Anthropic + Google.
+        # Falls back to data URI if model supports inline PDF rendering.
         payload = {
             "model": OPENROUTER_VISION_MODEL,
             "messages": [{
                 "role": "user",
                 "content": [
                     {"type": "text", "text": PDF_VISION_PROMPT},
-                    {"type": "file",
-                     "file": {"filename": "input.pdf",
-                              "file_data": f"data:application/pdf;base64,{b64}"}},
+                    {
+                        "type": "file",
+                        "file": {
+                            "filename": "input.pdf",
+                            "file_data": f"data:application/pdf;base64,{b64}",
+                        },
+                    },
                 ],
             }],
+            # engine 'native' uses Claude's vision-on-PDF (handles image-only PDFs).
+            # 'pdf-text' is text-only and would just duplicate pypdf's failure.
+            "plugins": [{"id": "file-parser", "pdf": {"engine": "native"}}],
             "max_tokens": 4000,
         }
         headers = {
@@ -382,7 +391,7 @@ async def extract_pdf_with_vision_fallback(
             "HTTP-Referer": "https://dailylife.bot",
             "X-Title": "Dailylife PDF vision fallback",
         }
-        async with httpx.AsyncClient(timeout=90.0) as c:
+        async with httpx.AsyncClient(timeout=120.0) as c:
             r = await c.post(OPENROUTER_URL, json=payload, headers=headers)
             if r.status_code >= 400:
                 logger.warning("vision PDF fallback HTTP %s: %s", r.status_code, r.text[:300])
