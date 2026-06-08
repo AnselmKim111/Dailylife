@@ -46,6 +46,50 @@ async def index_yesterday(chat_id: int) -> Dict[str, int]:
     return counts
 
 
+async def backfill_all(chat_id: int, budget_usd: float = 0.05) -> Dict[str, int]:
+    """v19 W4: one-time — walk chat_log + notes + attachments embedding gaps.
+    Cost cap: text-embedding-3-small ≈ $0.02 / 1M tokens. budget_usd=0.05
+    allows ~2.5M tokens which covers years of chat. Stops when budget hit."""
+    counts: Dict[str, int] = {"chat_log": 0, "note": 0, "attachment": 0}
+    # text-embedding-3-small is ~6.5 chars/token roughly for Korean+English mix
+    char_budget = int((budget_usd / 0.02) * 1_000_000 * 6.5)
+    chars_used = 0
+
+    candidates: List[Dict] = []
+    with db._conn() as c:  # noqa: SLF001 — internal backfill query
+        for r in c.execute(
+            "SELECT id, content FROM chat_log WHERE chat_id=? AND role='user' "
+            "AND length(content) >= 20 ORDER BY id DESC LIMIT 2000", (chat_id,)
+        ):
+            candidates.append({"kind": "chat_log", "id": r["id"], "text": r["content"]})
+        for r in c.execute(
+            "SELECT id, content FROM notes WHERE chat_id=? "
+            "ORDER BY id DESC LIMIT 1000", (chat_id,)
+        ):
+            candidates.append({"kind": "note", "id": r["id"], "text": r["content"]})
+        for r in c.execute(
+            "SELECT id, extracted_text FROM attachments WHERE chat_id=? "
+            "AND extracted_text != '' ORDER BY id DESC LIMIT 500", (chat_id,)
+        ):
+            candidates.append({"kind": "attachment", "id": r["id"], "text": r["extracted_text"]})
+
+    for cand in candidates:
+        text = (cand["text"] or "").strip()
+        if not text or len(text) < 20:
+            continue
+        if chars_used + len(text) > char_budget:
+            logger.info("backfill chat %s: budget hit at %d chars", chat_id, chars_used)
+            break
+        ok = await index_entity(chat_id, cand["kind"], cand["id"], text)
+        if ok:
+            counts[cand["kind"]] = counts.get(cand["kind"], 0) + 1
+            chars_used += len(text)
+
+    logger.info("backfill chat %s done: %s (chars=%d/budget=%d)",
+                 chat_id, counts, chars_used, char_budget)
+    return counts
+
+
 async def search(chat_id: int, query: str, k: int = 8) -> List[Dict]:
     """Query를 embed 후 chat의 모든 vector와 cosine 유사도 top-k."""
     try:

@@ -7512,6 +7512,42 @@ def _disable_chatty_morning_recurring_tasks() -> List[Tuple[int, int, str]]:
     return disabled
 
 
+async def _v19_run_safety_net(app: Application) -> None:
+    """v19 W4: 사용자별 1회 orphan 알림 + 임베딩 backfill.
+    facts 테이블을 KV로 활용 — `v19_safety_net_done=1` set 시 skip."""
+    import lifelog
+    chat_ids = set()
+    with db._conn() as c:  # noqa: SLF001
+        for r in c.execute(
+            "SELECT DISTINCT chat_id FROM chat_log "
+            "WHERE created_at >= datetime('now', '-90 days')"):
+            chat_ids.add(r[0])
+    for chat_id in chat_ids:
+        if _fact_value_local(chat_id, "v19_safety_net_done") == "1":
+            continue
+        try:
+            orphans = db.chat_log_attachment_orphans(chat_id, limit=200)
+            if orphans:
+                await app.bot.send_message(
+                    chat_id=chat_id,
+                    text=(
+                        f"📚 메모리 업그레이드 (v19).\n"
+                        f"이제 보내는 모든 PDF·사진·음성은 *영구 보존* + *검색 가능*. "
+                        f"필요할 때 '#N 다시 보내줘'로 원본 즉시 회수.\n\n"
+                        f"⚠️ 과거 첨부 {len(orphans)}건은 파일이 만료돼서 원본 복구 "
+                        f"못 해. 텍스트 추출본만 chat 기록에 남아 있어."
+                    ),
+                )
+        except Exception:
+            logger.exception("v19 orphan notice failed for chat %s", chat_id)
+        try:
+            counts = await lifelog.backfill_all(chat_id, budget_usd=0.05)
+            logger.info("v19 backfill chat %s: %s", chat_id, counts)
+        except Exception:
+            logger.exception("v19 backfill failed for chat %s", chat_id)
+        db.remember_fact(chat_id, "v19_safety_net_done", "1")
+
+
 async def post_init(app: Application) -> None:
     global _app
     _app = app
@@ -7535,6 +7571,11 @@ async def post_init(app: Application) -> None:
                 logger.exception("notify disabled recurring failed (non-fatal)")
     except Exception:
         logger.exception("v17 chatty briefing cleanup failed (non-fatal)")
+    # v19: 사용자 chat별 1회 orphan 알림 + 백필 트리거 (한 번만)
+    try:
+        await _v19_run_safety_net(app)
+    except Exception:
+        logger.exception("v19 safety net failed (non-fatal)")
     scheduler.init(
         app.bot,
         run_recurring_task,
