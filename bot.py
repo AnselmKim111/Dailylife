@@ -3770,13 +3770,14 @@ _STRUCTURED_EXTRACT_PROMPT = (
     "  \"dates\": [{\"label\":\"...\",\"date\":\"YYYY-MM-DD\"}]\n"
     "}\n"
     "발견 안 된 카테고리는 빈 배열. 추가 설명·markdown X. JSON만.\n\n"
-    "raw text:\n{text}"
+    "raw text:\n<<RAW_TEXT>>"
 )
 
 
 async def _structured_extract_attachment(chat_id: int, att_id: int, raw_text: str) -> None:
     """v19 Wave 2: 추출된 raw text → 구조화 JSON. attachments.structured_json에 저장.
-    raw text는 notes에도 백업해서 키워드 검색 belt-and-suspenders."""
+    raw text는 notes에도 백업해서 키워드 검색 belt-and-suspenders.
+    발견된 events/bookings는 사용자에게 *짧게 제안* (자동 등록 X — v18 톤 #6)."""
     if not raw_text or len(raw_text) < 30 or len(raw_text) > 50_000:
         # 너무 짧거나 김 — skip 구조화. raw는 그대로 attachments에만.
         return
@@ -3786,10 +3787,11 @@ async def _structured_extract_attachment(chat_id: int, att_id: int, raw_text: st
                      tags=f"attachment:{att_id},auto,raw")
     except Exception:
         logger.exception("attachment->note backup failed (non-fatal)")
-    # 2) Haiku로 구조화
+    # 2) Haiku로 구조화 — 템플릿에 literal JSON 중괄호가 있어 str.format() 금지
+    prompt = _STRUCTURED_EXTRACT_PROMPT.replace("<<RAW_TEXT>>", raw_text[:8000])
     try:
         data = await chat_completion(
-            [{"role": "user", "content": _STRUCTURED_EXTRACT_PROMPT.format(text=raw_text[:8000])}],
+            [{"role": "user", "content": prompt}],
             tools=None, chat_id=chat_id, kind="mail_extract", max_tokens=1500,
         )
         content = (data["choices"][0]["message"].get("content") or "").strip()
@@ -3804,6 +3806,27 @@ async def _structured_extract_attachment(chat_id: int, att_id: int, raw_text: st
                      len(parsed.get("expenses", [])))
     except Exception:
         logger.exception("structured extract failed (non-fatal)")
+        return
+    # 3) 발견 항목 짧은 제안 — 사용자 confirm 후만 등록 (자동 add_event X)
+    try:
+        lines: List[str] = []
+        for ev in parsed.get("events", [])[:3]:
+            when = (ev.get("when_iso") or "")[:16].replace("T", " ")
+            lines.append(f"  • {when} {ev.get('title', '')}".rstrip())
+        for bk in parsed.get("bookings", [])[:3]:
+            bits = [bk.get("vendor") or bk.get("kind") or ""]
+            if bk.get("route"):
+                bits.append(bk["route"])
+            if bk.get("code"):
+                bits.append(f"({bk['code']})")
+            lines.append("  • " + " ".join(b for b in bits if b))
+        if lines and _app and _app.bot:
+            msg = f"📎 #{att_id}에서 발견:\n" + "\n".join(lines)
+            if parsed.get("events"):
+                msg += "\n일정 등록할까?"
+            await _app.bot.send_message(chat_id=chat_id, text=msg)
+    except Exception:
+        logger.exception("structured proposal message failed (non-fatal)")
 
 
 async def _classify_intent(text: str, chat_id: int) -> str:
@@ -7513,15 +7536,19 @@ def _disable_chatty_morning_recurring_tasks() -> List[Tuple[int, int, str]]:
 
 
 async def _v19_run_safety_net(app: Application) -> None:
-    """v19 W4: 사용자별 1회 orphan 알림 + 임베딩 backfill.
-    facts 테이블을 KV로 활용 — `v19_safety_net_done=1` set 시 skip."""
+    """v19 W4: 사용자별 1회 orphan 알림 + 임베딩 backfill. Background task로
+    실행 (post_init 비차단). facts 테이블을 KV로 활용 — `v19_safety_net_done=1` 시 skip."""
     import lifelog
-    chat_ids = set()
-    with db._conn() as c:  # noqa: SLF001
-        for r in c.execute(
-            "SELECT DISTINCT chat_id FROM chat_log "
-            "WHERE created_at >= datetime('now', '-90 days')"):
-            chat_ids.add(r[0])
+    try:
+        chat_ids = set()
+        with db._conn() as c:  # noqa: SLF001
+            for r in c.execute(
+                "SELECT DISTINCT chat_id FROM chat_log "
+                "WHERE created_at >= datetime('now', '-90 days')"):
+                chat_ids.add(r[0])
+    except Exception:
+        logger.exception("v19 safety net: chat scan failed")
+        return
     for chat_id in chat_ids:
         if _fact_value_local(chat_id, "v19_safety_net_done") == "1":
             continue
@@ -7571,11 +7598,9 @@ async def post_init(app: Application) -> None:
                 logger.exception("notify disabled recurring failed (non-fatal)")
     except Exception:
         logger.exception("v17 chatty briefing cleanup failed (non-fatal)")
-    # v19: 사용자 chat별 1회 orphan 알림 + 백필 트리거 (한 번만)
-    try:
-        await _v19_run_safety_net(app)
-    except Exception:
-        logger.exception("v19 safety net failed (non-fatal)")
+    # v19: 사용자 chat별 1회 orphan 알림 + 백필 — 임베딩 수백 건이 걸릴 수
+    # 있어 background task로 (polling 시작을 막지 않음)
+    asyncio.create_task(_v19_run_safety_net(app))
     scheduler.init(
         app.bot,
         run_recurring_task,
