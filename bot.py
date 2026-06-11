@@ -86,24 +86,24 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 HISTORY_LIMIT = int(os.environ.get("HISTORY_LIMIT", "16"))
 TZ = ZoneInfo(USER_TZ)
 
-# v14 W2: 시스템 프롬프트 슬림화 — 코어 톤만 항상 주입. tool routing은
-# intent별로 조건부 (TOOL_ROUTING_BY_INTENT). capability rule은 키워드 매칭 시만.
-# 결과: 평균 system message ~4KB → ~1.8KB (45%로 감소).
+# v20: mission-first 재설정 — 외부 기억 + 일정 + 침묵. 회수 질문엔 검색
+# 강제, recall pre-fetch가 FTS 결과를 컨텍스트에 선주입 (도구 미호출 안전망).
 SYSTEM_PROMPT_TEMPLATE = (
-    "당신은 사용자의 chief of staff — *결정을 흡수해* 사용자가 결정 부담을 덜게 만듦.\n\n"
-    "톤 규칙 (절대):\n"
-    "1. Brevity — 사용자 메시지 길이에 맞춰. 짧게 물으면 짧게 답.\n"
-    "2. 결정: 추천 1개 + 이유 1줄. 옵션 나열·점수·%·streak·🔥💪✅ 금지. "
-    "'이번 주 어땠어' 같은 기분 질문 금지.\n"
-    "3. 모르면 '모름' — 추측 시 '추측이지만' 접두.\n"
-    "4. Persona·facts 위에 있으면 *자연 회상* (DB가 아니라 사람처럼). "
-    "없는 디테일 만들지 마.\n"
-    "5. 한국어 기본.\n"
-    "6. **자율 미션·long-form·다단계 web_search 금지** — "
-    "start_mission / plan_trip / write 류 token-heavy 도구는 사용자가 "
-    "*명시적으로* 요청('미션 시작', '풀패키지 짜줘', '검색해줘', '리포트 써줘')"
-    "할 때만. 단순 일정·사실 언급('신혼여행 스위스 정해짐')은 *요청 아님* — "
-    "add_event/remember_fact 한 줄로 끝. 추가로 뭐 할지는 짧게 *물어*.\n\n"
+    "당신은 사용자의 *외부 기억(external memory) + 일정 비서*. "
+    "사용자는 폰 사용 시간이 제한된 환경에서 짧게 묻고 짧게 회수한다.\n\n"
+    "존재 이유 (우선순위):\n"
+    "1. 기억 — 사용자가 던진 모든 것(파일·예약번호·사실·대화)은 보존돼 있다. "
+    "회수 질문엔 search_attachments → search_memory → lifelog_search 순서로 "
+    "*실제로 검색한 후에만* 답해. 검색 없이 '저장된 게 없다' 답변 금지. "
+    "회수한 정보는 그대로(번호·코드·시각 한 글자도 안 바꾸고) + 출처(#첨부id·노트) 표시.\n"
+    "2. 일정 — 시각 있는 정보는 add_event(+gcal 연결 시 양쪽). 리마인더가 본업.\n"
+    "3. 침묵 — 먼저 말 걸지 않음. 물으면 본질만, 사용자 메시지 길이에 맞춰 짧게.\n\n"
+    "톤 (절대):\n"
+    "- 결정 요청 시 추천 1개 + 이유 1줄. 점수·%·streak·🔥💪✅·기분 질문 금지.\n"
+    "- 모르면 '모름'. 추측은 '추측이지만' 접두. 없는 디테일 만들지 마.\n"
+    "- 자율 행동 금지: 미션·long-form·메일 발송·다단계 검색은 명시 요청 후만. "
+    "단순 언급('신혼여행 스위스 정해짐')은 요청 아님 — 한 줄 저장 + 짧게 물어.\n"
+    "- 한국어 기본.\n\n"
     "현재 시각: {now} ({tz})\n\n"
     "Known facts:\n{facts_block}"
 )
@@ -304,6 +304,90 @@ def _invalidate_facts_cache(chat_id: int) -> None:
     _facts_cache.pop(chat_id, None)
 
 
+# v20: recall pre-fetch — 회수성 질문이면 LLM이 검색 도구를 안 불러도
+# FTS 결과가 컨텍스트에 들어가도록 선주입. '기록에 없어' 오답 원천 차단.
+_RECALL_INTENTS = {"memory", "lifelog", "schedule", "trip"}
+_RECALL_KEYWORD_RE = re.compile(
+    r"예약|번호|PNR|티켓|항공|첨부|파일|PDF|pdf|사진|문서|영수증|확인서|"
+    r"언제|뭐였|어디였|기억|보냈|받았|보여줘|찾아"
+)
+_PREFETCH_STOPWORDS = {
+    "오늘", "내일", "어제", "이번", "지난", "그때", "그거", "그것", "내",
+    "나의", "관련", "정보", "내용", "알려줘", "알려", "보여줘", "보여",
+    "찾아줘", "찾아", "해줘", "뭐야", "뭐였", "있어", "있나", "주라", "줘",
+}
+
+
+# 사용자 표현 ↔ 문서 표기 동의어 브리지 ('예약번호' 질문 → 'PNR'만 적힌 문서 매칭)
+_PREFETCH_SYNONYMS: Dict[str, List[str]] = {
+    "예약번호": ["PNR", "예약", "booking"],
+    "예약": ["PNR", "booking"],
+    "항공권": ["항공", "항공편", "flight", "티켓", "PNR"],
+    "항공편": ["항공", "flight", "편명"],
+    "비행기": ["항공", "flight", "편명"],
+    "티켓": ["ticket", "항공", "좌석"],
+    "숙소": ["호텔", "hotel", "체크인"],
+    "호텔": ["체크인", "hotel", "숙박"],
+    "영수증": ["결제", "금액", "원"],
+    "기차": ["KTX", "열차", "SRT"],
+}
+
+
+def _recall_prefetch(chat_id: int, user_text: str, intent: Optional[str]) -> str:
+    """회수성 turn에서 attachments/notes/chat_log를 키워드별 검색해 컨텍스트
+    블록 생성. SQLite 로컬 쿼리만 — LLM 비용 0. 비회수성 turn은 빈 문자열."""
+    text = (user_text or "").strip()
+    if len(text) < 3:
+        return ""
+    if intent not in _RECALL_INTENTS and not _RECALL_KEYWORD_RE.search(text):
+        return ""
+    # 의미 있는 키워드 추출 (stopword·1자 토큰 제외, 최대 4개)
+    tokens = [t for t in re.split(r"[\s,.?!~]+", text)
+              if len(t) >= 2 and t not in _PREFETCH_STOPWORDS][:4]
+    if not tokens:
+        tokens = [text[:20]]
+    # 동의어 확장 — 사용자 단어가 문서 표기와 다를 때 (예약번호 vs PNR)
+    expanded: List[str] = []
+    for tok in tokens:
+        expanded.append(tok)
+        for syn in _PREFETCH_SYNONYMS.get(tok, []):
+            if syn not in expanded:
+                expanded.append(syn)
+    tokens = expanded[:8]
+    lines: List[str] = []
+    seen_att: set = set()
+    seen_note: set = set()
+    try:
+        for tok in tokens:
+            for a in db.search_attachments(chat_id, tok, limit=2):
+                if a["id"] in seen_att:
+                    continue
+                seen_att.add(a["id"])
+                snip = (a.get("snippet") or a.get("extracted_text") or "")[:220]
+                lines.append(
+                    f"[첨부#{a['id']} {a.get('filename') or a['kind']} "
+                    f"{(a.get('received_at') or '')[:10]}] {snip}"
+                )
+            for n in db.search_notes(chat_id, tok, limit=2):
+                if n["id"] in seen_note:
+                    continue
+                seen_note.add(n["id"])
+                snip = (n.get("snippet") or n.get("content") or "")[:160]
+                lines.append(f"[노트#{n['id']}] {snip}")
+            if len(lines) >= 6:
+                break
+    except Exception:
+        logger.exception("recall prefetch failed (non-fatal)")
+        return ""
+    if not lines:
+        return ""
+    return (
+        "메모리 사전 검색 결과 (이번 질문 관련 — 그대로 인용 + 출처 표시. "
+        "부족하면 search_attachments/search_memory로 더 찾아):\n"
+        + "\n".join(lines)
+    )[:1500]
+
+
 def _solar_date_for(date_entry: Dict, this_year: int) -> Optional[Tuple[int, int, int]]:
     """Resolve an important_date entry to (Y,M,D) in the solar calendar for
     a given solar `this_year`. Honors `is_lunar=True` → convert via lunar.py."""
@@ -400,12 +484,14 @@ def _system_message(
     chat_id: int,
     recent_user_text: str = "",
     intent: Optional[str] = None,
+    prefetch_block: str = "",
 ) -> Dict:
     """v14 W2: 슬림화된 시스템 메시지.
     - 코어 톤만 항상. tool routing은 intent 매칭 시만 1줄.
     - capability rule은 능력 질문 시만, attachment rule은 첨부 시만.
     - mode 블록은 단 1개 (우선순위: expert > writing > travel).
     - facts는 60s 캐시.
+    - v20: prefetch_block — 회수성 질문의 FTS 선검색 결과 주입.
     """
     now_local = datetime.now(TZ).strftime("%Y-%m-%d %H:%M (%a)")
     base = SYSTEM_PROMPT_TEMPLATE.format(
@@ -415,6 +501,10 @@ def _system_message(
     # intent-conditional tool routing (1 line max)
     if intent and intent in TOOL_ROUTING_BY_INTENT:
         base += "\n\n" + TOOL_ROUTING_BY_INTENT[intent]
+
+    # v20: recall pre-fetch 결과
+    if prefetch_block:
+        base += "\n\n" + prefetch_block
 
     # capability rule — only when user asks "what can you do"
     if recent_user_text and re.search(_CAPABILITY_QUESTION_RE, recent_user_text):
@@ -2916,9 +3006,13 @@ async def run_agent(chat_id: int, user_text: str, history: Optional[List[Dict]] 
     if intent and intent != "general":
         tools_for_loop = _tools_for_intent(intent)
 
+    # v20: recall pre-fetch — 회수성 질문이면 FTS 결과 선주입 (hop간 재사용)
+    prefetch_block = _recall_prefetch(chat_id, user_text, intent) if kind == "chat" else ""
+
     final_text = ""
     for hop in range(max_hops):
-        messages = [_system_message(chat_id, recent_user_text=user_text, intent=intent), *history]
+        messages = [_system_message(chat_id, recent_user_text=user_text, intent=intent,
+                                      prefetch_block=prefetch_block), *history]
         data = await chat_completion(messages, tools=tools_for_loop, chat_id=chat_id, kind=kind)
         msg = data["choices"][0]["message"]
         history.append(
