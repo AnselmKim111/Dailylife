@@ -1263,22 +1263,37 @@ def list_recent_attachments(chat_id: int, days: int = 180, limit: int = 20) -> L
 
 
 def search_attachments(chat_id: int, query: str, limit: int = 5,
-                        kind: Optional[str] = None) -> List[Dict]:
+                        kind: Optional[str] = None,
+                        from_date: Optional[str] = None,
+                        to_date: Optional[str] = None) -> List[Dict]:
     """FTS5 trigram + LIKE fallback on filename/caption/extracted_text.
-    Mirrors search_notes pattern."""
-    q = _fts_safe(query)
+    Mirrors search_notes pattern.
+    v21: from_date/to_date (YYYY-MM-DD) — '5월에 보낸 PDF' 류 시간 앵커 회수.
+    query가 비어도 날짜 범위가 있으면 그 범위의 최근 첨부 반환."""
+    def _date_clause(prefix: str) -> Tuple[str, List]:
+        sql, params = "", []
+        if from_date:
+            sql += f"AND {prefix}received_at >= ? "
+            params.append(from_date)
+        if to_date:
+            sql += f"AND {prefix}received_at <= ? "
+            params.append(to_date + "T23:59:59")
+        return sql, params
+
+    q = _fts_safe(query) if query else ""
     seen: Dict[int, Dict] = {}
     with _conn() as c:
         if q:
+            dsql, dparams = _date_clause("a.")
             sql = (
                 "SELECT a.id, a.chat_id, a.tg_file_id, a.kind, a.filename, "
                 "  a.mime_type, a.received_at, a.extracted_text, "
                 "  a.structured_json, a.extraction_method, "
                 "  snippet(attachments_fts, 2, '«', '»', '…', 12) AS snippet "
                 "FROM attachments_fts JOIN attachments a ON a.id = attachments_fts.rowid "
-                "WHERE attachments_fts MATCH ? AND a.chat_id=? "
+                "WHERE attachments_fts MATCH ? AND a.chat_id=? " + dsql
             )
-            params: List = [q, chat_id]
+            params: List = [q, chat_id, *dparams]
             if kind:
                 sql += "AND a.kind=? "
                 params.append(kind)
@@ -1286,11 +1301,13 @@ def search_attachments(chat_id: int, query: str, limit: int = 5,
             params.append(limit)
             for r in c.execute(sql, params).fetchall():
                 seen[r["id"]] = dict(r)
-        if len(seen) < limit:
+        if len(seen) < limit and query.strip():
+            dsql, dparams = _date_clause("")
             like = f"%{query.strip()}%"
             sql = ("SELECT * FROM attachments WHERE chat_id=? "
-                   "AND (filename LIKE ? OR caption LIKE ? OR extracted_text LIKE ?) ")
-            params2: List = [chat_id, like, like, like]
+                   "AND (filename LIKE ? OR caption LIKE ? OR extracted_text LIKE ?) "
+                   + dsql)
+            params2: List = [chat_id, like, like, like, *dparams]
             if kind:
                 sql += "AND kind=? "
                 params2.append(kind)
@@ -1303,6 +1320,21 @@ def search_attachments(chat_id: int, query: str, limit: int = 5,
                     seen[r["id"]] = d
                     if len(seen) >= limit:
                         break
+        if len(seen) < limit and not query.strip() and (from_date or to_date):
+            # 키워드 없이 시간 범위만 — 그 기간 첨부 나열
+            dsql, dparams = _date_clause("")
+            sql = "SELECT * FROM attachments WHERE chat_id=? " + dsql
+            params3: List = [chat_id, *dparams]
+            if kind:
+                sql += "AND kind=? "
+                params3.append(kind)
+            sql += "ORDER BY received_at DESC LIMIT ?"
+            params3.append(limit)
+            for r in c.execute(sql, params3).fetchall():
+                if r["id"] not in seen:
+                    d = dict(r)
+                    d["snippet"] = (d.get("extracted_text") or "")[:200]
+                    seen[r["id"]] = d
     return list(seen.values())[:limit]
 
 

@@ -462,15 +462,20 @@ TOOLS: List[Dict] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string"},
+                    "query": {"type": "string",
+                              "description": "키워드. '5월에 보낸 거' 류 시간만 있는 질의는 빈 문자열 + 날짜 범위."},
                     "file_kind": {
                         "type": "string",
                         "enum": ["pdf", "image", "voice", "doc_other"],
                         "description": "Optional: restrict to one kind.",
                     },
+                    "from_date": {"type": "string",
+                                   "description": "YYYY-MM-DD — 이 날짜 이후 받은 첨부만."},
+                    "to_date": {"type": "string",
+                                 "description": "YYYY-MM-DD — 이 날짜까지 받은 첨부만."},
                     "limit": {"type": "integer", "description": "Max hits (default 5)."},
                 },
-                "required": ["query"],
+                "required": [],
             },
         },
     },

@@ -304,6 +304,26 @@ def _invalidate_facts_cache(chat_id: int) -> None:
     _facts_cache.pop(chat_id, None)
 
 
+# v21: Telegram은 plain text 발송 — LLM 마크다운 잔재가 화면에 ** 그대로 노출됨.
+_MD_FENCE_RE = re.compile(r"^```[a-zA-Z]*\s*$", re.MULTILINE)
+
+
+def _strip_md(text: str) -> str:
+    """발신 직전 마크다운 제거: **굵게**·*강조*·## 제목·--- 구분선·[링크](url).
+    HTML parse_mode 전환은 특수문자 escape 리스크가 있어 strip이 안전."""
+    if not text:
+        return text
+    out = _MD_FENCE_RE.sub("", text)
+    out = re.sub(r"\*\*(.+?)\*\*", r"\1", out, flags=re.DOTALL)
+    out = re.sub(r"__(.+?)__", r"\1", out, flags=re.DOTALL)
+    out = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"\1", out)
+    out = re.sub(r"^#{1,6}\s+", "", out, flags=re.MULTILINE)
+    out = re.sub(r"^\s*(?:---+|\*\*\*+|___+)\s*$", "", out, flags=re.MULTILINE)
+    out = re.sub(r"\[([^\]]+)\]\((https?://[^)]+)\)", r"\1 (\2)", out)
+    out = re.sub(r"\n{3,}", "\n\n", out)
+    return out.strip()
+
+
 # v20: recall pre-fetch — 회수성 질문이면 LLM이 검색 도구를 안 불러도
 # FTS 결과가 컨텍스트에 들어가도록 선주입. '기록에 없어' 오답 원천 차단.
 _RECALL_INTENTS = {"memory", "lifelog", "schedule", "trip"}
@@ -333,6 +353,35 @@ _PREFETCH_SYNONYMS: Dict[str, List[str]] = {
 }
 
 
+def _parse_date_anchor(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """v21: 'N월 (D일)'·'지난달'·'지난주'·'어제' → (from_date, to_date) YYYY-MM-DD."""
+    import calendar as _cal
+    now = datetime.now(TZ)
+    m = re.search(r"(\d{1,2})월(?:\s*(\d{1,2})일)?", text)
+    if m:
+        mo = int(m.group(1))
+        if not (1 <= mo <= 12):
+            return (None, None)
+        year = now.year if mo <= now.month else now.year - 1
+        if m.group(2):
+            d = int(m.group(2))
+            day = f"{year:04d}-{mo:02d}-{d:02d}"
+            return (day, day)
+        last = _cal.monthrange(year, mo)[1]
+        return (f"{year:04d}-{mo:02d}-01", f"{year:04d}-{mo:02d}-{last:02d}")
+    if "지난달" in text or "저번달" in text:
+        first_this = now.replace(day=1)
+        last_prev = first_this - timedelta(days=1)
+        return (last_prev.strftime("%Y-%m-01"), last_prev.strftime("%Y-%m-%d"))
+    if "지난주" in text or "저번주" in text:
+        return ((now - timedelta(days=14)).strftime("%Y-%m-%d"),
+                now.strftime("%Y-%m-%d"))
+    if "어제" in text:
+        y = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        return (y, y)
+    return (None, None)
+
+
 def _recall_prefetch(chat_id: int, user_text: str, intent: Optional[str]) -> str:
     """회수성 turn에서 attachments/notes/chat_log를 키워드별 검색해 컨텍스트
     블록 생성. SQLite 로컬 쿼리만 — LLM 비용 0. 비회수성 turn은 빈 문자열."""
@@ -341,6 +390,7 @@ def _recall_prefetch(chat_id: int, user_text: str, intent: Optional[str]) -> str
         return ""
     if intent not in _RECALL_INTENTS and not _RECALL_KEYWORD_RE.search(text):
         return ""
+    from_date, to_date = _parse_date_anchor(text)
     # 의미 있는 키워드 추출 (stopword·1자 토큰 제외, 최대 4개)
     tokens = [t for t in re.split(r"[\s,.?!~]+", text)
               if len(t) >= 2 and t not in _PREFETCH_STOPWORDS][:4]
@@ -359,7 +409,8 @@ def _recall_prefetch(chat_id: int, user_text: str, intent: Optional[str]) -> str
     seen_note: set = set()
     try:
         for tok in tokens:
-            for a in db.search_attachments(chat_id, tok, limit=2):
+            for a in db.search_attachments(chat_id, tok, limit=2,
+                                            from_date=from_date, to_date=to_date):
                 if a["id"] in seen_att:
                     continue
                 seen_att.add(a["id"])
@@ -376,6 +427,18 @@ def _recall_prefetch(chat_id: int, user_text: str, intent: Optional[str]) -> str
                 lines.append(f"[노트#{n['id']}] {snip}")
             if len(lines) >= 6:
                 break
+        # v21: 키워드 hit 없어도 시간 앵커 있으면 그 기간 첨부 나열
+        if not lines and (from_date or to_date):
+            for a in db.search_attachments(chat_id, "", limit=4,
+                                            from_date=from_date, to_date=to_date):
+                if a["id"] in seen_att:
+                    continue
+                seen_att.add(a["id"])
+                snip = (a.get("snippet") or a.get("extracted_text") or "")[:180]
+                lines.append(
+                    f"[첨부#{a['id']} {a.get('filename') or a['kind']} "
+                    f"{(a.get('received_at') or '')[:10]}] {snip}"
+                )
     except Exception:
         logger.exception("recall prefetch failed (non-fatal)")
         return ""
@@ -2516,14 +2579,18 @@ def tool_search_memory(chat_id: int, args: Dict) -> Dict:
 
 
 def tool_search_attachments(chat_id: int, args: Dict) -> Dict:
-    """v19: PDF/이미지/음성 파일 검색. PNR·예약번호·항공편 등 raw 추출 텍스트 매칭."""
+    """v19: PDF/이미지/음성 파일 검색. PNR·예약번호·항공편 등 raw 추출 텍스트 매칭.
+    v21: from_date/to_date — '5월에 보낸 PDF' 시간 앵커 질의."""
     query = (args.get("query") or "").strip()
-    if not query:
-        return {"ok": False, "error": "query required"}
+    from_date = (args.get("from_date") or "").strip() or None
+    to_date = (args.get("to_date") or "").strip() or None
+    if not query and not from_date and not to_date:
+        return {"ok": False, "error": "query or date range required"}
     rows = db.search_attachments(
         chat_id, query,
         limit=int(args.get("limit", 5)),
         kind=args.get("file_kind") or None,
+        from_date=from_date, to_date=to_date,
     )
     return {
         "ok": True,
@@ -3051,7 +3118,8 @@ async def run_agent(chat_id: int, user_text: str, history: Optional[List[Dict]] 
                 }
             )
 
-    return final_text or "처리 완료."
+    # v21: 모든 run_agent 소비처 (chat·recurring·setup·ask 등)에 일괄 마크다운 제거
+    return _strip_md(final_text) or "처리 완료."
 
 
 RECURRING_PROMPT_MAX = 2000
@@ -3852,6 +3920,15 @@ _INTENT_CLASSIFY_PROMPT = (
 )
 
 
+async def _embed_attachment_now(chat_id: int, att_id: int, text: str) -> None:
+    """v21: ingestion 직후 임베딩 — '그 비행기표' 류 모호 회상이 당일부터 작동."""
+    try:
+        import lifelog
+        await lifelog.index_entity(chat_id, "attachment", att_id, text[:4000])
+    except Exception:
+        logger.exception("immediate attachment embed failed (non-fatal)")
+
+
 _STRUCTURED_EXTRACT_PROMPT = (
     "다음 텍스트는 사용자가 봇에 보낸 첨부 파일에서 추출된 raw text야 "
     "(PDF/사진/음성). 구조화된 정보를 한국어 JSON으로 추출:\n"
@@ -3875,6 +3952,8 @@ async def _structured_extract_attachment(chat_id: int, att_id: int, raw_text: st
     if not raw_text or len(raw_text) < 30 or len(raw_text) > 50_000:
         # 너무 짧거나 김 — skip 구조화. raw는 그대로 attachments에만.
         return
+    # 0) v21: 즉시 임베딩 — 다음날 04:30 cron까지 semantic 검색 공백 제거
+    await _embed_attachment_now(chat_id, att_id, raw_text)
     # 1) raw text를 notes에도 복제 — FTS5 추가 색인
     try:
         db.add_note(chat_id, raw_text[:8000],
@@ -5824,7 +5903,7 @@ async def _send_mission_result(mission_id: int, result_md: str) -> None:
     m = db.get_mission(mission_id)
     if not m:
         return
-    text = f"✅ Mission #{mission_id} 완성 — {m['title']}\n\n{result_md[:3500]}"
+    text = f"✅ Mission #{mission_id} 완성 — {m['title']}\n\n{_strip_md(result_md)[:3500]}"
     try:
         await _app.bot.send_message(chat_id=m["chat_id"], text=text)
     except Exception:
@@ -7306,6 +7385,8 @@ async def on_voice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         bio = await tg_file.download_as_bytearray()
         text = await transcribe.transcribe_voice(bytes(bio), mime)
         db.update_attachment_extraction(att_id, text or "", "whisper")
+        if text:
+            asyncio.create_task(_embed_attachment_now(chat_id, att_id, text))
     except transcribe.TranscribeUnavailable:
         db.update_attachment_extraction(att_id, "", "failed", "no_openai_key")
         await update.message.reply_text(
