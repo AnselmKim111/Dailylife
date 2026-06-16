@@ -3148,6 +3148,14 @@ async def run_recurring_task(task_id: int) -> None:
     if row is None or not row["enabled"]:
         return
     chat_id = row["chat_id"]
+    # v22: 사용자 비활성·조용시간엔 정기 발사 skip — 다른 텔방에서 활동 중일 때
+    # 봇이 끼어드는 거 차단. briefing과 동일 룰을 recurring에도 적용.
+    if _is_quiet_now(chat_id):
+        logger.info("recurring %s skipped — quiet hours", task_id)
+        return
+    if not _user_was_active(chat_id, hours=48):
+        logger.info("recurring %s skipped — chat %s idle 48h+", task_id, chat_id)
+        return
     safe_prompt = _sanitize_recurring_prompt(row["prompt"])
     if safe_prompt is None:
         logger.warning("recurring task %s prompt rejected (sanitize)", task_id)
@@ -7685,11 +7693,33 @@ _LLM_BRIEFING_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
+# v22: 봇이 *사용자에게 질문하는* 형태의 recurring_task는 일괄 OFF.
+# 묻기·확인·체크인은 사용자가 명시 요청하지 않으면 인지 부하 노이즈.
+_QUESTION_RECURRING_PATTERNS = re.compile(
+    r"(?:알려\s*줄래|알려\s*주(?:라|세요|시)|"
+    r"알려\s*달라|어땠|어땠어|어떠셨|어떻게|"
+    r"어디(?:야|니|에)|언제(?:야|니|쯤)|"
+    r"확인해\s*달라|확인해\s*주|"
+    r"체크\s*인|check\s*in|"
+    r"기분\s*(?:어떤|어때)|컨디션\s*(?:어떤|어때)|"
+    r"\?\s*$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+# 사용자가 명시 OFF한 "죽은 주제" — recurring이 매일 이를 다루며 *언급 자체로* 노이즈.
+# 사용자 요청: "삭제된 걸 왜 매일 알려주냐"
+_DEAD_TOPIC_HINTS = re.compile(
+    r"(?:시실리|sicilian|체스|chess|"
+    r"직장\s*주소|자대\s*주소|workplace\s*address)",
+    re.IGNORECASE,
+)
+
 
 def _disable_chatty_morning_recurring_tasks() -> List[Tuple[int, int, str]]:
-    """v17: 사용자가 등록한 LLM-prose 브리핑 recurring_task를 일괄 비활성화.
-    deterministic run_morning_briefing이 이미 같은 슬롯 커버 — 중복·길이 노이즈.
-    cron_kst 05:00-09:59 + prompt가 briefing keyword 매칭 시 enabled=0.
+    """v17/v22: 노이즈 recurring_task 일괄 비활성화.
+    - 아침(5-9시) + briefing 키워드 → run_morning_briefing이 대체
+    - 시간 무관 + 봇이 사용자에게 질문 (알려줄래·어땠·?로 끝)
+    - 시간 무관 + 죽은 주제 (시실리안 체스·삭제된 직장 주소 등)
     Returns: list of (task_id, chat_id, prompt) disabled."""
     disabled: List[Tuple[int, int, str]] = []
     for row in db.list_recurring_tasks():  # enabled=1 only
@@ -7697,16 +7727,21 @@ def _disable_chatty_morning_recurring_tasks() -> List[Tuple[int, int, str]]:
         try:
             hh = int(cron.split(":")[0])
         except (ValueError, IndexError):
-            continue
-        if not (5 <= hh <= 9):
-            continue
+            hh = -1
         prompt = row["prompt"] or ""
-        if not _LLM_BRIEFING_PATTERNS.search(prompt):
+        reason = None
+        if 5 <= hh <= 9 and _LLM_BRIEFING_PATTERNS.search(prompt):
+            reason = "chatty_morning_briefing"
+        elif _QUESTION_RECURRING_PATTERNS.search(prompt):
+            reason = "asks_user_questions"
+        elif _DEAD_TOPIC_HINTS.search(prompt):
+            reason = "dead_topic"
+        if reason is None:
             continue
         if db.set_recurring_enabled(row["id"], row["chat_id"], False):
             disabled.append((row["id"], row["chat_id"], prompt))
-            logger.info("v17: disabled chatty morning recurring_task #%s for chat %s: %r",
-                        row["id"], row["chat_id"], prompt[:80])
+            logger.info("disabled recurring_task #%s chat %s reason=%s: %r",
+                        row["id"], row["chat_id"], reason, prompt[:80])
     return disabled
 
 
