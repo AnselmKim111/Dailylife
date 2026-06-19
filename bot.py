@@ -4901,20 +4901,82 @@ _GAP_QUESTIONS: List[Dict] = [
      "needed": lambda chat_id: any(not p["role"] for p in db.list_people(chat_id))},
 ]
 
+# v23: 사용자가 거절한 gap question은 영구 silence.
+_GAP_REFUSAL_RE = re.compile(
+    r"(?:그만\s*물어|이미\s*(?:알|박|넣)|박아\s*놨|알려?\s*줬|"
+    r"알려\s*줬어|넣었어|입력했|등록했|저장했|"
+    r"몰라|모름|알려\s*주기\s*싫|싫어|관심\s*없|필요\s*없|"
+    r"stop\s*asking|already\s*told|don'?t\s*ask|"
+    r"안\s*알려|말\s*안\s*해)",
+    re.IGNORECASE,
+)
+
+
+def _gap_silenced(chat_id: int, key: str) -> bool:
+    return _fact_value_local(chat_id, f"gap_silenced_{key}") == "1"
+
 
 def _next_gap_question(chat_id: int) -> Optional[Dict]:
     for q in _GAP_QUESTIONS:
         try:
+            # v23: 사용자가 명시 거절한 항목은 영구 침묵
+            if _gap_silenced(chat_id, q["key"]):
+                continue
             if q["needed"](chat_id):
                 if q["key"] == "people_role_missing":
                     person = next((p for p in db.list_people(chat_id) if not p["role"]), None)
                     if person:
-                        return {"key": f"role:{person['id']}",
+                        person_key = f"role_{person['id']}"
+                        if _gap_silenced(chat_id, person_key):
+                            continue
+                        return {"key": person_key,
                                 "ask": f"👤 {person['name']}은(는) 어떤 관계야? (친구 / 가족 / 약혼녀 / 동료 / 동기 ...)"}
                 return q
         except Exception:
             continue
     return None
+
+
+def _handle_gap_answer(chat_id: int, user_text: str) -> None:
+    """v23: 어제·오늘 gap question을 보냈는데 사용자가 답하면:
+    - 거절 패턴 → 영구 silence
+    - 의미 있는 답 → 해당 fact key로 자동 저장 + silence
+    같은 질문 다시 안 함."""
+    today_iso = datetime.now(TZ).date().isoformat()
+    state = db.get_daily_state(chat_id, today_iso)
+    asked_key = state["learning_question_key"] if state else None
+    if not asked_key:
+        # 어제 ask했을 수도 — 24h 이내 확인
+        yest_iso = (datetime.now(TZ).date() - timedelta(days=1)).isoformat()
+        ystate = db.get_daily_state(chat_id, yest_iso)
+        asked_key = ystate["learning_question_key"] if ystate else None
+    if not asked_key:
+        return
+    text = (user_text or "").strip()
+    if not text:
+        return
+    # 1) 거절 패턴 → 영구 silence (저장 X)
+    if _GAP_REFUSAL_RE.search(text):
+        db.remember_fact(chat_id, f"gap_silenced_{asked_key}", "1")
+        logger.info("gap question %s silenced for chat %s (refused)", asked_key, chat_id)
+        return
+    # 2) 의미 있는 답 → fact 저장 시도
+    # asked_key가 'role_<person_id>' 형태면 사람 역할 업데이트
+    if asked_key.startswith("role_"):
+        try:
+            pid = int(asked_key.split("_", 1)[1])
+            db.update_person(pid, role=text[:60])
+            db.remember_fact(chat_id, f"gap_silenced_{asked_key}", "1")
+            logger.info("gap role auto-saved for person %s", pid)
+        except Exception:
+            logger.exception("gap role save failed")
+        return
+    # 일반 fact (home_address, work_address, monthly_food_budget) — 답이 너무
+    # 짧지 않고 명백한 거절도 아니면 저장
+    if len(text) >= 2 and not text.startswith("/"):
+        db.remember_fact(chat_id, asked_key, text[:200])
+        db.remember_fact(chat_id, f"gap_silenced_{asked_key}", "1")
+        logger.info("gap fact %s auto-saved for chat %s: %r", asked_key, chat_id, text[:60])
 
 
 async def run_active_learning(chat_id: int) -> None:
@@ -7310,6 +7372,11 @@ async def _process_user_text(
         except Exception:
             logger.exception("ambiguity detect failed (non-fatal)")
     # v15: reflection capture 경로 제거 (cron 폐기로 reflection_prompted 절대 set 안 됨).
+    # v23: gap question 답 가로채기 — 거절이면 영구 침묵, 답이면 자동 fact 저장
+    try:
+        _handle_gap_answer(chat_id, user_text)
+    except Exception:
+        logger.exception("gap answer handling failed (non-fatal)")
     # Opportunistic cleanup of idle chats (no extra cost — only sweeps every msg).
     _sweep_idle_chats()
     history = _history(chat_id)
