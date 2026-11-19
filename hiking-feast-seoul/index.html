@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#101917">
+<meta name="color-scheme" content="dark">
+<meta name="description" content="신촌에서 출발하는 도전적인 북한산·도봉산 등산 코스 3선. 코스별 인터랙티브 지도, 하산 뒤 고깃집과 술자리, 교통·안전 정보까지 한눈에.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="땀은 산에서, 잔은 내려와서 | 서울 산행 3선">
+<meta property="og:description" content="6~8시간 암릉 산행 + 고기와 술. 북한산 의상능선, 도봉산 Y계곡, 백운대 주능선. 지도와 뒤풀이 장소까지.">
+<title>땀은 산에서, 잔은 내려와서 — 서울 산행 3선</title>
+<link rel="preconnect" href="https://tile.openstreetmap.org">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
+<style>
+:root{--bg:#101917;--panel:#192420;--panel2:#222e28;--ink:#f6f4e9;--sub:#b2bcb0;--muted:#849287;--line:rgba(241,242,216,.16);--accent:#d5ef8c;--route:#d5ef8c}
+*{box-sizing:border-box}html{scroll-behavior:smooth}body{margin:0;background:var(--bg);color:var(--ink);font-family:-apple-system,BlinkMacSystemFont,"Apple SD Gothic Neo","Noto Sans KR","Malgun Gothic",sans-serif;font-size:15px;line-height:1.6;-webkit-font-smoothing:antialiased}a{color:inherit;text-decoration:none}button{font:inherit;cursor:pointer}button:focus-visible,a:focus-visible{outline:3px solid #d5ef8c;outline-offset:3px}::selection{background:#d5ef8c;color:#162015}
+.wrap{max-width:1180px;margin:0 auto;padding:0 26px}.topbar{height:68px;display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--line)}.brand{display:flex;align-items:center;gap:10px;font-size:13px;font-weight:900;letter-spacing:.12em}.brandmark{border:1.5px solid var(--accent);width:30px;height:30px;display:grid;place-items:center;color:var(--accent);transform:rotate(-8deg);font-size:17px}.navlink{color:var(--sub);font-size:12px;border:1px solid var(--line);padding:8px 12px;border-radius:20px}
+.hero{overflow:hidden;position:relative;border-bottom:1px solid var(--line);min-height:485px;background:radial-gradient(ellipse at 72% 95%,#304534 0%,transparent 48%),linear-gradient(135deg,#111d18 0%,#131d19 55%,#1f3229 100%)}.hero .wrap{position:relative;z-index:2;padding-top:77px;padding-bottom:76px}.eyebrow{display:flex;align-items:center;gap:9px;font-weight:750;letter-spacing:.2em;color:var(--accent);font-size:11px;text-transform:uppercase}.eyebrow .dot{width:7px;height:7px;background:var(--accent);border-radius:50%}.hero h1{font-size:clamp(40px,6.8vw,82px);font-weight:900;line-height:1.2;letter-spacing:-.075em;margin:24px 0 18px;max-width:850px}.hero h1 em{font-style:normal;color:var(--accent)}.hero p{color:#d7ddcc;font-size:16px;line-height:1.85;max-width:530px;margin:0}.hero-art{position:absolute;width:900px;right:-90px;bottom:-54px;opacity:.5;pointer-events:none;z-index:1}.hero-badges{display:flex;flex-wrap:wrap;gap:8px;margin:29px 0 0}.hero-badges span{color:#e4e9d8;border:1px solid #72887870;background:#121d1899;padding:6px 10px;font-size:12px;border-radius:40px;font-weight:700}.hero-actions{display:flex;flex-wrap:wrap;gap:11px;margin-top:29px}.primary,.secondary,.outline{border:0;display:inline-flex;align-items:center;justify-content:center;gap:9px;font-weight:800;border-radius:12px;padding:14px 20px;min-height:47px}.primary{background:var(--accent);color:#172015}.primary:hover{background:#e1faa0}.secondary{background:#fff;color:#16201a}.outline{border:1px solid var(--line);background:#ffffff0a;color:var(--ink)}.outline:hover{background:#ffffff12}.shareToast{position:fixed;left:50%;bottom:92px;z-index:9999;transform:translate(-50%,14px);background:#d5ef8c;color:#172015;border-radius:12px;padding:12px 18px;font-weight:800;box-shadow:0 10px 45px #0008;opacity:0;pointer-events:none;transition:.25s;white-space:nowrap}.shareToast.visible{opacity:1;transform:translate(-50%,0)}
+.section{padding-top:64px}.section-top{display:flex;align-items:end;justify-content:space-between;gap:18px;margin-bottom:23px}.kicker{font-size:11px;color:var(--accent);font-weight:850;letter-spacing:.17em;margin-bottom:10px;text-transform:uppercase}.section h2{font-size:clamp(27px,3.4vw,39px);line-height:1.25;letter-spacing:-.055em;margin:0}.section .section-desc{color:var(--sub);font-size:13px;max-width:360px;text-align:right}
+.trip-tabs{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px}.trip-tab{background:#18221e;border:1px solid var(--line);color:var(--ink);border-radius:16px;text-align:left;min-height:155px;padding:20px;transition:.2s;position:relative;overflow:hidden}.trip-tab:hover{border-color:#80958a}.trip-tab[aria-selected=true]{border-color:var(--accent);background:#283628;box-shadow:inset 0 0 0 1px #d5ef8c44}.tab-idx{font-family:Georgia,serif;font-style:italic;font-size:13px;color:var(--accent)}.tab-name{font-weight:850;font-size:19px;line-height:1.35;letter-spacing:-.04em;margin:12px 0 7px}.tab-tag{font-size:12px;color:var(--sub)}.trip-tab .selected-icon{position:absolute;top:15px;right:16px;font-size:15px;color:var(--accent);display:none}.trip-tab[aria-selected=true] .selected-icon{display:block}
+.feature{margin-top:18px;background:#1a2520;border:1px solid var(--line);border-radius:20px;overflow:hidden}.feature-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px;padding:27px 28px 21px;border-bottom:1px solid var(--line)}.feature-head h3{font-size:29px;line-height:1.3;letter-spacing:-.055em;margin:4px 0 8px}.feature-head p{color:var(--sub);margin:0;font-size:13px}.difficulty{color:#182319;background:var(--accent);font-weight:900;white-space:nowrap;font-size:12px;padding:7px 11px;border-radius:7px}.metrics{display:grid;grid-template-columns:repeat(4,1fr)}.metric{padding:19px 24px;border-right:1px solid var(--line);border-bottom:1px solid var(--line)}.metric:last-child{border-right:0}.metric-label{display:block;color:var(--muted);font-size:11px;margin-bottom:3px}.metric b{font-size:23px;font-weight:900;letter-spacing:-.045em}.metric small{font-size:11px;color:var(--sub);margin-left:4px}
+.layout{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(320px,.9fr);gap:18px;margin-top:18px}.map-card,.info-card{border:1px solid var(--line);border-radius:17px;overflow:hidden;background:#18231f}.card-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:17px 19px}.card-heading b{font-size:15px}.subtxt{font-size:11px;color:var(--sub)}#map{width:100%;height:440px;background:#24352e}.map-footer{display:flex;align-items:center;justify-content:space-between;gap:12px;color:var(--muted);font-size:11px;padding:13px 17px;line-height:1.5}.map-footer a{color:var(--accent);text-decoration:underline;text-underline-offset:3px}.leaflet-container{font-family:inherit}.leaflet-control-attribution{font-size:10px!important}.leaflet-popup-content-wrapper,.leaflet-popup-tip{background:#14221a;color:#fff}.leaflet-popup-content{font-size:13px}.pin{width:30px;height:30px;border-radius:50%;background:#192e21;border:2px solid #d5ef8c;color:#d5ef8c;display:grid;place-items:center;box-shadow:0 2px 18px #0009;font-size:12px;font-weight:900}.pin.start{background:#d5ef8c;color:#172015}.pin.end{background:#f0b483;color:#19221c;border-color:#f0b483}.leaflet-div-icon{background:none;border:none}
+.notes{display:flex;flex-direction:column;gap:12px}.info-card{padding:22px}.info-card .mini{font-size:11px;color:var(--accent);font-weight:850;letter-spacing:.12em;margin-bottom:10px}.info-card h3{font-size:21px;line-height:1.35;letter-spacing:-.04em;margin:0 0 12px}.info-card p{font-size:13px;color:#cbd4c5;margin:0}.quote{padding-left:14px;border-left:3px solid var(--accent);color:#e9eddf!important}.timeline{display:grid;gap:0;margin:15px 0 0;padding-left:0;list-style:none}.timeline li{display:flex;align-items:flex-start;gap:12px;padding-bottom:13px;font-size:13px;color:#d9dfd3}.timeline li:before{content:"";display:block;flex:0 0 8px;height:8px;border-radius:50%;background:var(--route);margin-top:7px;box-shadow:0 0 0 4px #d5ef8c18}.timeline li:last-child{padding-bottom:0}.rail{font-size:12px;color:var(--sub);border-top:1px solid var(--line);margin-top:17px;padding-top:14px}.rail strong{color:var(--ink)}
+.food{display:grid;grid-template-columns:minmax(0,1.2fr) minmax(0,1fr);gap:19px;padding:24px;border:1px solid #546b4b;background:linear-gradient(120deg,#263c2d,#1a2b21 72%);border-radius:18px;margin-top:18px}.food .eyebrow{color:#e4efa5}.food h3{font-size:28px;letter-spacing:-.05em;margin:8px 0 11px;line-height:1.3}.food p{margin:0 0 10px;font-size:13px;color:#d4e0d2}.food .address{font-size:12px;color:#b7caba}.food-actions{display:flex;gap:9px;flex-wrap:wrap;align-content:center;justify-content:flex-end}.food-actions .outline{border-color:#76907880}.food-tip{color:#d2e9ab!important;font-size:12px!important;margin-top:8px!important}.food .tag{display:inline-block;font-size:11px;color:#17261d;background:#e1f1b6;padding:4px 8px;border-radius:20px;font-weight:800;margin-right:5px}
+.tips{margin-top:65px;display:grid;grid-template-columns:1fr 1fr;gap:18px}.tip-card{background:#19231f;border:1px solid var(--line);border-radius:17px;padding:25px}.tip-card h3{font-size:19px;letter-spacing:-.04em;margin:0 0 14px}.tip-card ul{padding-left:19px;margin:0;display:grid;gap:10px;color:var(--sub);font-size:13px}.tip-card strong{color:var(--ink)}.tip-card a{color:var(--accent);text-decoration:underline;text-underline-offset:3px}
+.sources{margin:62px auto 0;padding-top:24px;padding-bottom:105px;border-top:1px solid var(--line);color:var(--muted);font-size:11px}.sources p{max-width:900px}.sources a{color:#b8c5b2;text-decoration:underline;text-underline-offset:3px}.sources .credits{letter-spacing:.1em;color:#d5ef8c;font-weight:750}.bottom-share{display:none}.disclaimer{font-size:11px!important;opacity:.95}
+@media(max-width:800px){.hero{min-height:auto}.hero .wrap{padding-top:60px;padding-bottom:55px}.hero-art{width:700px;right:-340px;bottom:-5px;opacity:.29}.layout{grid-template-columns:1fr}.notes{display:grid;grid-template-columns:1fr 1fr;gap:12px}.trip-tabs{gap:8px}.trip-tab{min-height:160px;padding:16px}.tab-name{font-size:16px}.tab-tag{font-size:11px}.metrics .metric{padding:14px 16px}.metric b{font-size:21px}.section-top{align-items:flex-start;flex-direction:column;gap:8px}.section .section-desc{text-align:left}.food{grid-template-columns:1fr}.food-actions{justify-content:flex-start}}
+@media(max-width:570px){.wrap{padding:0 17px}.topbar{height:58px}.hero .wrap{padding-top:47px;padding-bottom:53px}.hero h1{font-size:clamp(38px,10vw,55px);margin:19px 0 14px}.hero p{font-size:14px}.hero-badges{margin-top:24px}.hero-actions{margin-top:24px}.hero-actions .primary,.hero-actions .outline{padding:12px 15px;font-size:13px}.navlink{font-size:11px}.section{padding-top:47px}.trip-tabs{grid-template-columns:1fr;gap:9px}.trip-tab{min-height:unset;padding:14px 17px;display:grid;grid-template-columns:36px 1fr auto;align-items:center;gap:8px}.tab-idx{font-size:17px}.tab-name{font-size:16px;margin:0}.tab-tag{text-align:right}.trip-tab .selected-icon{right:15px;top:6px}.feature-head{padding:21px 18px}.feature-head h3{font-size:24px}.feature-head .difficulty{font-size:10px}.metrics{grid-template-columns:repeat(2,1fr)}.metric:nth-child(2){border-right:0}.metric:nth-child(-n+2){border-bottom:1px solid var(--line)}.metric b{font-size:22px}#map{height:380px}.notes{grid-template-columns:1fr}.info-card{padding:20px}.food{padding:20px}.food h3{font-size:25px}.food-actions .primary,.food-actions .outline{font-size:12px;padding:12px 13px}.tips{grid-template-columns:1fr;margin-top:48px}.tip-card{padding:21px}.sources{margin-top:45px;padding-bottom:100px}.bottom-share{position:fixed;z-index:500;bottom:0;left:0;right:0;display:flex;align-items:center;gap:10px;padding:10px 16px calc(10px + env(safe-area-inset-bottom));background:#0f1916f2;backdrop-filter:blur(16px);border-top:1px solid var(--line)}.bottom-share .primary{flex:1}.bottom-share .outline{padding-left:15px;padding-right:15px}.shareToast{bottom:94px}}
+@media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*{transition:none!important}}
+</style>
+</head>
+<body>
+<header class="wrap topbar">
+<a class="brand" href="#" aria-label="페이지 최상단"><span class="brandmark">⌁</span>TRAIL & TABLE</a>
+<a class="navlink" href="#routes">3개 코스 보러가기 ↘</a>
+</header>
+<section class="hero"><svg class="hero-art" viewBox="0 0 900 440" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true"><path d="M0 440L120 285 230 363 389 90 555 299 710 140 900 355V440H0Z" fill="#3b5943"/><path d="M0 440L172 328 260 374 475 174 624 352 770 237 900 328V440H0Z" fill="#243e32"/><path d="M390 92 434 170 380 160 351 196 338 163Z" fill="#cddfb1" opacity=".55"/><g stroke="#d9f5bd" opacity=".32" stroke-width="1.2"><path d="M-30 340C150 230 240 412 410 262S695 175 945 302"/><path d="M-30 364C150 254 240 436 410 286S695 199 945 326"/><path d="M-30 388C150 278 240 460 410 310S695 223 945 350"/><path d="M-30 412C150 302 240 484 410 334S695 247 945 374"/><path d="M-30 436C150 326 240 508 410 358S695 271 945 398"/></g><path d="M390 92 710 141" stroke="#bfe299" stroke-dasharray="6 13" opacity=".35"/></svg>
+<div class="wrap">
+<div class="eyebrow"><span class="dot"></span> SEOUL HIKING / AFTER-HIKE FEAST</div>
+<h1>땀은 산에서.<br><em>잔은 내려와서.</em></h1>
+<p>쉬운 산책은 사양한다. 암릉을 넘고, 봉우리를 정복하고,<br>하산하면 고기와 술로 보상받는 서울 근교 산행 3선.</p>
+<div class="hero-badges"><span>📍 신촌 출발</span><span>⏳ 산행 6~8시간</span><span>⛰ 상급자 지향</span><span>🥩 고기 + 뒤풀이</span></div>
+<div class="hero-actions"><a class="primary" href="#routes">코스 고르기 ↓</a><button class="outline" id="share-top">↗ 친구에게 공유</button></div>
+</div></section>
+<main>
+<section class="wrap section" id="routes">
+<div class="section-top"><div><div class="kicker">CHOOSE YOUR PAIN</div><h2>어느 산에서 고생할까?</h2></div><div class="section-desc">코스를 누르면 지도와 하산 후 뒤풀이 장소까지 한 번에 바뀝니다.</div></div>
+<div class="trip-tabs" role="tablist" aria-label="등산 코스 선택">
+<button class="trip-tab" type="button" data-i="0" aria-selected="true" role="tab"><span class="tab-idx">01</span><span class="tab-name">북한산 의상능선</span><span class="tab-tag">종합 추천</span><span class="selected-icon">✓</span></button>
+<button class="trip-tab" type="button" data-i="1" aria-selected="false" role="tab"><span class="tab-idx">02</span><span class="tab-name">도봉산 Y계곡</span><span class="tab-tag">암릉 스릴</span><span class="selected-icon">✓</span></button>
+<button class="trip-tab" type="button" data-i="2" aria-selected="false" role="tab"><span class="tab-idx">03</span><span class="tab-name">북한산 백운대</span><span class="tab-tag">정상 정복</span><span class="selected-icon">✓</span></button>
+</div>
+<article class="feature" aria-live="polite">
+<div class="feature-head"><div><div class="kicker" id="route-overline">01 / RIDGE DAY</div><h3 id="route-title">북한산 의상능선 종주</h3><p id="route-blurb"></p></div><span class="difficulty" id="difficulty">상~최상</span></div>
+<div class="metrics">
+<div class="metric"><span class="metric-label">산행 시간 · 휴식 포함</span><b id="m-time">6–8</b><small>시간</small></div>
+<div class="metric"><span class="metric-label">예상 이동 거리</span><b id="m-dist">7–9</b><small>km</small></div>
+<div class="metric"><span class="metric-label">체감 난도</span><b id="m-level">5/5</b></div>
+<div class="metric"><span class="metric-label">하산 지역</span><b id="m-end">구기동</b></div>
+</div></article>
+<div class="layout">
+<div class="map-card">
+<div class="card-heading"><b>🗺️ 산행 지도</b><span class="subtxt">코스별 주요 경유지</span></div>
+<div id="map" role="application" aria-label="선택한 등산 코스 경유지 지도"><div style="padding:28px;color:#cad8bc">지도를 불러오는 중입니다…</div></div>
+<div class="map-footer"><span>⚠️ 점선은 경유지 사이 <strong>개략적인 연결선</strong>입니다. 실제 등산로/GPX가 아닙니다.</span><a id="trail-detail" href="https://www.everytrail.co.kr/hiking/bukhansan/uisang" target="_blank" rel="noopener noreferrer">실제 산행 자료 ↗</a></div>
+</div>
+<div class="notes">
+<div class="info-card"><div class="mini">THE ROUTE</div><h3>지나갈 봉우리들</h3><ul class="timeline" id="timeline"></ul></div>
+<div class="info-card"><div class="mini">WHY THIS ONE</div><h3 id="selling-title">암릉이 계속 이어지는 하루</h3><p class="quote" id="selling"></p><div class="rail" id="transport"></div></div>
+</div>
+</div>
+<article class="food" aria-live="polite">
+<div><div class="eyebrow">🥩 AFTER THE SUMMIT</div><h3 id="food-name">장독대</h3><p id="food-desc"></p><p class="address" id="food-address"></p><p class="food-tip" id="food-tip"></p><div id="food-tags" style="margin-top:12px"></div></div>
+<div class="food-actions"><a id="food-map-link" href="#" class="primary" target="_blank" rel="noopener noreferrer">📍 식당 지도 보기</a><a id="food-call-link" href="#" class="outline">☎ 전화 문의</a><button id="copy-route" type="button" class="outline">🔗 이 코스 링크 복사</button></div>
+</article>
+</section>
+<section class="wrap tips">
+<div class="tip-card"><div class="kicker">SAMPLE DAY</div><h3>이렇게 하루를 쓰자</h3><ul><li><strong>07:00~07:30</strong> 신촌 출발 · 지하철/버스로 들머리 이동</li><li><strong>08:00~08:30</strong> 산행 시작 · 오전에 주요 암릉 통과</li><li><strong>15:00~16:00</strong> 하산 완료 목표 · 여유 있게 식당 이동</li><li><strong>16:30~</strong> 삼겹살·돼지갈비·막걸리·소주로 마무리</li></ul></div>
+<div class="tip-card"><div class="kicker">DON'T SKIP THIS</div><h3>산에서는 무조건 안전 우선</h3><ul><li><strong>11~12월</strong> 암릉 결빙과 강풍 가능. 접지력 있는 등산화, 보온복, 장갑, 헤드랜턴, 필요 시 아이젠 준비</li><li><strong>Y계곡</strong>은 노출된 급경사 바윗길. 비·눈·결빙 또는 고소공포가 있으면 공식 우회로 이용</li><li><strong>탐방로 통제</strong>는 산불조심기간과 날씨에 따라 달라짐. 출발 전 <a href="https://www.knps.or.kr/portal/main.do" target="_blank" rel="noopener">국립공원공단 공지</a> 확인</li><li><strong>술은 하산을 완전히 끝낸 뒤.</strong> 산행 중 음주는 하지 말고, 귀가는 대중교통 또는 택시 이용</li></ul></div>
+</section>
+<footer class="wrap sources">
+<div class="credits">TRAIL & TABLE · SEOUL EDITION</div>
+<p>지도 © OpenStreetMap 기여자. 경유지 마커 및 점선은 여행 기획을 위한 개략적 표시로, 현장 길찾기나 안전 판단에 사용하면 안 됩니다. 능선 분기점·입산 허용시간·통제 여부는 국립공원공단 현장 공지를 따르세요. 경로별 시간/거리는 실제 사례와 코스 정보를 바탕으로 한 대략적 범위로, 개인의 속도에 따라 달라집니다. 식당 영업시간·메뉴·예약은 출발 전에 전화로 확인하세요.</p>
+<p>참고: <a href="https://www.everytrail.co.kr/hiking/bukhansan/uisang" target="_blank" rel="noopener">의상능선 사용자 산행 기록</a> · <a href="https://www.everytrail.co.kr/hiking/dobongsan/podaeneungseon" target="_blank" rel="noopener">도봉산 포대능선 기록</a> · <a href="https://www.everytrail.co.kr/hiking/bukhansan/sogwicheon" target="_blank" rel="noopener">소귀천 코스 기록</a> · <a href="https://sanguidekorea.com/ko/course/bukhansan-uisangneungseon/" target="_blank" rel="noopener">의상능선 세부 정보/GPX</a> · 식당 정보: <a href="https://www.diningcode.com/profile.php?rid=g21xsAgJUYrH" target="_blank" rel="noopener">장독대</a>, <a href="https://www.diningcode.com/profile.php?rid=vrOIjTR72z2f" target="_blank" rel="noopener">숯불도봉산골</a>, <a href="https://www.diningcode.com/profile.php?rid=tKREgacaQ0T5" target="_blank" rel="noopener">숯불곰갈비집</a></p>
+<p>기획 자료 기준: 2026년 11월 · 개인용 여행 공유 페이지 · 실제 GPX 내비게이션 기능은 제공하지 않습니다.</p>
+</footer>
+</main>
+<div class="bottom-share"><button class="outline" id="share-bottom">↗ 공유</button><button class="primary" id="copy-bottom">🔗 선택 코스 링크 복사</button></div>
+<div class="shareToast" id="toast" aria-live="polite">링크를 복사했어요</div>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+<script>
+(function(){
+"use strict";
+var routes=[
+{slug:"uisang",overline:"01 / THE RIDGELINE",title:"북한산 의상능선 횡단",blurb:"연속 봉우리를 타고 남쪽 구기동으로 넘어가는 암릉 종주.",time:"6–8",distance:"약 7–9",level:"5/5",levelLabel:"상~최상",end:"구기동",heading:"봉우리 하나 넘으면 또 하나",selling:"의상봉·용출봉·용혈봉·증취봉·나한봉이 연속된다. 긴 오르내림과 바위 능선의 재미가 가장 잘 균형 잡힌 코스.",transport:"<strong>접근:</strong> 신촌 → 구파발역(2·3호선 환승) → 북한산성입구 방면 버스<br><strong>하산:</strong> 구기동 · 장독대까지는 하산지에서 추가 이동이 필요할 수 있음",detail:"https://www.everytrail.co.kr/hiking/bukhansan/uisang",food:{name:"구기동 장독대",desc:"북한산 풍경이 보이는 소박한 산자락 식당. 삼겹살 + 두부 + 금정산성막걸리라는 완벽한 조합.",address:"서울 종로구 비봉5길 30-3",phone:"02-3216-0122",tip:"야외 좌석이 적어 전화 예약을 권장. 구기탐방지원센터에서 식당까지 추가 도보·택시 이동 필요.",tags:["삼겹살","두부김치","막걸리"]},pts:[["북한산성탐방지원센터",37.65514,126.94943],["의상봉",37.6493,126.9576],["용출봉",37.6469,126.9607],["용혈봉·증취봉",37.6439,126.9637],["나한봉·청수동암문",37.6348,126.9734],["대남문",37.6290,126.9746],["구기탐방지원센터",37.61632,126.96172]]},
+{slug:"dobong",overline:"02 / THE Y VALLEY",title:"도봉산 포대능선 · Y계곡",blurb:"철난간 암릉과 깎아지른 바위. 스릴을 원한다면 이쪽.",time:"6–8",distance:"약 9–11",level:"5/5",levelLabel:"상~최상",end:"도봉산역",heading:"손발을 모두 써야 하는 구간",selling:"망월사에서 포대능선으로 올라 Y계곡을 넘어 신선대에 선다. 단순 체력전보다 기술적인 암릉 통과의 성취감이 큰 코스.",transport:"<strong>접근:</strong> 신촌 → 시청역 환승 → 망월사역(1호선) → 원도봉탐방지원센터<br><strong>하산:</strong> 도봉탐방지원센터 → 도봉산역 음식점 거리",detail:"https://www.everytrail.co.kr/hiking/dobongsan/podaeneungseon",food:{name:"숯불도봉산골",desc:"등산객들이 찾는 도봉산역 인근 노포 스타일. 생삼겹살·삼겹두루치기·김치전골에 소주 한잔.",address:"서울 도봉구 도봉산3길 13",phone:"02-3491-5277",tip:"도봉산역에서 가까움. 영업시간이 사이트마다 달라 미리 전화 확인 추천.",tags:["생삼겹살","삼겹두루치기","소주"]},pts:[["원도봉탐방지원센터",37.7089,127.0335],["망월사",37.70465,127.02116],["포대정상",37.7020,127.0168],["Y계곡",37.7007,127.0171],["신선대",37.6996,127.0161],["마당바위",37.6915,127.0252],["도봉탐방지원센터",37.68600,127.03628]]},
+{slug:"baegun",overline:"03 / THE SUMMIT",title:"북한산 백운대 · 산성주능선",blurb:"백운대 정상을 찍고 성곽 능선을 길게 걸어 우이동으로.",time:"7–8",distance:"약 9–11",level:"4/5",levelLabel:"상",end:"우이동",heading:"정상 인증과 주능선을 한 번에",selling:"백운대(836m)의 조망에 산성주능선의 긴 걷기를 더했다. 최고봉을 밟는 상징성과 꽉 찬 하루 산행을 원한다면 제격.",transport:"<strong>접근:</strong> 신촌 → 구파발역 → 북한산성입구 방면 버스<br><strong>하산:</strong> 소귀천공원지킴터 → 우이동 → 솔밭공원역 인근 식당 이동",detail:"https://www.everytrail.co.kr/hiking/bukhansan/sogwicheon",food:{name:"숯불곰갈비집",desc:"우이동·솔밭공원역 인근의 편한 고깃집. 숯불 돼지갈비와 삼겹살, 김치찌개까지 챙기는 식사.",address:"서울 강북구 삼양로155길 4",phone:"02-999-3389",tip:"소귀천 하산지 바로 앞은 아니므로 식당까지 별도 이동 필요. 고기 모임은 전화 예약 추천.",tags:["돼지갈비","삼겹살","김치찌개"]},pts:[["북한산성탐방지원센터",37.65514,126.94943],["백운봉암문",37.6583,126.9743],["백운대",37.6589,126.9780],["용암문",37.6483,126.9820],["동장대",37.64366,126.98309],["대동문",37.64031,126.98607],["소귀천공원지킴터",37.65495,126.99841]]}
+];
+var active=0,map=null,drawLayer=null,toastTimer=null;
+function byId(id){return document.getElementById(id)}
+function mapSearch(q){return "https://map.naver.com/p/search/"+encodeURIComponent(q)}
+function display(i){
+active=i;
+var r=routes[i];
+document.documentElement.style.setProperty("--route",i===0?"#d5ef8c":i===1?"#f3a985":"#8ed3e8");
+document.querySelectorAll(".trip-tab").forEach(function(b,j){b.setAttribute("aria-selected",String(i===j))});
+byId("route-overline").textContent=r.overline;
+byId("route-title").textContent=r.title;
+byId("route-blurb").textContent=r.blurb;
+byId("difficulty").textContent=r.levelLabel;
+byId("m-time").textContent=r.time;
+byId("m-dist").textContent=r.distance;
+byId("m-level").textContent=r.level;
+byId("m-end").textContent=r.end;
+byId("selling-title").textContent=r.heading;
+byId("selling").textContent=r.selling;
+byId("transport").innerHTML=r.transport;
+byId("trail-detail").href=r.detail;
+byId("timeline").innerHTML=r.pts.map(function(p,j){return "<li>"+(j===0?"<strong>START · </strong>":j===r.pts.length-1?"<strong>FINISH · </strong>":"")+p[0]+"</li>"}).join("");
+byId("food-name").textContent=r.food.name;
+byId("food-desc").textContent=r.food.desc;
+byId("food-address").textContent=r.food.address;
+byId("food-tip").textContent="TIP · "+r.food.tip;
+byId("food-tags").innerHTML=r.food.tags.map(function(s){return "<span class='tag'>"+s+"</span>"}).join("");
+byId("food-map-link").href=mapSearch(r.food.name+" "+r.food.address);
+byId("food-call-link").href="tel:"+r.food.phone;
+try{var u=new URL(window.location.href);u.searchParams.set("r",r.slug);history.replaceState(null,"",u.toString())}catch(e){}
+draw(r);
+}
+function draw(r){
+if(!map||typeof L==="undefined")return;
+if(drawLayer)map.removeLayer(drawLayer);
+var fg=L.featureGroup();
+var color=active===0?"#7ab74e":active===1?"#df845a":"#3a9ab6";
+var coords=r.pts.map(function(p){return [p[1],p[2]]});
+L.polyline(coords,{color:"#fff",weight:7,opacity:.66,dashArray:"2 11",lineJoin:"round"}).addTo(fg);
+L.polyline(coords,{color:color,weight:4,opacity:.92,dashArray:"4 11",lineJoin:"round"}).addTo(fg);
+r.pts.forEach(function(p,j){
+var cl=j===0?"start":j===r.pts.length-1?"end":"";
+var label=j===0?"S":j===r.pts.length-1?"F":String(j);
+var icon=L.divIcon({html:'<div class="pin '+cl+'">'+label+'</div>',className:"",iconSize:[30,30],iconAnchor:[15,15]});
+L.marker([p[1],p[2]],{icon:icon}).bindPopup("<strong>"+p[0]+"</strong><br><span>경유지 위치는 개략적입니다.</span>").addTo(fg);
+});
+fg.addTo(map);drawLayer=fg;
+map.fitBounds(fg.getBounds().pad(.19),{animate:false,maxZoom:13});
+setTimeout(function(){map.invalidateSize()},100);
+}
+function notify(txt){var t=byId("toast");t.textContent=txt;t.classList.add("visible");clearTimeout(toastTimer);toastTimer=setTimeout(function(){t.classList.remove("visible")},2300)}
+function shareUrl(){try{var u=new URL(window.location.href);u.searchParams.set("r",routes[active].slug);return u.toString()}catch(e){return window.location.href}}
+async function copyLink(){
+var s=shareUrl();
+try{await navigator.clipboard.writeText(s);notify("선택 코스 링크를 복사했어요")}catch(e){
+try{var input=document.createElement("textarea");input.value=s;input.style.position="fixed";input.style.opacity="0";document.body.appendChild(input);input.select();document.execCommand("copy");input.remove();notify("링크를 복사했어요")}catch(x){window.prompt("아래 링크를 복사하세요",s)}}
+}
+async function share(){
+var r=routes[active];
+if(navigator.share){try{await navigator.share({title:"땀은 산에서, 잔은 내려와서",text:r.title+" · "+r.time+"시간 산행 → "+r.food.name,url:shareUrl()});return}catch(e){if(e.name==="AbortError")return}}
+copyLink();
+}
+document.querySelectorAll(".trip-tab").forEach(function(b){b.addEventListener("click",function(){display(Number(b.getAttribute("data-i")))})});
+byId("share-top").addEventListener("click",share);
+byId("share-bottom").addEventListener("click",share);
+byId("copy-route").addEventListener("click",copyLink);
+byId("copy-bottom").addEventListener("click",copyLink);
+if(typeof L!=="undefined"){
+try{map=L.map("map",{scrollWheelZoom:false,zoomControl:true,minZoom:9,maxZoom:17});
+L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',maxZoom:19}).addTo(map)}
+catch(e){map=null}
+}
+if(!map){byId("map").innerHTML='<div style="padding:25px;color:#dae7ca">지도를 불러올 수 없습니다. 아래 실제 산행 자료 링크와 코스 경유지 목록을 확인하세요.</div>'}
+var init=(new URLSearchParams(window.location.search)).get("r");
+var n=routes.findIndex(function(r){return r.slug===init});
+display(n<0?0:n);
+})();
+</script>
+</body>
+</html>
